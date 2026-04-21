@@ -1,0 +1,88 @@
+# ─────────────────────────────────────────────────────────────
+#  Stock Monitor — main configuration
+#  Values wrapped in ${VAR} are read from the .env file.
+# ─────────────────────────────────────────────────────────────
+
+# ── Stocks to watch ───────────────────────────────────────────
+stocks:
+  - symbol: AAPL
+    alerts:
+      # Alert if price moves +/- 2% within any 10-minute window
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+
+      # Alert if today's volume exceeds 2× the 10-day average
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+
+      # Alert if price crosses specific price levels
+      - type: price_threshold
+        above: 230.0
+        cooldown_minutes: 120
+
+  - symbol: INTC
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+
+      - type: volume_spike
+        multiplier: 3.0
+        cooldown_minutes: 60
+
+      - type: price_threshold
+        below: 18.0
+        cooldown_minutes: 120
+
+  - symbol: NVDA
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 15
+        cooldown_minutes: 30
+
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+
+# ── Notifications ─────────────────────────────────────────────
+notifications:
+  telegram:
+    enabled: true
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+
+  discord:
+    enabled: false
+    webhook_url: "${DISCORD_WEBHOOK_URL}"
+
+  desktop:
+    enabled: true
+
+# ── TradingView Webhook ───────────────────────────────────────
+tradingview:
+  # Must match TRADINGVIEW_WEBHOOK_SECRET in .env
+  webhook_secret: "${TRADINGVIEW_WEBHOOK_SECRET}"
+
+# ── HTTP Server (for receiving webhooks) ─────────────────────
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+# ── Monitoring engine ─────────────────────────────────────────
+monitoring:
+  # How often to poll yfinance (seconds). 60s is a safe rate limit.
+  interval_seconds: 60
+  # Include pre-market (04:00–09:30 ET) and after-hours (16:00–20:00 ET)
+  include_extended_hours: true
+  # How many minutes of price history to keep in memory for % change checks
+  price_history_minutes: 60
+
+# ── Logging ───────────────────────────────────────────────────
+logging:
+  level: "INFO"         # DEBUG | INFO | WARNING | ERROR
+  file: "logs/stock_monitor.log"

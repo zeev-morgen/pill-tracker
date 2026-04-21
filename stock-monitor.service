@@ -1,0 +1,41 @@
+# systemd unit file — install to /etc/systemd/system/stock-monitor.service
+#
+# Setup
+# ─────
+# 1. sudo cp stock-monitor.service /etc/systemd/system/
+# 2. Edit WorkingDirectory and ExecStart to match your install path.
+# 3. sudo systemctl daemon-reload
+# 4. sudo systemctl enable --now stock-monitor
+# 5. sudo journalctl -u stock-monitor -f        # follow live logs
+
+[Unit]
+Description=Real-time Stock Monitor with TradingView Webhook Support
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USERNAME
+
+# ── Adjust these two paths ──────────────────────────────────────────────────
+WorkingDirectory=/home/YOUR_LINUX_USERNAME/pill-tracker
+ExecStart=/home/YOUR_LINUX_USERNAME/pill-tracker/venv/bin/python run.py
+# ────────────────────────────────────────────────────────────────────────────
+
+EnvironmentFile=/home/YOUR_LINUX_USERNAME/pill-tracker/.env
+
+# Restart on crash, but not on deliberate stop (exit code 0)
+Restart=on-failure
+RestartSec=10s
+
+# Log to the system journal (also rotated to logs/ by the app itself)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stock-monitor
+
+# Keep the process alive across disconnects
+KillMode=process
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
