@@ -60,14 +60,18 @@ class StockDataFeed:
 
     @staticmethod
     def _fi_get(fast_info, *attrs) -> Optional[float]:
-        """Return the first non-None value from fast_info attributes."""
+        """Return the first non-None float from fast_info, skipping on any error.
+
+        yfinance property getters can raise (not just AttributeError) when the
+        underlying network call fails, so each access is individually guarded.
+        """
         for attr in attrs:
-            val = getattr(fast_info, attr, None)
-            if val is not None:
-                try:
+            try:
+                val = getattr(fast_info, attr)
+                if val is not None:
                     return float(val)
-                except (TypeError, ValueError):
-                    pass
+            except Exception:
+                pass
         return None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -83,17 +87,24 @@ class StockDataFeed:
         try:
             fi = self._ticker(symbol).fast_info
 
-            price = self._fi_get(fi, "lastPrice", "regularMarketPrice")
+            # yfinance ≥ 1.0 uses snake_case; fall back to older camelCase names
+            price = self._fi_get(
+                fi, "last_price", "lastPrice", "regularMarketPrice"
+            )
             if price is None:
                 logger.warning("No price available for %s", symbol)
                 return None
 
             prev_close = self._fi_get(
-                fi, "previousClose", "regularMarketPreviousClose"
+                fi,
+                "previous_close", "previousClose",
+                "regular_market_previous_close", "regularMarketPreviousClose",
             )
-            volume = self._fi_get(fi, "lastVolume", "dayVolume", "regularMarketVolume")
-            day_high = self._fi_get(fi, "dayHigh", "regularMarketDayHigh")
-            day_low  = self._fi_get(fi, "dayLow",  "regularMarketDayLow")
+            volume = self._fi_get(
+                fi, "last_volume", "lastVolume", "day_volume", "dayVolume"
+            )
+            day_high = self._fi_get(fi, "day_high", "dayHigh")
+            day_low  = self._fi_get(fi, "day_low",  "dayLow")
 
             change_pct = (
                 (price - prev_close) / prev_close * 100.0
@@ -135,7 +146,19 @@ class StockDataFeed:
             return None
 
     def get_average_daily_volume(self, symbol: str, days: int = 10) -> Optional[float]:
-        """Return the mean daily volume over the last *days* trading sessions."""
+        """Return the mean daily volume over the last *days* trading sessions.
+
+        Tries fast_info.ten_day_average_volume first (instant, no extra request),
+        then falls back to pulling daily bars.
+        """
+        try:
+            fi = self._ticker(symbol).fast_info
+            fast_val = self._fi_get(fi, "ten_day_average_volume", "threeMonthAverageVolume")
+            if fast_val and fast_val > 0:
+                return fast_val
+        except Exception:
+            pass
+
         try:
             hist = self._ticker(symbol).history(
                 period=f"{days + 7}d", interval="1d"
