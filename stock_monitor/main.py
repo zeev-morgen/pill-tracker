@@ -30,9 +30,11 @@ import uvicorn
 
 from .alert_engine import AlertEngine
 from .config import AppConfig, load_config
+from .dashboard import update_price_cache
 from .data_feed import StockDataFeed, get_market_session
 from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
+from .store import alert_store
 from .webhook_server import create_webhook_app
 
 
@@ -100,8 +102,16 @@ class StockMonitorApp:
                     session,
                 )
 
+                update_price_cache(data)
+
                 for event in self.engine.evaluate(symbol, stock_cfg, data):
                     self.dispatcher.dispatch(event, session)
+                    alert_store.add(
+                        symbol=event.symbol,
+                        alert_type=event.alert_type,
+                        message=event.message,
+                        severity=event.severity,
+                    )
 
             except Exception as exc:
                 self._log.error("Error monitoring %s: %s", symbol, exc, exc_info=True)

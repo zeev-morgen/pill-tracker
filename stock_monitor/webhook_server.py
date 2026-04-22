@@ -33,6 +33,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .notifier import NotificationDispatcher
+from .dashboard import router as dashboard_router
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,8 @@ logger = logging.getLogger(__name__)
 def create_webhook_app(
     dispatcher: NotificationDispatcher, secret: str = ""
 ) -> FastAPI:
-    app = FastAPI(title="Stock Monitor Webhooks", version="1.0.0", docs_url="/docs")
+    app = FastAPI(title="Stock Monitor", version="1.0.0", docs_url="/docs")
+    app.include_router(dashboard_router)
 
     # ── Signature helper ──────────────────────────────────────────────────────
 
