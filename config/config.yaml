@@ -5,49 +5,145 @@
 
 # ── Stocks to watch ───────────────────────────────────────────
 stocks:
-  - symbol: AAPL
+  - symbol: AMZN
     alerts:
-      # Alert if price moves +/- 2% within any 10-minute window
       - type: price_change_pct
         threshold_pct: 2.0
         window_minutes: 10
         cooldown_minutes: 30
-
-      # Alert if today's volume exceeds 2× the 10-day average
       - type: volume_spike
         multiplier: 2.0
         cooldown_minutes: 60
-
-      # Alert if price crosses specific price levels
       - type: price_threshold
-        above: 230.0
+        above: 270.0
+        below: 240.0
         cooldown_minutes: 120
 
-  - symbol: INTC
+  - symbol: ABCL
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 5.0
+        below: 3.5
+        cooldown_minutes: 120
+
+  - symbol: SEDG
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 50.0
+        below: 38.0
+        cooldown_minutes: 120
+
+  - symbol: CF
     alerts:
       - type: price_change_pct
         threshold_pct: 2.0
         window_minutes: 10
         cooldown_minutes: 30
-
       - type: volume_spike
-        multiplier: 3.0
+        multiplier: 2.0
         cooldown_minutes: 60
-
       - type: price_threshold
-        below: 18.0
+        above: 130.0
+        below: 115.0
         cooldown_minutes: 120
 
-  - symbol: NVDA
+  - symbol: SNDK
     alerts:
       - type: price_change_pct
-        threshold_pct: 3.0
-        window_minutes: 15
+        threshold_pct: 4.0
+        window_minutes: 10
         cooldown_minutes: 30
-
       - type: volume_spike
         multiplier: 2.5
         cooldown_minutes: 60
+      - type: price_threshold
+        above: 1050.0
+        below: 900.0
+        cooldown_minutes: 120
+
+  - symbol: META
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 700.0
+        below: 640.0
+        cooldown_minutes: 120
+
+  - symbol: MENS
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 5.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 3.0
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 3.0
+        below: 1.8
+        cooldown_minutes: 120
+
+  - symbol: FULC
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 4.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 3.0
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 9.0
+        below: 6.5
+        cooldown_minutes: 120
+
+  - symbol: MU
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 530.0
+        below: 450.0
+        cooldown_minutes: 120
+
+  - symbol: ORCL
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+      - type: price_threshold
+        above: 200.0
+        below: 175.0
+        cooldown_minutes: 120
 
 # ── Notifications ─────────────────────────────────────────────
 notifications:
