@@ -13,11 +13,31 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+import urllib3
 
 from .alert_engine import AlertEvent
 from .config import NotificationConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _post_with_ssl_fallback(url: str, **kwargs) -> requests.Response:
+    """POST with normal SSL verification; retry verify=False if an SSLError is raised.
+
+    Useful behind corporate firewalls / antivirus tools (Kaspersky, Bitdefender,
+    ESET, Symantec, etc.) that perform TLS inspection with a self-signed root CA.
+    """
+    try:
+        return requests.post(url, timeout=10, **kwargs)
+    except requests.exceptions.SSLError as exc:
+        logger.warning(
+            "SSL verification failed for %s (%s) — retrying without verification. "
+            "A proxy/antivirus is likely intercepting HTTPS.",
+            url.split("?")[0],
+            exc.__class__.__name__,
+        )
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return requests.post(url, timeout=10, verify=False, **kwargs)
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -42,10 +62,9 @@ class TelegramNotifier:
 
     def send(self, text: str) -> bool:
         try:
-            resp = requests.post(
+            resp = _post_with_ssl_fallback(
                 self._url,
                 json={"chat_id": self._chat_id, "text": text, "parse_mode": "Markdown"},
-                timeout=10,
             )
             resp.raise_for_status()
             return True
@@ -68,7 +87,7 @@ class DiscordNotifier:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }]
             }
-            resp = requests.post(self._url, json=payload, timeout=10)
+            resp = _post_with_ssl_fallback(self._url, json=payload)
             resp.raise_for_status()
             return True
         except Exception as exc:
