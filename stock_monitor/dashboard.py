@@ -19,12 +19,16 @@ _price_cache: Dict[str, dict] = {}
 
 def update_price_cache(data: dict) -> None:
     _price_cache[data["symbol"]] = {
-        "symbol":     data["symbol"],
-        "price":      data["price"],
-        "change_pct": data["change_pct"],
-        "volume":     data["volume"],
-        "session":    data["session"],
-        "updated":    datetime.now().strftime("%H:%M:%S"),
+        "symbol":          data["symbol"],
+        "price":           data["price"],
+        "change_pct":      data["change_pct"],
+        "from_open_pct":   data.get("from_open_pct"),
+        "since_close_pct": data.get("since_close_pct"),
+        "volume":          data["volume"],
+        "day_high":        data.get("day_high"),
+        "day_low":         data.get("day_low"),
+        "session":         data["session"],
+        "updated":         datetime.now().strftime("%H:%M:%S"),
     }
 
 
@@ -165,18 +169,33 @@ function sessionLabel(s) {
   return {pre:'Pre-Market', regular:'Regular', after:'After-Hours', closed:'Closed'}[s] || s;
 }
 
+function pctCell(val) {
+  if (val == null) return '<span class="flat">—</span>';
+  const cls  = val > 0 ? 'up' : val < 0 ? 'down' : 'flat';
+  const sign = val >= 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${val.toFixed(2)}%</span>`;
+}
+
 function renderStocks(stocks) {
   if (!stocks.length) return;
   const html = `<table>
-    <thead><tr><th>Symbol</th><th>Price</th><th>Change</th><th>Volume</th><th>Session</th><th>Updated</th></tr></thead>
+    <thead><tr>
+      <th>סמל</th><th>מחיר</th>
+      <th>שינוי יומי</th>
+      <th>מסגירה</th>
+      <th>נפח</th><th>גבוה / נמוך</th><th>סשן</th><th>עודכן</th>
+    </tr></thead>
     <tbody>${stocks.map(s => {
-      const cls = s.change_pct > 0 ? 'up' : s.change_pct < 0 ? 'down' : 'flat';
-      const sign = s.change_pct > 0 ? '+' : '';
+      const scVal = s.since_close_pct != null ? s.since_close_pct : s.from_open_pct;
+      const hi = s.day_high ? '$'+s.day_high.toFixed(2) : '—';
+      const lo = s.day_low  ? '$'+s.day_low.toFixed(2)  : '—';
       return `<tr>
         <td><span class="symbol">${s.symbol}</span></td>
         <td><span class="price">$${s.price.toFixed(2)}</span></td>
-        <td><span class="${cls}">${sign}${s.change_pct.toFixed(2)}%</span></td>
+        <td>${pctCell(s.change_pct)}</td>
+        <td>${pctCell(scVal)}</td>
         <td><span class="volume">${fmt(s.volume)}</span></td>
+        <td><span class="volume">${hi} / ${lo}</span></td>
         <td><span class="session-tag ${sessionClass(s.session)}">${sessionLabel(s.session)}</span></td>
         <td><span class="volume">${s.updated}</span></td>
       </tr>`;

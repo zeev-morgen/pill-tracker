@@ -24,7 +24,7 @@ import logging.handlers
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import uvicorn
 
@@ -35,6 +35,7 @@ from .data_feed import StockDataFeed, get_market_session
 from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
 from .store import alert_store
+from .telegram_bot import TelegramCommandBot
 from .webhook_server import create_webhook_app
 
 
@@ -78,6 +79,8 @@ class StockMonitorApp:
             interval_seconds=config.monitoring.interval_seconds,
             include_extended_hours=config.monitoring.include_extended_hours,
         )
+        # Tracks last regular-session price per symbol for since-close calculation
+        self._regular_close: Dict[str, Optional[float]] = {}
         self._log = logging.getLogger(__name__)
 
     # ── Core monitoring loop ──────────────────────────────────────────────────
@@ -93,11 +96,28 @@ class StockMonitorApp:
                     self._log.warning("No data for %s — skipping", symbol)
                     continue
 
+                # ── Since-close tracking ──────────────────────────────────
+                if session == "regular":
+                    # Store current price as today's running close
+                    self._regular_close[symbol] = data["price"]
+                elif session in ("after", "pre") and symbol not in self._regular_close:
+                    # App started after close — fetch from history once
+                    rc = self.data_feed.get_regular_close_price(symbol)
+                    if rc:
+                        self._regular_close[symbol] = rc
+
+                rc = self._regular_close.get(symbol)
+                if rc and rc > 0 and session != "regular":
+                    data["regular_close"]    = rc
+                    data["since_close_pct"]  = (data["price"] - rc) / rc * 100.0
+                # ─────────────────────────────────────────────────────────
+
                 self._log.info(
-                    "%-6s  $%8.2f  %+.2f%%  vol=%10s  [%s]",
+                    "%-6s  $%8.2f  %+.2f%%  sc=%s  vol=%10s  [%s]",
                     symbol,
                     data["price"],
                     data["change_pct"],
+                    f"{data['since_close_pct']:+.2f}%" if data.get("since_close_pct") is not None else "N/A",
                     f"{data['volume']:,}",
                     session,
                 )
@@ -132,6 +152,18 @@ class StockMonitorApp:
 
         self.scheduler.add_callback(self.monitor_cycle)
         self.scheduler.start()
+
+        # Start Telegram command bot if token is configured
+        tg_cfg = self.config.notifications.telegram
+        if tg_cfg.enabled and tg_cfg.bot_token:
+            tg_bot = TelegramCommandBot(
+                bot_token=tg_cfg.bot_token,
+                data_feed=self.data_feed,
+                monitored_symbols=[s.symbol for s in self.config.stocks],
+                regular_close_ref=self._regular_close,
+            )
+            asyncio.create_task(tg_bot.poll_loop())
+            self._log.info("Telegram command bot active — send a ticker to your bot")
 
         webhook_app = create_webhook_app(
             self.dispatcher, self.config.tradingview_secret

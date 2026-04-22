@@ -105,27 +105,52 @@ class StockDataFeed:
             )
             day_high = self._fi_get(fi, "day_high", "dayHigh")
             day_low  = self._fi_get(fi, "day_low",  "dayLow")
+            open_price = self._fi_get(fi, "open", "regularMarketOpen")
 
             change_pct = (
                 (price - prev_close) / prev_close * 100.0
                 if prev_close and prev_close != 0
                 else 0.0
             )
+            from_open_pct = (
+                (price - open_price) / open_price * 100.0
+                if open_price and open_price != 0
+                else None
+            )
 
             return {
-                "symbol":     symbol,
-                "price":      price,
-                "prev_close": prev_close,
-                "change_pct": change_pct,
-                "volume":     int(volume) if volume is not None else 0,
-                "day_high":   day_high,
-                "day_low":    day_low,
-                "session":    get_market_session(),
-                "timestamp":  datetime.now(NYSE_TZ),
+                "symbol":        symbol,
+                "price":         price,
+                "prev_close":    prev_close,
+                "open_price":    open_price,
+                "change_pct":    change_pct,
+                "from_open_pct": from_open_pct,
+                "since_close_pct": None,   # filled in by monitor_cycle after-hours
+                "regular_close": None,     # filled in by monitor_cycle
+                "volume":        int(volume) if volume is not None else 0,
+                "day_high":      day_high,
+                "day_low":       day_low,
+                "session":       get_market_session(),
+                "timestamp":     datetime.now(NYSE_TZ),
             }
 
         except Exception as exc:
             logger.error("Error fetching data for %s: %s", symbol, exc, exc_info=True)
+            return None
+
+    def get_regular_close_price(self, symbol: str) -> Optional[float]:
+        """Return today's regular-session closing price (last bar at/before 4 PM ET).
+
+        Used to compute the after-hours since-close change when the app starts
+        after the market has already closed.
+        """
+        try:
+            hist = self._ticker(symbol).history(period="2d", interval="5m", prepost=False)
+            if hist.empty:
+                return None
+            return float(hist["Close"].iloc[-1])
+        except Exception as exc:
+            logger.error("Error fetching regular close for %s: %s", symbol, exc)
             return None
 
     def get_intraday_history(
