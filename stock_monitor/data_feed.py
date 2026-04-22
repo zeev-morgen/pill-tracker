@@ -80,32 +80,42 @@ class StockDataFeed:
         """
         Fetch the most current quote for *symbol*.
 
-        Returns a dict with keys: symbol, price, prev_close, change_pct,
-        volume, day_high, day_low, session, timestamp.
-        Returns None on failure.
+        During regular hours: uses fast_info (fast, no extra network call).
+        During extended hours: supplements fast_info with history() calls to
+        get the accurate after-hours price and the real 4PM regular close —
+        because fast_info.last_price returns the regular close during AH sessions.
         """
         try:
-            fi = self._ticker(symbol).fast_info
+            fi      = self._ticker(symbol).fast_info
+            session = get_market_session()
 
-            # yfinance ≥ 1.0 uses snake_case; fall back to older camelCase names
-            price = self._fi_get(
-                fi, "last_price", "lastPrice", "regularMarketPrice"
-            )
-            if price is None:
-                logger.warning("No price available for %s", symbol)
-                return None
-
-            prev_close = self._fi_get(
+            # ── Base fields from fast_info ────────────────────────────────
+            price = self._fi_get(fi, "last_price", "lastPrice", "regularMarketPrice")
+            prev_close  = self._fi_get(
                 fi,
                 "previous_close", "previousClose",
                 "regular_market_previous_close", "regularMarketPreviousClose",
             )
-            volume = self._fi_get(
-                fi, "last_volume", "lastVolume", "day_volume", "dayVolume"
-            )
-            day_high = self._fi_get(fi, "day_high", "dayHigh")
-            day_low  = self._fi_get(fi, "day_low",  "dayLow")
-            open_price = self._fi_get(fi, "open", "regularMarketOpen")
+            volume     = self._fi_get(fi, "last_volume", "lastVolume", "day_volume", "dayVolume")
+            day_high   = self._fi_get(fi, "day_high",  "dayHigh")
+            day_low    = self._fi_get(fi, "day_low",   "dayLow")
+            open_price = self._fi_get(fi, "open",      "regularMarketOpen")
+
+            # ── Extended-hours correction ─────────────────────────────────
+            # fast_info.last_price == regular close during AH/pre sessions in
+            # yfinance ≥ 1.0, so we pull the real prices from 5-min history.
+            regular_close: Optional[float] = None
+            if session in ("after", "pre"):
+                ext = self._get_extended_prices(symbol)
+                if ext:
+                    price         = ext["current_price"]   # real AH/pre price
+                    regular_close = ext["regular_close"]   # 4PM close
+                    if ext.get("prev_close"):
+                        prev_close = ext["prev_close"]     # yesterday's close
+
+            if price is None:
+                logger.warning("No price available for %s", symbol)
+                return None
 
             change_pct = (
                 (price - prev_close) / prev_close * 100.0
@@ -117,25 +127,69 @@ class StockDataFeed:
                 if open_price and open_price != 0
                 else None
             )
+            since_close_pct = (
+                (price - regular_close) / regular_close * 100.0
+                if regular_close and regular_close != 0 and session != "regular"
+                else None
+            )
 
             return {
-                "symbol":        symbol,
-                "price":         price,
-                "prev_close":    prev_close,
-                "open_price":    open_price,
-                "change_pct":    change_pct,
-                "from_open_pct": from_open_pct,
-                "since_close_pct": None,   # filled in by monitor_cycle after-hours
-                "regular_close": None,     # filled in by monitor_cycle
-                "volume":        int(volume) if volume is not None else 0,
-                "day_high":      day_high,
-                "day_low":       day_low,
-                "session":       get_market_session(),
-                "timestamp":     datetime.now(NYSE_TZ),
+                "symbol":          symbol,
+                "price":           price,
+                "prev_close":      prev_close,
+                "open_price":      open_price,
+                "regular_close":   regular_close,
+                "change_pct":      change_pct,
+                "from_open_pct":   from_open_pct,
+                "since_close_pct": since_close_pct,
+                "volume":          int(volume) if volume is not None else 0,
+                "day_high":        day_high,
+                "day_low":         day_low,
+                "session":         session,
+                "timestamp":       datetime.now(NYSE_TZ),
             }
 
         except Exception as exc:
             logger.error("Error fetching data for %s: %s", symbol, exc, exc_info=True)
+            return None
+
+    def _get_extended_prices(self, symbol: str) -> Optional[Dict]:
+        """Return accurate prices during pre/after-hours from intraday history.
+
+        Returns dict with keys: current_price, regular_close, prev_close (optional).
+        """
+        try:
+            # 5-min bars including extended hours → last bar = current AH price
+            hist_pre = self._ticker(symbol).history(
+                period="2d", interval="5m", prepost=True
+            )
+            # Daily bars (no extended hours) → iloc[-1] = today's close, [-2] = yesterday
+            hist_daily = self._ticker(symbol).history(
+                period="5d", interval="1d", prepost=False
+            )
+
+            if hist_pre.empty:
+                return None
+
+            current_price = float(hist_pre["Close"].iloc[-1])
+
+            regular_close: Optional[float] = None
+            prev_close:    Optional[float] = None
+
+            if not hist_daily.empty:
+                # Today's regular session close is always the last bar in daily history
+                regular_close = float(hist_daily["Close"].iloc[-1])
+                if len(hist_daily) >= 2:
+                    prev_close = float(hist_daily["Close"].iloc[-2])
+
+            return {
+                "current_price": current_price,
+                "regular_close": regular_close,
+                "prev_close":    prev_close,
+            }
+
+        except Exception as exc:
+            logger.warning("Extended-hours history failed for %s: %s", symbol, exc)
             return None
 
     def get_regular_close_price(self, symbol: str) -> Optional[float]:

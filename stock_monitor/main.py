@@ -96,21 +96,11 @@ class StockMonitorApp:
                     self._log.warning("No data for %s — skipping", symbol)
                     continue
 
-                # ── Since-close tracking ──────────────────────────────────
+                # Track regular-session price for Telegram bot & alert engine
                 if session == "regular":
-                    # Store current price as today's running close
                     self._regular_close[symbol] = data["price"]
-                elif session in ("after", "pre") and symbol not in self._regular_close:
-                    # App started after close — fetch from history once
-                    rc = self.data_feed.get_regular_close_price(symbol)
-                    if rc:
-                        self._regular_close[symbol] = rc
-
-                rc = self._regular_close.get(symbol)
-                if rc and rc > 0 and session != "regular":
-                    data["regular_close"]    = rc
-                    data["since_close_pct"]  = (data["price"] - rc) / rc * 100.0
-                # ─────────────────────────────────────────────────────────
+                elif data.get("regular_close"):
+                    self._regular_close[symbol] = data["regular_close"]
 
                 self._log.info(
                     "%-6s  $%8.2f  %+.2f%%  sc=%s  vol=%10s  [%s]",
