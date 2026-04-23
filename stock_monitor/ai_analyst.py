@@ -4,6 +4,8 @@ import logging
 from typing import Optional
 
 import anthropic
+import httpx
+import urllib3
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -27,8 +29,36 @@ class StockAnalyst:
     """Generates a Hebrew AI analysis for a stock symbol using Claude."""
 
     def __init__(self, api_key: str, model: str = "claude-opus-4-7") -> None:
-        self._client = anthropic.Anthropic(api_key=api_key)
-        self._model  = model
+        self._api_key        = api_key
+        self._model          = model
+        self._client         = anthropic.Anthropic(api_key=api_key)
+        self._insecure_client: Optional[anthropic.Anthropic] = None   # lazy SSL fallback
+
+    def _get_insecure_client(self) -> anthropic.Anthropic:
+        """Build a verify=False client for networks with TLS inspection (Kaspersky etc.)."""
+        if self._insecure_client is None:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            self._insecure_client = anthropic.Anthropic(
+                api_key=self._api_key,
+                http_client=httpx.Client(verify=False, timeout=60.0),
+            )
+        return self._insecure_client
+
+    def _stream_once(self, client: anthropic.Anthropic, prompt: str):
+        with client.messages.stream(
+            model=self._model,
+            max_tokens=1500,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            return stream.get_final_message()
 
     def analyze(self, symbol: str, data: dict) -> str:
         """Return a Hebrew analysis string. Blocks until the full response arrives."""
@@ -37,26 +67,22 @@ class StockAnalyst:
         momentum = self._fetch_momentum(symbol, data)
         prompt   = self._build_prompt(symbol, data, extra, news, momentum)
         try:
-            with self._client.messages.stream(
-                model=self._model,
-                max_tokens=1500,
-                thinking={"type": "adaptive"},
-                system=[
-                    {
-                        "type": "text",
-                        "text": _SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                msg = stream.get_final_message()
+            try:
+                msg = self._stream_once(self._client, prompt)
+            except (anthropic.APIConnectionError, httpx.ConnectError) as exc:
+                logger.warning(
+                    "Anthropic API connection error (%s) — retrying with SSL verify=False. "
+                    "A proxy/antivirus is likely intercepting HTTPS.",
+                    exc.__class__.__name__,
+                )
+                msg = self._stream_once(self._get_insecure_client(), prompt)
+
             return next(
                 (b.text for b in msg.content if b.type == "text"),
                 "לא התקבל ניתוח.",
             )
         except Exception as exc:
-            logger.error("AI analysis failed for %s: %s", symbol, exc)
+            logger.error("AI analysis failed for %s: %s", symbol, exc, exc_info=True)
             return f"❌ שגיאה בניתוח AI עבור {symbol}: {exc}"
 
     # ── Helpers ───────────────────────────────────────────────────────────────
