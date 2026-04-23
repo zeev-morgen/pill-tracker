@@ -46,17 +46,17 @@ def is_market_open(include_extended: bool = True) -> bool:
 # ── Data feed ─────────────────────────────────────────────────────────────────
 
 class StockDataFeed:
-    """Thin wrapper around yfinance.Ticker with caching and error handling."""
+    """Thin wrapper around yfinance.Ticker with per-call fresh instances."""
 
     def __init__(self) -> None:
-        self._tickers: Dict[str, yf.Ticker] = {}
+        pass
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _ticker(self, symbol: str) -> yf.Ticker:
-        if symbol not in self._tickers:
-            self._tickers[symbol] = yf.Ticker(symbol)
-        return self._tickers[symbol]
+        # Always create a fresh Ticker so fast_info and history don't return
+        # stale cached values from the previous polling cycle.
+        return yf.Ticker(symbol)
 
     @staticmethod
     def _fi_get(fast_info, *attrs) -> Optional[float]:
