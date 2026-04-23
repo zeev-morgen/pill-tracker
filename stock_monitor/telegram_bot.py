@@ -132,13 +132,15 @@ class TelegramCommandBot:
         monitored_symbols: List[str],
         regular_close_ref: Dict[str, Optional[float]],
         analyst=None,                       # Optional[StockAnalyst]
+        authorized_chat_id: str = "",       # if set, bot ignores all other users
     ) -> None:
-        self._base     = f"https://api.telegram.org/bot{bot_token}"
-        self._feed     = data_feed
-        self._syms     = [s.upper() for s in monitored_symbols]
-        self._rc_ref   = regular_close_ref  # shared dict from StockMonitorApp
-        self._analyst  = analyst
-        self._offset   = 0
+        self._base               = f"https://api.telegram.org/bot{bot_token}"
+        self._feed               = data_feed
+        self._syms               = [s.upper() for s in monitored_symbols]
+        self._rc_ref             = regular_close_ref  # shared dict from StockMonitorApp
+        self._analyst            = analyst
+        self._authorized_chat_id = authorized_chat_id
+        self._offset             = 0
 
     # ── Polling loop ──────────────────────────────────────────────────────────
 
@@ -185,6 +187,11 @@ class TelegramCommandBot:
         chat_id = msg["chat"]["id"]
         text    = msg.get("text", "").strip()
         if not text:
+            return
+
+        # Ignore messages from unauthorized users
+        if self._authorized_chat_id and str(chat_id) != self._authorized_chat_id:
+            logger.debug("Ignoring message from unauthorized chat_id %s", chat_id)
             return
 
         # Strip leading slash and uppercase

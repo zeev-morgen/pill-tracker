@@ -173,6 +173,7 @@ class StockMonitorApp:
                 monitored_symbols=[s.symbol for s in self.config.stocks],
                 regular_close_ref=self._regular_close,
                 analyst=self._analyst,
+                authorized_chat_id=tg_cfg.chat_id,
             )
             asyncio.create_task(tg_bot.poll_loop())
             self._log.info("Telegram command bot active — send a ticker to your bot")
