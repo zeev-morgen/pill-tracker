@@ -153,6 +153,8 @@ class TelegramCommandBot:
                     self._offset = upd["update_id"] + 1
                     if "message" in upd:
                         asyncio.create_task(self._handle(upd["message"]))
+                    elif "callback_query" in upd:
+                        asyncio.create_task(self._handle_callback(upd["callback_query"]))
             except Exception as exc:
                 logger.debug("Bot poll error: %s", exc)
             await asyncio.sleep(2)
@@ -162,24 +164,39 @@ class TelegramCommandBot:
     def _get_updates(self) -> list:
         r = _get(
             f"{self._base}/getUpdates",
-            params={"offset": self._offset, "timeout": 1, "limit": 10},
+            params={
+                "offset":          self._offset,
+                "timeout":         1,
+                "limit":           10,
+                "allowed_updates": '["message","callback_query"]',
+            },
         )
         if r.status_code == 200:
             return r.json().get("result", [])
         return []
 
-    def _send(self, chat_id: int, text: str) -> None:
+    def _send(self, chat_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
         try:
-            _post(
-                f"{self._base}/sendMessage",
-                json={
-                    "chat_id":    chat_id,
-                    "text":       text,
-                    "parse_mode": "Markdown",
-                },
-            )
+            payload = {
+                "chat_id":    chat_id,
+                "text":       text,
+                "parse_mode": "Markdown",
+            }
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            _post(f"{self._base}/sendMessage", json=payload)
         except Exception as exc:
             logger.error("Bot send error: %s", exc)
+
+    def _answer_callback(self, callback_id: str, text: str = "") -> None:
+        """Acknowledge a callback_query so the loading spinner stops."""
+        try:
+            _post(
+                f"{self._base}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text},
+            )
+        except Exception as exc:
+            logger.debug("answerCallbackQuery error: %s", exc)
 
     # ── Message handling ──────────────────────────────────────────────────────
 
@@ -232,7 +249,33 @@ class TelegramCommandBot:
         if rc and data["session"] != "regular":
             data["regular_close"]    = rc
             data["since_close_pct"]  = (data["price"] - rc) / rc * 100.0
-        self._send(chat_id, _format_stock(symbol, data))
+
+        # Inline button to trigger AI analysis on-demand
+        reply_markup = None
+        if self._analyst is not None:
+            reply_markup = {
+                "inline_keyboard": [[
+                    {"text": "🧠 ניתוח AI + המלצה", "callback_data": f"analyze:{symbol}"}
+                ]]
+            }
+        self._send(chat_id, _format_stock(symbol, data), reply_markup=reply_markup)
+
+    async def _handle_callback(self, cb: dict) -> None:
+        """Process an inline-keyboard button press."""
+        cb_id   = cb.get("id", "")
+        chat_id = cb.get("message", {}).get("chat", {}).get("id")
+        data    = cb.get("data", "")
+
+        # Authorization check
+        if self._authorized_chat_id and str(chat_id) != self._authorized_chat_id:
+            self._answer_callback(cb_id)
+            return
+
+        self._answer_callback(cb_id, "מתחיל ניתוח…")
+
+        if data.startswith("analyze:"):
+            symbol = data.split(":", 1)[1].upper()
+            await self._send_analysis(chat_id, symbol)
 
     async def _send_status(self, chat_id: int) -> None:
         if not self._syms:
