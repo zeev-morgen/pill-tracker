@@ -182,3 +182,17 @@ monitoring:
 logging:
   level: "INFO"         # DEBUG | INFO | WARNING | ERROR
   file: "logs/stock_monitor.log"
+
+# ── AI Analysis (Claude) ──────────────────────
+ai:
+  enabled: false        # Set to true after adding ANTHROPIC_API_KEY to .env
+  api_key: "${ANTHROPIC_API_KEY}"
+  model: "claude-opus-4-7"
+
+# ── Earnings Alerts ───────────────────────────
+earnings:
+  enabled: true
+  # Alert N days before a watched stock reports results
+  alert_at_days: [7, 3, 1]
+  # Time to run the daily check (ET, weekdays only)
+  check_time: "08:00"

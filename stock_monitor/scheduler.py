@@ -30,12 +30,17 @@ class MarketScheduler:
         self.include_extended     = include_extended_hours
         self._scheduler           = AsyncIOScheduler(timezone=NYSE_TZ)
         self._callbacks: List[Callable] = []
+        self._daily_jobs: List[tuple]   = []   # (fn, hour, minute)
 
     # ── Registration ──────────────────────────────────────────────────────────
 
     def add_callback(self, fn: Callable) -> None:
         """Register an async function to be called on each monitor tick."""
         self._callbacks.append(fn)
+
+    def add_daily_job(self, fn: Callable, hour: int = 8, minute: int = 0) -> None:
+        """Register an async function to run Mon-Fri at the given ET time."""
+        self._daily_jobs.append((fn, hour, minute))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -70,6 +75,17 @@ class MarketScheduler:
             trigger=CronTrigger(day_of_week="mon-fri", hour=20, minute=0, timezone=NYSE_TZ),
             id="after_market_close",
         )
+
+        for fn, hour, minute in self._daily_jobs:
+            self._scheduler.add_job(
+                fn,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=hour, minute=minute, timezone=NYSE_TZ
+                ),
+                id=f"daily_{fn.__name__}",
+                replace_existing=True,
+                max_instances=1,
+            )
 
         self._scheduler.start()
         logger.info(

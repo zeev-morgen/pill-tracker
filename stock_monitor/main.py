@@ -32,6 +32,7 @@ from .alert_engine import AlertEngine
 from .config import AppConfig, load_config
 from .dashboard import update_price_cache
 from .data_feed import StockDataFeed, get_market_session
+from .earnings import EarningsMonitor
 from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
 from .store import alert_store
@@ -82,6 +83,26 @@ class StockMonitorApp:
         # Tracks last regular-session price per symbol for since-close calculation
         self._regular_close: Dict[str, Optional[float]] = {}
         self._log = logging.getLogger(__name__)
+
+        # ── Optional subsystems ───────────────────────────────────────────────
+        self._analyst = None
+        if config.ai.enabled and config.ai.api_key:
+            from .ai_analyst import StockAnalyst
+            self._analyst = StockAnalyst(api_key=config.ai.api_key, model=config.ai.model)
+            self._log.info("AI analyst enabled (model=%s)", config.ai.model)
+
+        self._earnings: Optional[EarningsMonitor] = None
+        if config.earnings.enabled:
+            self._earnings = EarningsMonitor(
+                symbols=[s.symbol for s in config.stocks],
+                dispatcher=self.dispatcher,
+                alert_days=config.earnings.alert_at_days,
+            )
+            h, m = map(int, config.earnings.check_time.split(":"))
+            self.scheduler.add_daily_job(self._earnings.daily_check, hour=h, minute=m)
+            self._log.info(
+                "Earnings monitor enabled — daily check at %s ET", config.earnings.check_time
+            )
 
     # ── Core monitoring loop ──────────────────────────────────────────────────
 
@@ -151,6 +172,7 @@ class StockMonitorApp:
                 data_feed=self.data_feed,
                 monitored_symbols=[s.symbol for s in self.config.stocks],
                 regular_close_ref=self._regular_close,
+                analyst=self._analyst,
             )
             asyncio.create_task(tg_bot.poll_loop())
             self._log.info("Telegram command bot active — send a ticker to your bot")

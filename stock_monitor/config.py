@@ -95,6 +95,20 @@ class LoggingConfig:
 
 
 @dataclass
+class AIConfig:
+    enabled: bool = False
+    api_key: str = ""
+    model: str = "claude-opus-4-7"
+
+
+@dataclass
+class EarningsConfig:
+    enabled: bool = True
+    alert_at_days: List[int] = field(default_factory=lambda: [7, 3, 1])
+    check_time: str = "08:00"   # HH:MM ET
+
+
+@dataclass
 class AppConfig:
     stocks: List[StockConfig] = field(default_factory=list)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
@@ -102,6 +116,8 @@ class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    ai: AIConfig = field(default_factory=AIConfig)
+    earnings: EarningsConfig = field(default_factory=EarningsConfig)
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────────
@@ -154,6 +170,8 @@ def load_config(config_path: str = "config/config.yaml") -> AppConfig:
     mo = raw.get("monitoring", {})
     lg = raw.get("logging", {})
     tv = raw.get("tradingview", {})
+    ai = raw.get("ai", {})
+    er = raw.get("earnings", {})
 
     return AppConfig(
         stocks=stocks,
@@ -171,5 +189,15 @@ def load_config(config_path: str = "config/config.yaml") -> AppConfig:
         logging=LoggingConfig(
             level=str(lg.get("level", "INFO")),
             file=str(lg.get("file", "logs/stock_monitor.log")),
+        ),
+        ai=AIConfig(
+            enabled=bool(ai.get("enabled", False)),
+            api_key=str(ai.get("api_key", "")),
+            model=str(ai.get("model", "claude-opus-4-7")),
+        ),
+        earnings=EarningsConfig(
+            enabled=bool(er.get("enabled", True)),
+            alert_at_days=list(er.get("alert_at_days", [7, 3, 1])),
+            check_time=str(er.get("check_time", "08:00")),
         ),
     )

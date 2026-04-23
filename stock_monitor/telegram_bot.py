@@ -3,11 +3,13 @@ Telegram command bot — responds to ticker queries and slash commands in Hebrew
 
 Commands
 ────────
-/start          ← ברוך הבא
-/help           ← רשימת פקודות
-/status         ← כל המניות במעקב עם מחיר עדכני
-/[ticker]       ← נתוני מניה, לדוגמה /aapl
-[TICKER]        ← שלח טיקר ישירות, לדוגמה NVDA
+/start              ← ברוך הבא
+/help               ← רשימת פקודות
+/status             ← כל המניות במעקב עם מחיר עדכני
+/analyze AAPL       ← ניתוח AI של מניה
+ניתוח AAPL          ← ניתוח AI (עברית)
+/[ticker]           ← נתוני מניה, לדוגמה /aapl
+[TICKER]            ← שלח טיקר ישירות, לדוגמה NVDA
 
 The bot runs as a background asyncio task using long-polling.
 """
@@ -27,7 +29,8 @@ from .data_feed import StockDataFeed, get_market_session
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
 
-_TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
+_TICKER_RE  = re.compile(r"^[A-Z]{1,6}$")
+_ANALYZE_RE = re.compile(r"^(?:ANALYZE|ניתוח)\s+([A-Z]{1,6})$", re.IGNORECASE)
 
 _SESSION_HE = {
     "pre":     "טרום מסחר 🌅",
@@ -39,6 +42,7 @@ _HELP_TEXT = (
     "📋 *פקודות זמינות:*\n\n"
     "• שלח *טיקר* כלשהו ← נתונים מלאים\n"
     "  לדוגמה: `AAPL`, `NVDA`, `AMZN`\n\n"
+    "• `ניתוח AAPL` ← ניתוח AI של מניה\n"
     "• /status ← כל המניות במעקב\n"
     "• /help   ← הודעה זו\n"
 )
@@ -127,12 +131,14 @@ class TelegramCommandBot:
         data_feed: StockDataFeed,
         monitored_symbols: List[str],
         regular_close_ref: Dict[str, Optional[float]],
+        analyst=None,                       # Optional[StockAnalyst]
     ) -> None:
-        self._base   = f"https://api.telegram.org/bot{bot_token}"
-        self._feed   = data_feed
-        self._syms   = [s.upper() for s in monitored_symbols]
-        self._rc_ref = regular_close_ref   # shared dict from StockMonitorApp
-        self._offset = 0
+        self._base     = f"https://api.telegram.org/bot{bot_token}"
+        self._feed     = data_feed
+        self._syms     = [s.upper() for s in monitored_symbols]
+        self._rc_ref   = regular_close_ref  # shared dict from StockMonitorApp
+        self._analyst  = analyst
+        self._offset   = 0
 
     # ── Polling loop ──────────────────────────────────────────────────────────
 
@@ -184,6 +190,8 @@ class TelegramCommandBot:
         # Strip leading slash and uppercase
         cmd = text.lstrip("/").upper()
 
+        analyze_match = _ANALYZE_RE.match(text.strip())
+
         if cmd in ("START", "שלום", "HELLO"):
             self._send(
                 chat_id,
@@ -195,6 +203,9 @@ class TelegramCommandBot:
             self._send(chat_id, _HELP_TEXT)
         elif cmd == "STATUS":
             await self._send_status(chat_id)
+        elif analyze_match:
+            symbol = analyze_match.group(1).upper()
+            await self._send_analysis(chat_id, symbol)
         elif _TICKER_RE.match(cmd):
             await self._send_ticker(chat_id, cmd)
         else:
@@ -232,3 +243,20 @@ class TelegramCommandBot:
             else:
                 lines.append(f"• *{sym}*: N/A\n")
         self._send(chat_id, "".join(lines))
+
+    async def _send_analysis(self, chat_id: int, symbol: str) -> None:
+        if self._analyst is None:
+            self._send(
+                chat_id,
+                "❌ ניתוח AI אינו מופעל.\n"
+                "הגדר `ANTHROPIC_API_KEY` ב-`.env` ואפשר `ai.enabled: true` בקונפיגורציה.",
+            )
+            return
+        self._send(chat_id, f"🤖 מנתח את *{symbol}* עם AI… (עשוי לקחת עד 30 שניות)")
+        loop = asyncio.get_event_loop()
+        # Run the blocking Claude API call in a thread so we don't block the event loop
+        analysis = await loop.run_in_executor(
+            None, self._analyst.analyze, symbol,
+            self._feed.get_current_data(symbol) or {}
+        )
+        self._send(chat_id, f"🧠 *ניתוח AI — {symbol}*\n{'─' * 20}\n{analysis}")
