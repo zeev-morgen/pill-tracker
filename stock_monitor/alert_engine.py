@@ -58,6 +58,10 @@ class AlertEngine:
         # 10-day average volume cache: symbol → (avg_volume, cache_timestamp)
         self._avg_vol_cache: Dict[str, Tuple[float, datetime]] = {}
 
+        # Threshold crossing state: (symbol, direction, level) → was_triggered_last_poll
+        # None = first observation (no alert fired yet), True/False = prior state
+        self._threshold_states: Dict[Tuple[str, str, float], Optional[bool]] = {}
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _history_for(self, symbol: str) -> deque:
@@ -197,36 +201,50 @@ class AlertEngine:
     def _check_price_threshold(
         self, symbol: str, alert: AlertConfig, price: float
     ) -> Optional[AlertEvent]:
-        if alert.above is not None and price >= alert.above:
-            key = f"price_above_{alert.above}"
-            if not self._on_cooldown(symbol, key, alert.cooldown_minutes):
-                self._set_cooldown(symbol, key)
-                return AlertEvent(
-                    symbol=symbol,
-                    alert_type="price_threshold",
-                    message=(
-                        f"${symbol} crossed ABOVE ${alert.above:.2f} "
-                        f"(now ${price:.2f})"
-                    ),
-                    price=price,
-                    timestamp=datetime.now(NYSE_TZ),
-                    severity="INFO",
-                )
+        if alert.above is not None:
+            sk = (symbol, "above", alert.above)
+            prev = self._threshold_states.get(sk)        # None on first poll
+            now_above = price >= alert.above
+            self._threshold_states[sk] = now_above
 
-        if alert.below is not None and price <= alert.below:
-            key = f"price_below_{alert.below}"
-            if not self._on_cooldown(symbol, key, alert.cooldown_minutes):
-                self._set_cooldown(symbol, key)
-                return AlertEvent(
-                    symbol=symbol,
-                    alert_type="price_threshold",
-                    message=(
-                        f"${symbol} crossed BELOW ${alert.below:.2f} "
-                        f"(now ${price:.2f})"
-                    ),
-                    price=price,
-                    timestamp=datetime.now(NYSE_TZ),
-                    severity="WARNING",
-                )
+            # Fire only on the upward edge; skip the very first observation so
+            # we don't alert just because the price is already above at startup.
+            if now_above and prev is not None and not prev:
+                key = f"price_above_{alert.above}"
+                if not self._on_cooldown(symbol, key, alert.cooldown_minutes):
+                    self._set_cooldown(symbol, key)
+                    return AlertEvent(
+                        symbol=symbol,
+                        alert_type="price_threshold",
+                        message=(
+                            f"${symbol} crossed ABOVE ${alert.above:.2f} "
+                            f"(now ${price:.2f})"
+                        ),
+                        price=price,
+                        timestamp=datetime.now(NYSE_TZ),
+                        severity="INFO",
+                    )
+
+        if alert.below is not None:
+            sk = (symbol, "below", alert.below)
+            prev = self._threshold_states.get(sk)
+            now_below = price <= alert.below
+            self._threshold_states[sk] = now_below
+
+            if now_below and prev is not None and not prev:
+                key = f"price_below_{alert.below}"
+                if not self._on_cooldown(symbol, key, alert.cooldown_minutes):
+                    self._set_cooldown(symbol, key)
+                    return AlertEvent(
+                        symbol=symbol,
+                        alert_type="price_threshold",
+                        message=(
+                            f"${symbol} crossed BELOW ${alert.below:.2f} "
+                            f"(now ${price:.2f})"
+                        ),
+                        price=price,
+                        timestamp=datetime.now(NYSE_TZ),
+                        severity="WARNING",
+                    )
 
         return None

@@ -95,8 +95,7 @@ class EarningsMonitor:
             if ed_df is not None and not ed_df.empty:
                 future = [idx for idx in ed_df.index if idx.date() >= today]
                 if future:
-                    # earnings_dates is sorted newest-first; last entry = earliest future
-                    ts = future[-1]
+                    ts = min(future)   # min() is sort-order-safe regardless of DataFrame order
                     return ts.date() if hasattr(ts, "date") else ts
 
         except Exception as exc:

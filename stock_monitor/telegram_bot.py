@@ -304,9 +304,10 @@ class TelegramCommandBot:
             return
         self._send(chat_id, f"🤖 מנתח את *{symbol}* עם AI… (עשוי לקחת עד 30 שניות)")
         loop = asyncio.get_event_loop()
-        # Run the blocking Claude API call in a thread so we don't block the event loop
-        analysis = await loop.run_in_executor(
-            None, self._analyst.analyze, symbol,
-            self._feed.get_current_data(symbol) or {}
-        )
+        # Both get_current_data and analyze are blocking — run both in the executor
+        def _fetch_and_analyze() -> str:
+            data = self._feed.get_current_data(symbol) or {}
+            return self._analyst.analyze(symbol, data)
+
+        analysis = await loop.run_in_executor(None, _fetch_and_analyze)
         self._send(chat_id, f"🧠 *ניתוח AI — {symbol}*\n{'─' * 20}\n{analysis}")
