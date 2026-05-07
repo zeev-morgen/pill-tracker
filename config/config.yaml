@@ -14,10 +14,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.0
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 270.0
-        below: 240.0
-        cooldown_minutes: 120
 
   - symbol: ABCL
     alerts:
@@ -28,10 +24,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.5
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 5.0
-        below: 3.5
-        cooldown_minutes: 120
 
   - symbol: SEDG
     alerts:
@@ -42,10 +34,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.5
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 50.0
-        below: 38.0
-        cooldown_minutes: 120
 
   - symbol: CF
     alerts:
@@ -56,10 +44,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.0
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 130.0
-        below: 115.0
-        cooldown_minutes: 120
 
   - symbol: SNDK
     alerts:
@@ -70,10 +54,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.5
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 1050.0
-        below: 900.0
-        cooldown_minutes: 120
 
   - symbol: META
     alerts:
@@ -84,10 +64,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.0
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 700.0
-        below: 640.0
-        cooldown_minutes: 120
 
   - symbol: MENS
     alerts:
@@ -98,10 +74,6 @@ stocks:
       - type: volume_spike
         multiplier: 3.0
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 3.0
-        below: 1.8
-        cooldown_minutes: 120
 
   - symbol: FULC
     alerts:
@@ -112,10 +84,6 @@ stocks:
       - type: volume_spike
         multiplier: 3.0
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 9.0
-        below: 6.5
-        cooldown_minutes: 120
 
   - symbol: MU
     alerts:
@@ -126,10 +94,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.5
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 530.0
-        below: 450.0
-        cooldown_minutes: 120
 
   - symbol: ORCL
     alerts:
@@ -140,10 +104,6 @@ stocks:
       - type: volume_spike
         multiplier: 2.0
         cooldown_minutes: 60
-      - type: price_threshold
-        above: 200.0
-        below: 175.0
-        cooldown_minutes: 120
 
 # ── Notifications ─────────────────────────────────────────────
 notifications:
