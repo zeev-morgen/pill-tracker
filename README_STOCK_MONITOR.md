@@ -90,11 +90,23 @@ Each stock in `config.yaml` can have an `alerts` list.  Mix and match rule types
 
 ```yaml
 - type: volume_spike
-  multiplier: 2.0           # alert if today_volume ≥ multiplier × 10d_avg
+  multiplier: 2.0           # alert if volume ≥ multiplier × the time-adjusted benchmark
+  time_adjusted: true       # default true — measure against elapsed trading time
   cooldown_minutes: 60
 ```
 
-> **Example:** "Alert if today's volume is already 2× the normal daily average."
+By default (`time_adjusted: true`) the benchmark is scaled to **how much of the
+trading session has elapsed**, not the full-day average. So if the market has
+been open 3 hours (~46% of the 9:30–16:00 session) and the stock has already
+traded a full day's average volume, that counts as ~2.2× the expected pace and
+fires immediately — instead of waiting until the raw daily total is exceeded.
+Pre-market and after-hours fall back to the plain full-day comparison.
+
+Set `time_adjusted: false` to keep the old behaviour (compare cumulative volume
+against the full 10-day daily average regardless of time of day).
+
+> **Example:** "Alert if the stock is trading at 2× its normal pace for this
+> point in the day — e.g. a full day's volume done in the first 3 hours."
 
 ### `price_threshold` — cross a fixed price level
 

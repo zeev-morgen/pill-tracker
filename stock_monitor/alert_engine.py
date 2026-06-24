@@ -4,7 +4,11 @@ Alert engine: evaluates custom trigger rules against live market data.
 Supported alert types
 ─────────────────────
 price_change_pct  — fires when price moves ± N % within a rolling time window
-volume_spike      — fires when today's volume exceeds M × the 10-day average
+volume_spike      — fires when today's volume outpaces the 10-day average.
+                    With time_adjusted (default), the benchmark is scaled to how
+                    much of the trading session has elapsed, so a stock that has
+                    already traded a full day's volume 3 hours in will spike —
+                    instead of waiting for the raw full-day total to be exceeded.
 price_threshold   — fires when price crosses above/below a fixed level
 """
 
@@ -17,10 +21,15 @@ from typing import Dict, List, Optional, Tuple
 import pytz
 
 from .config import AlertConfig, AppConfig, StockConfig
-from .data_feed import StockDataFeed
+from .data_feed import StockDataFeed, session_elapsed_fraction
 
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
+
+# Floor for the session-elapsed fraction used in time-adjusted volume spikes.
+# Avoids a near-zero denominator in the first minutes after the open blowing the
+# pace ratio up to a meaningless number (≈ first 20 min of the 390-min session).
+MIN_SESSION_FRACTION = 0.05
 
 
 # ── Domain objects ────────────────────────────────────────────────────────────
@@ -177,7 +186,33 @@ class AlertEngine:
         if not avg or avg <= 0:
             return None
 
-        ratio = volume / avg
+        # Choose what to compare today's cumulative volume against.
+        if alert.time_adjusted:
+            frac = session_elapsed_fraction()
+            if 0.0 < frac < 1.0:
+                # Mid-session: scale the 10-day average to the elapsed portion of
+                # the trading day, so a spike can fire intraday — e.g. a full
+                # day's volume already traded in the first 3 hours. Clamp the
+                # fraction so the noisy first minutes don't inflate the ratio.
+                frac = max(frac, MIN_SESSION_FRACTION)
+                expected = avg * frac
+                benchmark = (
+                    f"the pace expected by {frac * 100:.0f}% into the day "
+                    f"({int(expected):,} of the {int(avg):,} 10-day avg)"
+                )
+            else:
+                # Pre-market or after the close: no meaningful intraday pace, so
+                # fall back to the plain full-day comparison.
+                expected = avg
+                benchmark = f"the 10-day avg ({int(avg):,})"
+        else:
+            expected = avg
+            benchmark = f"the 10-day avg ({int(avg):,})"
+
+        if expected <= 0:
+            return None
+
+        ratio = volume / expected
         if ratio < alert.multiplier:
             return None
 
@@ -191,7 +226,7 @@ class AlertEngine:
             alert_type="volume_spike",
             message=(
                 f"${symbol} volume spike: {volume:,} shares "
-                f"= {ratio:.1f}× the 10-day avg ({int(avg):,})"
+                f"= {ratio:.1f}× {benchmark}"
             ),
             price=0.0,
             timestamp=datetime.now(NYSE_TZ),

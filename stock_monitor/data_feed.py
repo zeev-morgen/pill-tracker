@@ -18,6 +18,11 @@ _REG_OPEN   = (9, 30)
 _REG_CLOSE  = (16, 0)
 _POST_CLOSE = (20, 0)
 
+# Regular session length in minutes (9:30 → 16:00 ET = 6.5 h)
+_REG_OPEN_MINUTES  = _REG_OPEN[0]  * 60 + _REG_OPEN[1]    # 570
+_REG_CLOSE_MINUTES = _REG_CLOSE[0] * 60 + _REG_CLOSE[1]   # 960
+_REG_SESSION_MINUTES = _REG_CLOSE_MINUTES - _REG_OPEN_MINUTES  # 390
+
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
@@ -34,6 +39,26 @@ def get_market_session() -> str:
     if _REG_CLOSE <= t < _POST_CLOSE:
         return "after"
     return "closed"
+
+
+def session_elapsed_fraction(now: Optional[datetime] = None) -> float:
+    """Fraction (0.0–1.0) of the regular trading session elapsed so far.
+
+    0.0  → at or before the 9:30 ET open (pre-market)
+    1.0  → at or after the 16:00 ET close (after-hours / closed)
+    0.46 → ~3 hours into the session
+
+    Used to measure volume spikes relative to trading time: a stock that has
+    already traded a full day's average volume only 3 hours in is spiking,
+    even though the raw full-day comparison wouldn't flag it yet.
+    """
+    now = now or datetime.now(NYSE_TZ)
+    minutes = now.hour * 60 + now.minute + now.second / 60.0
+    if minutes <= _REG_OPEN_MINUTES:
+        return 0.0
+    if minutes >= _REG_CLOSE_MINUTES:
+        return 1.0
+    return (minutes - _REG_OPEN_MINUTES) / _REG_SESSION_MINUTES
 
 
 def is_market_open(include_extended: bool = True) -> bool:

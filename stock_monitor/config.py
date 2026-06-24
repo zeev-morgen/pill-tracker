@@ -39,6 +39,7 @@ class AlertConfig:
     threshold_pct: float = 2.0        # for price_change_pct
     window_minutes: int = 10          # for price_change_pct
     multiplier: float = 2.0           # for volume_spike
+    time_adjusted: bool = True        # for volume_spike: scale benchmark to elapsed session time
     above: Optional[float] = None     # for price_threshold
     below: Optional[float] = None     # for price_threshold
     cooldown_minutes: int = 30        # min gap between repeat alerts
@@ -128,6 +129,7 @@ def _parse_alert(raw: Dict[str, Any]) -> AlertConfig:
         threshold_pct=float(raw.get("threshold_pct", raw.get("threshold", 2.0))),
         window_minutes=int(raw.get("window_minutes", 10)),
         multiplier=float(raw.get("multiplier", 2.0)),
+        time_adjusted=bool(raw.get("time_adjusted", True)),
         above=float(raw["above"]) if raw.get("above") is not None else None,
         below=float(raw["below"]) if raw.get("below") is not None else None,
         cooldown_minutes=int(raw.get("cooldown_minutes", 30)),
