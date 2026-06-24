@@ -21,15 +21,10 @@ from typing import Dict, List, Optional, Tuple
 import pytz
 
 from .config import AlertConfig, AppConfig, StockConfig
-from .data_feed import StockDataFeed, session_elapsed_fraction
+from .data_feed import MIN_SESSION_FRACTION, StockDataFeed, session_elapsed_fraction
 
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
-
-# Floor for the session-elapsed fraction used in time-adjusted volume spikes.
-# Avoids a near-zero denominator in the first minutes after the open blowing the
-# pace ratio up to a meaningless number (≈ first 20 min of the 390-min session).
-MIN_SESSION_FRACTION = 0.05
 
 
 # ── Domain objects ────────────────────────────────────────────────────────────

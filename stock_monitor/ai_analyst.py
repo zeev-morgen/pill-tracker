@@ -8,6 +8,8 @@ import httpx
 import urllib3
 import yfinance as yf
 
+from .data_feed import MIN_SESSION_FRACTION, session_elapsed_fraction
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
@@ -15,7 +17,7 @@ _SYSTEM_PROMPT = (
     "הניתוח שלך צריך להיות תמציתי, מקצועי ומבוסס נתונים.\n\n"
     "מבנה התשובה:\n"
     "📰 *חדשות אחרונות*: 2-3 נקודות מרכזיות מהחדשות שסופקו\n"
-    "📈 *מומנטום*: שינוי, נפח יחסית לממוצע, חוזק המגמה\n"
+    "📈 *מומנטום*: שינוי, נפח יחסית לממוצע ולקצב הצפוי לפי שעת המסחר, חוזק המגמה\n"
     "💹 *מכפילים*: P/E, שווי שוק, צמיחת הכנסות, מרווח גולמי\n"
     "⚠️ *סיכונים*: 1-2 סיכונים מרכזיים\n"
     "🎯 *המלצה*: קנייה חזקה / קנייה / החזקה / מכירה / הימנעות\n"
@@ -140,6 +142,14 @@ class StockAnalyst:
                 cur_vol = data.get("volume") or float(hist["Volume"].iloc[-1])
                 if avg_vol > 0:
                     out["volume_vs_avg"] = cur_vol / avg_vol
+                    # Time-adjusted pace: how the volume so far compares to what
+                    # would be expected by this point in the trading session, so
+                    # a full day's volume done in 3 h reads as a clear spike.
+                    frac = session_elapsed_fraction()
+                    out["session_elapsed_pct"] = frac * 100.0
+                    if 0.0 < frac < 1.0:
+                        expected = avg_vol * max(frac, MIN_SESSION_FRACTION)
+                        out["volume_vs_pace"] = cur_vol / expected
                 pct_30d = (
                     (float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[0]))
                     / float(hist["Close"].iloc[0]) * 100.0
@@ -182,6 +192,8 @@ class StockAnalyst:
         l52 = extra.get("fifty_two_low")
 
         vva = momentum.get("volume_vs_avg")
+        vvp = momentum.get("volume_vs_pace")
+        sep = momentum.get("session_elapsed_pct")
         p30 = momentum.get("change_30d_pct")
 
         parts = [
@@ -201,7 +213,14 @@ class StockAnalyst:
             parts.append(f"• טווח 52 שבועות: ${l52:.2f} – ${h52:.2f}")
         parts.append(f"• נפח: {vol:,}")
         if vva is not None:
-            parts.append(f"• נפח יחסית לממוצע 30 יום: x{vva:.2f}")
+            parts.append(f"• נפח יחסית לממוצע 30 יום (יום מלא): x{vva:.2f}")
+        if sep is not None and 0 < sep < 100:
+            parts.append(f"• חלף מסשן המסחר הרגיל: {sep:.0f}%")
+        if vvp is not None:
+            parts.append(
+                f"• נפח יחסית לקצב הצפוי לפי שעת המסחר: x{vvp:.2f} "
+                f"(x1 = קצב רגיל; מעל x1 = מהיר מהרגיל לנקודת הזמן הזו ביום)"
+            )
         parts.append(f"• סשן: {sess}")
 
         parts += [

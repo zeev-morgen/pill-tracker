@@ -23,6 +23,11 @@ _REG_OPEN_MINUTES  = _REG_OPEN[0]  * 60 + _REG_OPEN[1]    # 570
 _REG_CLOSE_MINUTES = _REG_CLOSE[0] * 60 + _REG_CLOSE[1]   # 960
 _REG_SESSION_MINUTES = _REG_CLOSE_MINUTES - _REG_OPEN_MINUTES  # 390
 
+# Floor for the session-elapsed fraction used in time-adjusted volume metrics.
+# Avoids a near-zero denominator in the first minutes after the open inflating
+# the pace ratio to a meaningless number (≈ first 20 min of the 390-min session).
+MIN_SESSION_FRACTION = 0.05
+
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
