@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 # ── Interpolation ─────────────────────────────────────────────────────────────
 
 def _interpolate_env(text: str) -> str:
-    """Replace ${VAR_NAME} placeholders with values from the environment."""
+    """Replace ${VAR_NAME} placeholders with values from the environment.
+
+    Comment-only lines are left untouched: documentation that mentions the
+    ${VAR} syntax should not be treated as a real placeholder, otherwise every
+    startup logs a spurious "not set" warning for it.
+    """
     def _replace(match: re.Match) -> str:
         var = match.group(1)
         val = os.environ.get(var, "")
@@ -23,7 +28,10 @@ def _interpolate_env(text: str) -> str:
             logger.warning("Environment variable %s is not set", var)
         return val
 
-    return re.sub(r"\$\{([^}]+)\}", _replace, text)
+    return "\n".join(
+        line if line.lstrip().startswith("#") else re.sub(r"\$\{([^}]+)\}", _replace, line)
+        for line in text.splitlines()
+    )
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
