@@ -1,14 +1,14 @@
 """In-memory + JSON-persisted portfolio store.
 
-Holds the user's manually entered positions (ticker, quantity, purchase date).
+Holds the user's manually entered positions (ticker, quantity, entry price).
 Thread-safe and dependency-free so it can be unit-tested in isolation.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
-from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STORE_PATH = Path("data") / "portfolio.json"
+DEFAULT_STORE_PATH = Path(os.environ.get("STORE_PATH", "data/portfolio.json"))
 
 
 class Holding(BaseModel):
@@ -24,7 +24,7 @@ class Holding(BaseModel):
 
     ticker: str = Field(..., min_length=1, max_length=12)
     quantity: float = Field(..., gt=0)
-    purchase_date: date
+    entry_price: float = Field(..., gt=0)
 
     @field_validator("ticker")
     @classmethod
@@ -32,13 +32,6 @@ class Holding(BaseModel):
         value = value.strip().upper()
         if not value or not all(c.isalnum() or c in ".-^" for c in value):
             raise ValueError("ticker must contain only letters, digits, '.', '-' or '^'")
-        return value
-
-    @field_validator("purchase_date")
-    @classmethod
-    def not_in_future(cls, value: date) -> date:
-        if value > date.today():
-            raise ValueError("purchase_date cannot be in the future")
         return value
 
 
@@ -86,9 +79,19 @@ class PortfolioStore:
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
             for item in raw:
-                holding = Holding(**item)
+                try:
+                    # Extra keys from older schema versions (e.g. purchase_date)
+                    # are dropped rather than failing the whole load.
+                    holding = Holding(
+                        ticker=item.get("ticker", ""),
+                        quantity=item.get("quantity", 0),
+                        entry_price=item.get("entry_price", 0),
+                    )
+                except ValueError:
+                    logger.warning("skipping incompatible portfolio record: %s", item)
+                    continue
                 self._holdings[holding.ticker] = holding
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
             logger.error("Failed to load portfolio file %s: %s", self._path, exc)
 
     def _save(self) -> None:
@@ -96,10 +99,7 @@ class PortfolioStore:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = [
-                {**h.model_dump(), "purchase_date": h.purchase_date.isoformat()}
-                for h in self._holdings.values()
-            ]
+            payload = [h.model_dump() for h in self._holdings.values()]
             self._path.write_text(
                 json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
             )

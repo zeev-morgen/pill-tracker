@@ -1,15 +1,22 @@
 """FastAPI application wiring the store, alert engine, AI analyst and dashboard.
 
 Run with:  uvicorn main:app --reload
+
+Optional security for public deployments: set DASHBOARD_USER and
+DASHBOARD_PASSWORD environment variables to require HTTP Basic auth on
+every route. When unset (local use), no login is required.
 """
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from ai_analyst import AIAnalyst, AnalysisError
@@ -21,7 +28,29 @@ from store import Holding, PortfolioStore
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Stock Tracker", version="2.0")
+# ---------------------------------------------------------------- auth
+
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)) -> None:
+    expected_user = os.environ.get("DASHBOARD_USER")
+    expected_password = os.environ.get("DASHBOARD_PASSWORD")
+    if not expected_user or not expected_password:
+        return  # auth disabled (local use)
+    if (
+        credentials is None
+        or not secrets.compare_digest(credentials.username, expected_user)
+        or not secrets.compare_digest(credentials.password, expected_password)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="נדרשת התחברות",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+
+app = FastAPI(title="Stock Tracker", version="2.1", dependencies=[Depends(require_auth)])
 
 store = PortfolioStore()
 market_data = MarketDataService()
@@ -32,8 +61,7 @@ analyst = AIAnalyst(market_data)
 class PositionSummary(BaseModel):
     ticker: str
     quantity: float
-    purchase_date: str
-    entry_price: Optional[float]
+    entry_price: float
     current_price: Optional[float]
     market_value: Optional[float]
     pnl_pct: Optional[float]
@@ -57,8 +85,8 @@ def list_holdings() -> List[Holding]:
 
 @app.post("/api/holdings", response_model=Holding, status_code=201)
 def upsert_holding(holding: Holding) -> Holding:
-    # Pydantic already validated ticker format, quantity > 0 and date not in
-    # the future; reject tickers yfinance doesn't recognize before persisting.
+    # Pydantic already validated ticker format and positive quantity/price;
+    # reject tickers yfinance doesn't recognize before persisting.
     try:
         market_data.fetch_history(holding.ticker, period="5d")
     except MarketDataError as exc:
@@ -77,24 +105,21 @@ def delete_holding(ticker: str) -> None:
 def _build_summary() -> List[PositionSummary]:
     positions: List[PositionSummary] = []
     for holding in store.all():
-        entry_price = current_price = market_value = pnl_pct = pnl_value = None
+        current_price = market_value = pnl_pct = pnl_value = None
         sector = "Unknown"
         try:
             current_price = market_data.fetch_current_price(holding.ticker)
-            entry_price = market_data.price_on(holding.ticker, holding.purchase_date)
             market_value = current_price * holding.quantity
             sector = market_data.fetch_fundamentals(holding.ticker).sector
-            if entry_price:
-                pnl_pct = (current_price - entry_price) / entry_price * 100.0
-                pnl_value = (current_price - entry_price) * holding.quantity
+            pnl_pct = (current_price - holding.entry_price) / holding.entry_price * 100.0
+            pnl_value = (current_price - holding.entry_price) * holding.quantity
         except MarketDataError as exc:
             logger.warning("summary: skipping prices for %s: %s", holding.ticker, exc)
         positions.append(
             PositionSummary(
                 ticker=holding.ticker,
                 quantity=holding.quantity,
-                purchase_date=holding.purchase_date.isoformat(),
-                entry_price=entry_price,
+                entry_price=holding.entry_price,
                 current_price=current_price,
                 market_value=market_value,
                 pnl_pct=pnl_pct,
@@ -165,7 +190,7 @@ async def alerts() -> dict:
 @app.get("/api/analyze/{ticker}")
 async def analyze(ticker: str) -> dict:
     try:
-        validated = Holding(ticker=ticker, quantity=1, purchase_date="1970-01-01")
+        validated = Holding(ticker=ticker, quantity=1, entry_price=1)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="טיקר לא תקין") from exc
     holding = store.get(validated.ticker)

@@ -32,20 +32,15 @@ class PositionContext:
     """Everything the prompt needs about the user's personal position."""
 
     quantity: float
-    purchase_date: str
-    entry_price: Optional[float]
+    entry_price: float
     current_price: float
 
     @property
-    def pnl_pct(self) -> Optional[float]:
-        if not self.entry_price:
-            return None
+    def pnl_pct(self) -> float:
         return (self.current_price - self.entry_price) / self.entry_price * 100.0
 
     @property
-    def pnl_value(self) -> Optional[float]:
-        if not self.entry_price:
-            return None
+    def pnl_value(self) -> float:
         return (self.current_price - self.entry_price) * self.quantity
 
 
@@ -88,25 +83,16 @@ class AIAnalyst:
             f"## Fundamentals\n{fundamentals_summary}",
         ]
         if position is not None:
-            entry = (
-                f"{position.entry_price:.2f}" if position.entry_price else "unknown"
-            )
-            pnl_pct = (
-                f"{position.pnl_pct:+.2f}%" if position.pnl_pct is not None else "unknown"
-            )
-            pnl_value = (
-                f"{position.pnl_value:+,.2f}" if position.pnl_value is not None else "unknown"
-            )
             sections.append(
                 "## The user's personal position\n"
                 f"- Quantity held: {position.quantity}\n"
-                f"- Purchase date: {position.purchase_date}\n"
-                f"- Entry price (close on purchase date): {entry}\n"
+                f"- Entry price (user-entered): {position.entry_price:.2f}\n"
                 f"- Current price: {position.current_price:.2f}\n"
-                f"- Actual P/L since entry: {pnl_pct} ({pnl_value} in currency terms)\n"
+                f"- Actual P/L since entry: {position.pnl_pct:+.2f}% "
+                f"({position.pnl_value:+,.2f} in currency terms)\n"
             )
             sections.append(
-                "Compare the position's actual performance since the purchase date "
+                "Compare the position's actual performance since the entry price "
                 "against today's technical picture, and give a recommendation "
                 "(buy more / hold / trim / exit) tailored to THIS entry point — "
                 "not a generic rating. Address whether the original entry thesis "
@@ -152,11 +138,9 @@ class AIAnalyst:
         if holding is None:
             return None
         current = self._market.fetch_current_price(ticker)
-        entry = self._market.price_on(ticker, holding.purchase_date)
         return PositionContext(
             quantity=holding.quantity,
-            purchase_date=holding.purchase_date.isoformat(),
-            entry_price=entry,
+            entry_price=holding.entry_price,
             current_price=current,
         )
 

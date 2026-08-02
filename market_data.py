@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
 from functools import lru_cache
-from typing import Dict, Optional
+from typing import Dict
 
 import pandas as pd
 import yfinance as yf
@@ -65,18 +64,6 @@ class MarketDataService:
     def fetch_current_price(self, ticker: str) -> float:
         df = self.fetch_history(ticker, period="5d")
         return float(df["Close"].iloc[-1])
-
-    def price_on(self, ticker: str, on: date) -> Optional[float]:
-        """Closing price on (or the first trading day after) a given date."""
-        try:
-            df = self.fetch_history(ticker, period="max")
-        except MarketDataError:
-            return None
-        idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
-        mask = idx.date >= on
-        if not mask.any():
-            return None
-        return float(df.loc[mask, "Close"].iloc[0])
 
     @lru_cache(maxsize=256)
     def _fetch_fundamentals(self, ticker: str) -> Fundamentals:

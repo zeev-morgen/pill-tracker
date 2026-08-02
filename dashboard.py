@@ -1,7 +1,7 @@
 """Dashboard UI: a single self-contained HTML page served by FastAPI.
 
 Includes:
-- Manual entry modal (quantity + purchase date per ticker) -> /api/holdings
+- Manual entry + edit modal (quantity + entry price per ticker) -> /api/holdings
 - Alert tabs: ATR volatility exposure and sector diversification
 - Chart.js pie charts: sector allocation and index allocation
 - On-demand AI analysis per position
@@ -97,7 +97,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <h3>פוזיציות</h3>
       <table>
         <thead><tr>
-          <th>טיקר</th><th>כמות</th><th>תאריך רכישה</th><th>מחיר כניסה</th>
+          <th>טיקר</th><th>כמות</th><th>מחיר כניסה</th>
           <th>מחיר נוכחי</th><th>שווי</th><th>רווח/הפסד</th><th></th>
         </tr></thead>
         <tbody id="positions-body">
@@ -143,13 +143,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <!-- ============ Manual entry modal ============ -->
 <div class="modal-overlay" id="modal">
   <div class="modal">
-    <h3>הזנת פוזיציה ידנית</h3>
+    <h3 id="modal-title">הזנת פוזיציה ידנית</h3>
     <label for="f-ticker">טיקר</label>
     <input id="f-ticker" placeholder="לדוגמה: AAPL" maxlength="12">
     <label for="f-qty">כמות מניות</label>
     <input id="f-qty" type="number" min="0.0001" step="any" placeholder="לדוגמה: 10">
-    <label for="f-date">מועד רכישה</label>
-    <input id="f-date" type="date">
+    <label for="f-price">מחיר כניסה (למניה)</label>
+    <input id="f-price" type="number" min="0.0001" step="any" placeholder="לדוגמה: 187.50">
     <div class="error-msg" id="f-error"></div>
     <div class="actions">
       <button class="primary" onclick="saveHolding()">שמירה</button>
@@ -193,26 +193,46 @@ document.querySelectorAll(".tab").forEach((tab) => {
   });
 });
 
-/* ---------- modal ---------- */
-function openModal() {
+/* ---------- modal (add + edit share the same form) ---------- */
+function openModal(existing = null) {
+  const tickerEl = document.getElementById("f-ticker");
   document.getElementById("f-error").textContent = "";
+  if (existing) {
+    document.getElementById("modal-title").textContent = "עריכת פוזיציה — " + existing.ticker;
+    tickerEl.value = existing.ticker;
+    tickerEl.disabled = true;
+    document.getElementById("f-qty").value = existing.quantity;
+    document.getElementById("f-price").value = existing.entry_price;
+  } else {
+    document.getElementById("modal-title").textContent = "הזנת פוזיציה ידנית";
+    tickerEl.value = "";
+    tickerEl.disabled = false;
+    document.getElementById("f-qty").value = "";
+    document.getElementById("f-price").value = "";
+  }
   document.getElementById("modal").classList.add("open");
 }
 function closeModal() { document.getElementById("modal").classList.remove("open"); }
 
+let currentPositions = [];
+function editHolding(ticker) {
+  const position = currentPositions.find((p) => p.ticker === ticker);
+  if (position) openModal(position);
+}
+
 async function saveHolding() {
   const ticker = document.getElementById("f-ticker").value.trim().toUpperCase();
   const quantity = parseFloat(document.getElementById("f-qty").value);
-  const purchase_date = document.getElementById("f-date").value;
+  const entry_price = parseFloat(document.getElementById("f-price").value);
   const errEl = document.getElementById("f-error");
   errEl.textContent = "";
   if (!ticker) { errEl.textContent = "יש להזין טיקר"; return; }
   if (!Number.isFinite(quantity) || quantity <= 0) { errEl.textContent = "כמות חייבת להיות מספר חיובי"; return; }
-  if (!purchase_date) { errEl.textContent = "יש לבחור מועד רכישה"; return; }
+  if (!Number.isFinite(entry_price) || entry_price <= 0) { errEl.textContent = "מחיר כניסה חייב להיות מספר חיובי"; return; }
   try {
     await api("/api/holdings", {
       method: "POST",
-      body: JSON.stringify({ ticker, quantity, purchase_date }),
+      body: JSON.stringify({ ticker, quantity, entry_price }),
     });
     closeModal();
     refreshAll();
@@ -230,8 +250,9 @@ async function loadPortfolio() {
   const body = document.getElementById("positions-body");
   try {
     const data = await api("/api/portfolio/summary");
+    currentPositions = data.positions;
     if (!data.positions.length) {
-      body.innerHTML = '<tr><td colspan="8" class="muted">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="muted">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</td></tr>';
       return;
     }
     body.innerHTML = data.positions.map((p) => {
@@ -240,16 +261,17 @@ async function loadPortfolio() {
         `<span class="${cls}">${fmt(p.pnl_pct)}% (${fmt(p.pnl_value)})</span>`;
       return `<tr>
         <td><b>${esc(p.ticker)}</b></td><td>${fmt(p.quantity, 4)}</td>
-        <td>${esc(p.purchase_date)}</td><td>${fmt(p.entry_price)}</td>
+        <td>${fmt(p.entry_price)}</td>
         <td>${fmt(p.current_price)}</td><td>${fmt(p.market_value)}</td>
         <td>${pnl}</td>
         <td>
           <button onclick="analyze('${esc(p.ticker)}')">ניתוח AI</button>
+          <button onclick="editHolding('${esc(p.ticker)}')">עריכה</button>
           <button onclick="deleteHolding('${esc(p.ticker)}')">מחיקה</button>
         </td></tr>`;
     }).join("");
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="8" class="neg">שגיאה: ${esc(e.message)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7" class="neg">שגיאה: ${esc(e.message)}</td></tr>`;
   }
 }
 
