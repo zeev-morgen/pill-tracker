@@ -102,3 +102,22 @@ def test_alert_store_respects_limit():
     for i in range(10):
         store.add("AAPL", "price_change_pct", f"msg {i}", "INFO")
     assert len(store.recent(3)) == 3
+
+
+# ── Database initialization resilience ────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "postgresql://...placeholder...",        # placeholder pasted verbatim
+        "postgresql://u:p@no-such-host.invalid/db",
+        "not-even-a-url",
+        "",
+    ],
+)
+def test_bad_database_url_degrades_instead_of_crashing(bad_url):
+    """A broken DATABASE_URL must not take the monitor down with it."""
+    from stock_monitor import db
+
+    assert db.init_db(bad_url) is False
+    assert db.is_enabled() is False

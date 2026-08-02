@@ -98,8 +98,17 @@ def init_db(url: Optional[str] = None) -> bool:
         _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
         logger.info("PostgreSQL connected — alerts and holdings are persisted")
         return True
-    except SQLAlchemyError as exc:
-        logger.error("PostgreSQL init failed (%s) — falling back to in-memory storage", exc)
+    except Exception as exc:
+        # Deliberately broad: a malformed URL surfaces as UnicodeEncodeError or
+        # ValueError rather than SQLAlchemyError, and an unreachable host as
+        # OSError. None of these should take the monitor down — losing
+        # persistence must not also cost us price polling and Telegram alerts.
+        logger.error(
+            "PostgreSQL init failed (%s: %s) — falling back to in-memory storage. "
+            "Check that DATABASE_URL holds the real connection string.",
+            exc.__class__.__name__,
+            exc,
+        )
         _engine = None
         _SessionFactory = None
         return False
