@@ -23,19 +23,49 @@ request to carry an X-Signature header with value:
 """
 
 import hashlib
+import base64
+import binascii
 import hmac
 import json
 import logging
+import os
+import secrets as pysecrets
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .notifier import NotificationDispatcher
 from .dashboard import router as dashboard_router
 
 logger = logging.getLogger(__name__)
+
+# Paths that must stay reachable without a login:
+#   /health        — uptime pingers and the host's own health check
+#   /webhook/*     — TradingView and custom integrations, guarded by the
+#                    separate HMAC signature instead of a password
+_PUBLIC_PATHS = ("/health", "/webhook/")
+
+
+def _auth_configured() -> tuple[str, str]:
+    return os.environ.get("DASHBOARD_USER", ""), os.environ.get("DASHBOARD_PASSWORD", "")
+
+
+def _credentials_ok(header: Optional[str], user: str, password: str) -> bool:
+    """Constant-time check of an HTTP Basic Authorization header."""
+    if not header or not header.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, IndexError):
+        return False
+    got_user, _, got_password = decoded.partition(":")
+    # Compare both halves regardless of the first result to avoid leaking
+    # which of the two was wrong through response timing.
+    user_ok = pysecrets.compare_digest(got_user, user)
+    password_ok = pysecrets.compare_digest(got_password, password)
+    return user_ok and password_ok
 
 
 def create_webhook_app(
@@ -43,6 +73,24 @@ def create_webhook_app(
 ) -> FastAPI:
     app = FastAPI(title="Stock Monitor", version="1.0.0", docs_url="/docs")
     app.include_router(dashboard_router)
+
+    # ── Dashboard authentication ──────────────────────────────────────────────
+    # Enabled only when DASHBOARD_USER and DASHBOARD_PASSWORD are both set, so
+    # local runs are unaffected. Required for any public deployment.
+    @app.middleware("http")
+    async def require_basic_auth(request: Request, call_next):
+        user, password = _auth_configured()
+        if not user or not password:
+            return await call_next(request)
+        if request.url.path.startswith(_PUBLIC_PATHS):
+            return await call_next(request)
+        if not _credentials_ok(request.headers.get("authorization"), user, password):
+            return Response(
+                content="Authentication required",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Stock Monitor"'},
+            )
+        return await call_next(request)
 
     # ── Signature helper ──────────────────────────────────────────────────────
 
