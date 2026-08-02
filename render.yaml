@@ -1,18 +1,33 @@
-# One-click deploy to Render (free plan).
-# In Render: New -> Blueprint -> point at this repo/branch.
+# Deploy to Render — free plan (web service + free PostgreSQL).
+# In Render: New → Blueprint → point at this repo and branch.
+databases:
+  - name: stock-tracker-db
+    plan: free
+    databaseName: stocktracker
+    user: stocktracker
+
 services:
   - type: web
-    name: stock-tracker
+    name: stock-monitor
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: python run.py
     envVars:
+      # Wired automatically from the database above — do not set by hand.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stock-tracker-db
+          property: connectionString
+      # Render assigns the public port; config.yaml reads ${PORT}.
+      - key: PORT
+        value: 8080
+      # Secrets — set these in the Render dashboard, never in the repo.
       - key: ANTHROPIC_API_KEY
-        sync: false          # set manually in the Render dashboard (secret)
-      - key: DASHBOARD_USER
-        sync: false          # basic-auth username for the public dashboard
-      - key: DASHBOARD_PASSWORD
-        sync: false          # basic-auth password
-      - key: ANTHROPIC_MODEL
-        value: claude-opus-4-7
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TRADINGVIEW_WEBHOOK_SECRET
+        sync: false

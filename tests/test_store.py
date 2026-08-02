@@ -1,77 +1,104 @@
+"""Store tests — run against the in-memory fallback (no DATABASE_URL needed)."""
+
 import pytest
-from pydantic import ValidationError
 
-from store import Holding, PortfolioStore
+from stock_monitor.store import AlertStore, Holding, HoldingError, PortfolioStore
 
 
-def make_store() -> PortfolioStore:
-    return PortfolioStore(path=None)  # in-memory only
+# ── Holding validation ────────────────────────────────────────────────────────
 
+def test_holding_normalizes_ticker():
+    holding = Holding.create(ticker=" aapl ", quantity=10, entry_price=187.5)
+    assert holding.ticker == "AAPL"
+    assert holding.quantity == 10.0
+    assert holding.entry_price == 187.5
+
+
+def test_holding_accepts_numeric_strings_from_json():
+    holding = Holding.create(ticker="MU", quantity="2.5", entry_price="98.25")
+    assert holding.quantity == 2.5
+    assert holding.entry_price == 98.25
+
+
+@pytest.mark.parametrize("quantity", [0, -5])
+def test_holding_rejects_non_positive_quantity(quantity):
+    with pytest.raises(HoldingError):
+        Holding.create(ticker="AAPL", quantity=quantity, entry_price=100)
+
+
+@pytest.mark.parametrize("entry_price", [0, -10])
+def test_holding_rejects_non_positive_entry_price(entry_price):
+    with pytest.raises(HoldingError):
+        Holding.create(ticker="AAPL", quantity=1, entry_price=entry_price)
+
+
+def test_holding_rejects_invalid_ticker():
+    with pytest.raises(HoldingError):
+        Holding.create(ticker="AA PL;", quantity=1, entry_price=100)
+
+
+def test_holding_rejects_empty_ticker():
+    with pytest.raises(HoldingError):
+        Holding.create(ticker="   ", quantity=1, entry_price=100)
+
+
+def test_holding_rejects_non_numeric_input():
+    with pytest.raises(HoldingError):
+        Holding.create(ticker="AAPL", quantity="abc", entry_price=100)
+
+
+# ── PortfolioStore ────────────────────────────────────────────────────────────
 
 def test_upsert_and_get():
-    store = make_store()
-    holding = Holding(ticker="aapl", quantity=10, entry_price=187.5)
-    store.upsert(holding)
+    store = PortfolioStore()
+    store.upsert(Holding.create("aapl", 10, 187.5))
     fetched = store.get("AAPL")
-    assert fetched is not None
-    assert fetched.ticker == "AAPL"  # normalized to uppercase
-    assert fetched.quantity == 10
+    assert fetched.ticker == "AAPL"
     assert fetched.entry_price == 187.5
 
 
-def test_upsert_overwrites_existing_ticker():
-    store = make_store()
-    store.upsert(Holding(ticker="MSFT", quantity=5, entry_price=300))
-    store.upsert(Holding(ticker="MSFT", quantity=8, entry_price=310))
+def test_upsert_edits_existing_position():
+    store = PortfolioStore()
+    store.upsert(Holding.create("MSFT", 5, 300))
+    store.upsert(Holding.create("MSFT", 8, 310))
     assert len(store.all()) == 1
     assert store.get("MSFT").quantity == 8
     assert store.get("MSFT").entry_price == 310
 
 
+def test_get_is_case_insensitive():
+    store = PortfolioStore()
+    store.upsert(Holding.create("NVDA", 3, 120))
+    assert store.get("nvda") is not None
+
+
 def test_delete():
-    store = make_store()
-    store.upsert(Holding(ticker="NVDA", quantity=3, entry_price=120))
+    store = PortfolioStore()
+    store.upsert(Holding.create("NVDA", 3, 120))
     assert store.delete("nvda") is True
     assert store.delete("nvda") is False
     assert store.get("NVDA") is None
 
 
-@pytest.mark.parametrize("quantity", [0, -5])
-def test_rejects_non_positive_quantity(quantity):
-    with pytest.raises(ValidationError):
-        Holding(ticker="AAPL", quantity=quantity, entry_price=100)
+def test_all_returns_every_position():
+    store = PortfolioStore()
+    store.upsert(Holding.create("AMZN", 1, 200))
+    store.upsert(Holding.create("META", 2, 500))
+    assert {h.ticker for h in store.all()} == {"AMZN", "META"}
 
 
-@pytest.mark.parametrize("entry_price", [0, -10])
-def test_rejects_non_positive_entry_price(entry_price):
-    with pytest.raises(ValidationError):
-        Holding(ticker="AAPL", quantity=1, entry_price=entry_price)
+# ── AlertStore ────────────────────────────────────────────────────────────────
+
+def test_alert_store_returns_newest_first():
+    store = AlertStore()
+    store.add("AAPL", "price_change_pct", "first", "INFO")
+    store.add("MU", "volume_spike", "second", "WARNING")
+    recent = store.recent()
+    assert [a.symbol for a in recent] == ["MU", "AAPL"]
 
 
-def test_rejects_invalid_ticker_characters():
-    with pytest.raises(ValidationError):
-        Holding(ticker="AA PL;", quantity=1, entry_price=100)
-
-
-def test_persistence_round_trip(tmp_path):
-    path = tmp_path / "portfolio.json"
-    store = PortfolioStore(path=path)
-    store.upsert(Holding(ticker="AAPL", quantity=2.5, entry_price=187.5))
-
-    reloaded = PortfolioStore(path=path)
-    holding = reloaded.get("AAPL")
-    assert holding is not None
-    assert holding.quantity == 2.5
-    assert holding.entry_price == 187.5
-
-
-def test_load_skips_legacy_records_without_entry_price(tmp_path):
-    path = tmp_path / "portfolio.json"
-    path.write_text(
-        '[{"ticker": "OLD", "quantity": 5, "purchase_date": "2024-01-02"},'
-        ' {"ticker": "NEW", "quantity": 3, "entry_price": 50.0}]',
-        encoding="utf-8",
-    )
-    store = PortfolioStore(path=path)
-    assert store.get("OLD") is None      # legacy record dropped, not crashing
-    assert store.get("NEW").entry_price == 50.0
+def test_alert_store_respects_limit():
+    store = AlertStore()
+    for i in range(10):
+        store.add("AAPL", "price_change_pct", f"msg {i}", "INFO")
+    assert len(store.recent(3)) == 3

@@ -1,0 +1,158 @@
+# ─────────────────────────────────────────────────────────────
+#  Stock Monitor — main configuration
+#  Values wrapped in ${VAR} are read from the .env file.
+# ─────────────────────────────────────────────────────────────
+
+# ── Stocks to watch ───────────────────────────────────────────
+stocks:
+  - symbol: AMZN
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+
+  - symbol: ABCL
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+
+  - symbol: SEDG
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+
+  - symbol: CF
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+
+  - symbol: SNDK
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 4.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+
+  - symbol: META
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+
+  - symbol: MENS
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 5.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 3.0
+        cooldown_minutes: 60
+
+  - symbol: FULC
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 4.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 3.0
+        cooldown_minutes: 60
+
+  - symbol: MU
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 3.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.5
+        cooldown_minutes: 60
+
+  - symbol: ORCL
+    alerts:
+      - type: price_change_pct
+        threshold_pct: 2.0
+        window_minutes: 10
+        cooldown_minutes: 30
+      - type: volume_spike
+        multiplier: 2.0
+        cooldown_minutes: 60
+
+# ── Notifications ─────────────────────────────────────────────
+notifications:
+  telegram:
+    enabled: true
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+
+  discord:
+    enabled: false
+    webhook_url: "${DISCORD_WEBHOOK_URL}"
+
+  desktop:
+    enabled: true
+
+# ── TradingView Webhook ───────────────────────────────────────
+tradingview:
+  # Must match TRADINGVIEW_WEBHOOK_SECRET in .env
+  webhook_secret: "${TRADINGVIEW_WEBHOOK_SECRET}"
+
+# ── HTTP Server (for receiving webhooks) ─────────────────────
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+# ── Monitoring engine ─────────────────────────────────────────
+monitoring:
+  # How often to poll yfinance (seconds). 60s is a safe rate limit.
+  interval_seconds: 60
+  # Include pre-market (04:00–09:30 ET) and after-hours (16:00–20:00 ET)
+  include_extended_hours: true
+  # How many minutes of price history to keep in memory for % change checks
+  price_history_minutes: 60
+
+# ── Logging ───────────────────────────────────────────────────
+logging:
+  level: "INFO"         # DEBUG | INFO | WARNING | ERROR
+  file: "logs/stock_monitor.log"
+
+# ── AI Analysis (Claude) ──────────────────────
+ai:
+  enabled: true
+  api_key: "${ANTHROPIC_API_KEY}"
+  model: "claude-opus-4-7"
+
+# ── Earnings Alerts ───────────────────────────
+earnings:
+  enabled: true
+  # Alert N days before a watched stock reports results
+  alert_at_days: [7, 3, 1]
+  # Time to run the daily check (ET, weekdays only)
+  check_time: "08:00"
