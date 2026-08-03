@@ -321,8 +321,7 @@ _HTML = """<!DOCTYPE html>
   .muted-hint { color: var(--muted); font-weight: 400; }
   .sector-cell { cursor: pointer; border-bottom: 1px dotted var(--border); }
   .sector-cell.unknown { color: var(--yellow); }
-  .split-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 4px 0 10px; }
-  .split-bar span { display: block; }
+  .index-detail { color: var(--muted); font-size: 0.78rem; margin-top: 10px; }
   .split-legend { display: flex; gap: 18px; font-size: 0.82rem; flex-wrap: wrap; }
   .split-legend b { font-variant-numeric: tabular-nums; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-left: 6px; }
@@ -396,12 +395,12 @@ _HTML = """<!DOCTYPE html>
         <div class="chart-box"><canvas id="sectorChart"></canvas></div>
       </div>
       <div class="card">
-        <div class="card-title">חלוקה לפי מדדים</div>
-        <div style="padding:14px 18px 0">
-          <div class="split-bar" id="split-bar"></div>
-          <div class="split-legend" id="split-legend"></div>
-        </div>
+        <div class="card-title">מדדים מול מניות בודדות</div>
         <div class="chart-box"><canvas id="indexChart"></canvas></div>
+        <div style="padding:0 18px 16px">
+          <div class="split-legend" id="split-legend"></div>
+          <div id="index-detail" class="index-detail"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -685,7 +684,7 @@ function renderHoldings(data) {
   </table>`;
 }
 
-function renderPie(canvasId, existing, entries) {
+function renderPie(canvasId, existing, entries, colors) {
   const ctx = document.getElementById(canvasId);
   if (existing) existing.destroy();
   if (!entries.length) return null;
@@ -695,7 +694,7 @@ function renderPie(canvasId, existing, entries) {
       labels: entries.map((e) => e.label),
       datasets: [{
         data: entries.map((e) => e.weight_pct),
-        backgroundColor: CHART_COLORS,
+        backgroundColor: colors || CHART_COLORS,
         borderColor: '#161b22',
         borderWidth: 2,
       }],
@@ -710,23 +709,36 @@ function renderPie(canvasId, existing, entries) {
   });
 }
 
-/* How much of the portfolio is held through index funds / ETFs versus picked
-   as individual stocks — a different question from index *membership* below. */
-function renderAssetSplit(split) {
-  const bar = document.getElementById('split-bar');
+/* Exactly two slices: money held through index funds / ETFs versus money in
+   individual stocks. Index *membership* (which stock sits in which index) is
+   listed as text below — as a pie it produced a dozen overlapping slices that
+   obscured this split, which is the number that actually matters. */
+const ETF_COLOR = '#bc8cff';
+const STOCK_COLOR = '#58a6ff';
+
+function renderAssetSplit(split, byIndex) {
   const legend = document.getElementById('split-legend');
+  const detail = document.getElementById('index-detail');
   if (!split || (split.etf_pct === 0 && split.stock_pct === 0)) {
-    bar.innerHTML = ''; legend.innerHTML = '';
+    legend.innerHTML = ''; detail.innerHTML = '';
+    if (indexChart) { indexChart.destroy(); indexChart = null; }
     return;
   }
-  bar.innerHTML =
-    `<span style="width:${split.etf_pct}%;background:#bc8cff"></span>` +
-    `<span style="width:${split.stock_pct}%;background:#58a6ff"></span>`;
+
+  indexChart = renderPie('indexChart', indexChart, [
+    {label: 'מדדים / קרנות סל', weight_pct: split.etf_pct},
+    {label: 'מניות בודדות',     weight_pct: split.stock_pct},
+  ], [ETF_COLOR, STOCK_COLOR]);
+
   legend.innerHTML =
-    `<span><i class="dot" style="background:#bc8cff"></i>מדדים / קרנות סל: ` +
+    `<span><i class="dot" style="background:${ETF_COLOR}"></i>מדדים / קרנות סל: ` +
     `<b>${split.etf_pct.toFixed(1)}%</b> <span class="volume">(${money(split.etf_value)})</span></span>` +
-    `<span><i class="dot" style="background:#58a6ff"></i>מניות בודדות: ` +
+    `<span><i class="dot" style="background:${STOCK_COLOR}"></i>מניות בודדות: ` +
     `<b>${split.stock_pct.toFixed(1)}%</b> <span class="volume">(${money(split.stock_value)})</span></span>`;
+
+  detail.innerHTML = (byIndex && byIndex.length)
+    ? 'חשיפה למדדים: ' + byIndex.map((i) => `${esc(i.label)} ${i.weight_pct.toFixed(0)}%`).join(' · ')
+    : '';
 }
 
 function renderRisk(data) {
@@ -765,8 +777,7 @@ async function loadPortfolio() {
     renderHoldings(data);
     renderRisk(data);
     sectorChart = renderPie('sectorChart', sectorChart, data.allocation.by_sector);
-    indexChart  = renderPie('indexChart',  indexChart,  data.allocation.by_index);
-    renderAssetSplit(data.allocation.by_asset_type);
+    renderAssetSplit(data.allocation.by_asset_type, data.allocation.by_index);
   } catch (e) {
     document.getElementById('holdings-wrap').innerHTML =
       `<div class="empty" style="color:var(--red)">שגיאה: ${esc(e.message)}</div>`;

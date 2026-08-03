@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import yfinance as yf
 
+from . import reference_data
 from .store import PortfolioStore
 
 logger = logging.getLogger(__name__)
@@ -187,23 +188,38 @@ def build_allocation(positions: List[dict]) -> dict:
 
 @lru_cache(maxsize=256)
 def fetch_fundamentals(ticker: str) -> Fundamentals:
-    """Sector/name/asset type via yfinance; index membership via the mapping.
+    """Sector, name and asset type for a ticker.
 
-    yfinance often returns no sector at all (empty ``.info``, throttling), which
-    is why holdings carry a manual sector override — see ``collect_positions``.
+    Sector resolution order — yfinance first because it is authoritative and
+    current, then the curated table, then Unknown. yfinance's ``.info``
+    frequently comes back empty (throttling, upstream changes), so without the
+    fallback most holdings ended up unclassified and the sector breakdown was
+    one meaningless slice. A manual override on the holding still beats both;
+    see ``collect_positions``.
     """
     info: dict = {}
     try:
         info = yf.Ticker(ticker).info or {}
     except Exception as exc:
         logger.warning("fundamentals fetch failed for %s: %s", ticker, exc)
+
+    curated_sector = reference_data.lookup_sector(ticker)
+    sector = info.get("sector") or curated_sector or UNKNOWN_SECTOR
+    if not info.get("sector") and curated_sector:
+        logger.debug("Sector for %s resolved from the curated table", ticker)
+
     quote_type = str(info.get("quoteType") or "").upper()
+    if quote_type:
+        asset_type = "etf" if quote_type in {"ETF", "MUTUALFUND", "INDEX"} else "stock"
+    else:
+        asset_type = "etf" if reference_data.is_known_etf(ticker) else "stock"
+
     return Fundamentals(
         ticker=ticker,
-        sector=info.get("sector") or UNKNOWN_SECTOR,
+        sector=sector,
         name=info.get("shortName") or ticker,
         indexes=INDEX_MEMBERSHIP.get(ticker, ["Other"]),
-        asset_type="etf" if quote_type in {"ETF", "MUTUALFUND", "INDEX"} else "stock",
+        asset_type=asset_type,
     )
 
 
