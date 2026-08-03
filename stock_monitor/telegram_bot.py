@@ -6,6 +6,7 @@ Commands
 /start              ← ברוך הבא
 /help               ← רשימת פקודות
 /status             ← כל המניות במעקב עם מחיר עדכני
+/portfolio  |  תיק  ← סטטוס התיק האישי + כפתור לניתוח AI של התיק
 /analyze AAPL       ← ניתוח AI של מניה
 ניתוח AAPL          ← ניתוח AI (עברית)
 /[ticker]           ← נתוני מניה, לדוגמה /aapl
@@ -25,6 +26,7 @@ import requests
 import urllib3
 
 from .data_feed import StockDataFeed, get_market_session
+from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import portfolio_store
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ _HELP_TEXT = (
     "• שלח *טיקר* כלשהו ← נתונים מלאים\n"
     "  לדוגמה: `AAPL`, `NVDA`, `AMZN`\n\n"
     "• `ניתוח AAPL` ← ניתוח AI של מניה\n"
+    "• /portfolio או `תיק` ← סטטוס התיק שלך\n"
     "• /status ← כל המניות במעקב\n"
     "• /help   ← הודעה זו\n"
 )
@@ -140,6 +143,7 @@ class TelegramCommandBot:
         self._syms               = [s.upper() for s in monitored_symbols]
         self._rc_ref             = regular_close_ref  # shared dict from StockMonitorApp
         self._analyst            = analyst
+        self._risk               = PortfolioRiskAnalyzer(portfolio_store)
         self._authorized_chat_id = authorized_chat_id
         self._offset             = 0
 
@@ -228,6 +232,8 @@ class TelegramCommandBot:
             self._send(chat_id, _HELP_TEXT)
         elif cmd == "STATUS":
             await self._send_status(chat_id)
+        elif cmd in ("PORTFOLIO", "תיק", "התיק"):
+            await self._send_portfolio(chat_id)
         elif analyze_match:
             symbol = analyze_match.group(1).upper()
             await self._send_analysis(chat_id, symbol)
@@ -274,7 +280,9 @@ class TelegramCommandBot:
 
         self._answer_callback(cb_id, "מתחיל ניתוח…")
 
-        if data.startswith("analyze:"):
+        if data == "analyze_portfolio":
+            await self._send_portfolio_analysis(chat_id)
+        elif data.startswith("analyze:"):
             symbol = data.split(":", 1)[1].upper()
             await self._send_analysis(chat_id, symbol)
 
@@ -294,6 +302,80 @@ class TelegramCommandBot:
             else:
                 lines.append(f"• *{sym}*: N/A\n")
         self._send(chat_id, "".join(lines))
+
+    # ── Portfolio ─────────────────────────────────────────────────────────────
+
+    async def _send_portfolio(self, chat_id: int) -> None:
+        """Portfolio status with an inline button for the AI review."""
+        self._send(chat_id, "📂 טוען את התיק…")
+        loop = asyncio.get_event_loop()
+        # full_report() hits yfinance once per holding — keep it off the loop.
+        report = await loop.run_in_executor(None, self._risk.full_report)
+
+        positions = report.get("positions") or []
+        if not positions:
+            self._send(
+                chat_id,
+                "התיק ריק.\nהוסף פוזיציות בדשבורד — טאב *התיק שלי*.",
+            )
+            return
+
+        pnl = report.get("total_pnl_value", 0.0)
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        lines = [
+            "💼 *התיק שלי*\n",
+            f"שווי כולל: *${report.get('total_value', 0):,.2f}*\n",
+            f"{pnl_icon} רווח/הפסד: *{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}*\n\n",
+        ]
+        for p in sorted(positions, key=lambda x: x["market_value"], reverse=True):
+            icon = "🟢" if p["pnl_pct"] >= 0 else "🔴"
+            atr = f" | ATR {p['atr_pct']:.1f}%" if p.get("atr_pct") is not None else ""
+            lines.append(
+                f"{icon} *{p['ticker']}* {p['pnl_pct']:+.2f}%\n"
+                f"   {p['quantity']:g} × ${p['current_price']:.2f} = "
+                f"${p['market_value']:,.2f}{atr}\n"
+            )
+
+        # Surface the risk alerts that the dashboard tabs would show.
+        warnings = []
+        if report.get("sector", {}).get("alert"):
+            names = ", ".join(
+                s["sector"] for s in report["sector"].get("concentrated_sectors", [])
+            )
+            warnings.append(f"⚠️ ריכוזיות סקטוריאלית: {names}")
+        if report.get("volatility", {}).get("alert"):
+            warnings.append(
+                f"⚠️ חשיפת תנודתיות: {report['volatility']['exposure_pct']:.0f}% מהתיק"
+            )
+        if warnings:
+            lines.append("\n" + "\n".join(warnings) + "\n")
+
+        reply_markup = None
+        if self._analyst is not None:
+            reply_markup = {
+                "inline_keyboard": [[
+                    {"text": "🧠 ניתוח AI של התיק", "callback_data": "analyze_portfolio"}
+                ]]
+            }
+        self._send(chat_id, "".join(lines), reply_markup=reply_markup)
+
+    async def _send_portfolio_analysis(self, chat_id: int) -> None:
+        if self._analyst is None:
+            self._send(
+                chat_id,
+                "❌ ניתוח AI אינו מופעל.\n"
+                "הגדר `ANTHROPIC_API_KEY` ואפשר `ai.enabled: true` בקונפיגורציה.",
+            )
+            return
+        self._send(chat_id, "🤖 מנתח את התיק כמכלול… (עשוי לקחת עד דקה)")
+        loop = asyncio.get_event_loop()
+
+        def _report_and_analyze() -> str:
+            report = self._risk.full_report()
+            return self._analyst.analyze_portfolio(report)
+
+        analysis = await loop.run_in_executor(None, _report_and_analyze)
+        self._send(chat_id, f"🧠 *ניתוח AI — התיק שלי*\n{'─' * 20}\n{analysis}")
 
     async def _send_analysis(self, chat_id: int, symbol: str) -> None:
         if self._analyst is None:

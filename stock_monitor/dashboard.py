@@ -23,9 +23,11 @@ router = APIRouter()
 
 _risk_analyzer = PortfolioRiskAnalyzer(portfolio_store)
 
-# The AI analyst is built by main.py only when a key is configured, so the
-# dashboard receives it through this registry rather than constructing its own.
+# The AI analyst is built by main.py only when a key is configured, and the
+# data feed is owned by the running app, so both reach the dashboard through
+# this registry rather than being constructed a second time here.
 _analyst = None
+_data_feed = None
 
 
 def set_analyst(analyst) -> None:
@@ -35,6 +37,21 @@ def set_analyst(analyst) -> None:
 
 def get_analyst():
     return _analyst
+
+
+def set_data_feed(feed) -> None:
+    global _data_feed
+    _data_feed = feed
+
+
+def get_data_feed():
+    """The app's feed when running as a daemon; a standalone one otherwise."""
+    global _data_feed
+    if _data_feed is None:
+        from .data_feed import StockDataFeed
+
+        _data_feed = StockDataFeed()
+    return _data_feed
 
 # ── Shared live-price cache (written by monitor_cycle, read by dashboard) ────
 _price_cache: Dict[str, dict] = {}
@@ -104,6 +121,38 @@ async def api_delete_holding(ticker: str):
     if not portfolio_store.delete(ticker):
         raise HTTPException(status_code=404, detail="הפוזיציה לא נמצאה")
     return JSONResponse({"status": "deleted", "ticker": ticker.strip().upper()})
+
+
+@router.post("/api/analyze/{ticker}")
+async def api_analyze_ticker(ticker: str):
+    """AI analysis of a single stock, personalized to the held position.
+
+    When the ticker is in the portfolio the recommendation is tailored to the
+    user's entry price; otherwise it is a general assessment.
+    """
+    analyst = get_analyst()
+    if analyst is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true",
+        )
+    try:
+        symbol = Holding.create(ticker, 1, 1).ticker   # reuse ticker validation
+    except HoldingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    holding = portfolio_store.get(symbol)
+
+    def _fetch_and_analyze() -> str:
+        data = get_data_feed().get_current_data(symbol) or {}
+        return analyst.analyze(symbol, data, holding=holding)
+
+    try:
+        analysis = await run_in_threadpool(_fetch_and_analyze)
+    except Exception as exc:
+        logger.error("Analysis failed for %s: %s", symbol, exc, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"שגיאה בניתוח {symbol}") from exc
+    return JSONResponse({"ticker": symbol, "analysis": analysis})
 
 
 @router.post("/api/portfolio/analyze")
@@ -337,7 +386,7 @@ _HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card" id="analysis-card" style="display:none">
-      <div class="card-title">ניתוח AI — התיק כמכלול</div>
+      <div class="card-title" id="analysis-title">ניתוח AI</div>
       <div id="analysis-body" class="analysis-text">—</div>
     </div>
 
@@ -629,6 +678,7 @@ function renderHoldings(data) {
               title="לחץ לעריכת הסקטור">${esc(p.sector)}${p.sector_is_manual ? ' ✎' : ''}</span>
       </td>
       <td style="white-space:nowrap">
+        <button class="btn" onclick="analyzeTicker('${esc(p.ticker)}')" title="ניתוח AI של המניה">🧠</button>
         <button class="btn" onclick="editHolding('${esc(p.ticker)}')">עריכה</button>
         <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')">מחיקה</button>
       </td></tr>`).join('')}</tbody>
@@ -723,19 +773,30 @@ async function loadPortfolio() {
   }
 }
 
-/* ── Whole-portfolio AI analysis ── */
-async function analyzePortfolio() {
+/* ── AI analysis: one stock, or the whole portfolio ── */
+async function runAnalysis(title, path, pending) {
   const card = document.getElementById('analysis-card');
   const body = document.getElementById('analysis-body');
+  document.getElementById('analysis-title').textContent = title;
   card.style.display = 'block';
-  body.textContent = 'מנתח את התיק… (עשוי לקחת עד דקה)';
+  body.textContent = pending;
   card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
   try {
-    const data = await api('/api/portfolio/analyze', {method: 'POST'});
+    const data = await api(path, {method: 'POST'});
     body.textContent = data.analysis;
   } catch (e) {
     body.innerHTML = `<span class="down">שגיאה: ${esc(e.message)}</span>`;
   }
+}
+
+function analyzePortfolio() {
+  return runAnalysis('ניתוח AI — התיק כמכלול', '/api/portfolio/analyze',
+                     'מנתח את התיק… (עשוי לקחת עד דקה)');
+}
+
+function analyzeTicker(ticker) {
+  return runAnalysis(`ניתוח AI — ${ticker}`, '/api/analyze/' + encodeURIComponent(ticker),
+                     `מנתח את ${ticker}… (עשוי לקחת עד דקה)`);
 }
 
 /* ── Build label: makes a stale deploy obvious instead of invisible ── */

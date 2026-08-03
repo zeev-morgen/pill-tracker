@@ -108,3 +108,65 @@ def test_analyze_returns_the_analysis(client):
 def test_analyze_is_post_only(client):
     # A GET must not spend Anthropic tokens via prefetch or refresh.
     assert client.get("/api/portfolio/analyze").status_code == 405
+
+
+# ── Per-stock analysis ────────────────────────────────────────────────────────
+
+class _AnalystStub:
+    def analyze(self, symbol, data, holding=None):
+        return f"{symbol}|held={holding is not None}"
+
+    def analyze_portfolio(self, report):
+        return "portfolio"
+
+
+class _FeedStub:
+    def get_current_data(self, symbol):
+        return {"price": 350.0, "change_pct": 1.0}
+
+
+@pytest.fixture
+def ai_client(client):
+    dashboard.set_analyst(_AnalystStub())
+    dashboard.set_data_feed(_FeedStub())
+    try:
+        yield client
+    finally:
+        dashboard.set_analyst(None)
+
+
+def test_single_stock_analysis_returns_text(ai_client):
+    response = ai_client.post("/api/analyze/TSLA")
+    assert response.status_code == 200
+    assert response.json()["ticker"] == "TSLA"
+
+
+def test_single_stock_analysis_normalizes_the_ticker(ai_client):
+    assert ai_client.post("/api/analyze/tsla").json()["ticker"] == "TSLA"
+
+
+def test_held_position_is_passed_to_the_analyst(ai_client):
+    from stock_monitor.store import Holding, portfolio_store
+
+    portfolio_store.upsert(Holding.create("AVGO", 6.76, 374.67))
+    try:
+        assert "held=True" in ai_client.post("/api/analyze/AVGO").json()["analysis"]
+    finally:
+        portfolio_store.delete("AVGO")
+
+
+def test_unheld_ticker_still_analyzes(ai_client):
+    assert "held=False" in ai_client.post("/api/analyze/ZZZZ").json()["analysis"]
+
+
+def test_invalid_ticker_is_rejected(ai_client):
+    assert ai_client.post("/api/analyze/BAD TICKER").status_code == 422
+
+
+def test_single_stock_analysis_requires_ai(client):
+    dashboard.set_analyst(None)
+    assert client.post("/api/analyze/TSLA").status_code == 503
+
+
+def test_single_stock_analysis_is_post_only(ai_client):
+    assert ai_client.get("/api/analyze/TSLA").status_code == 405

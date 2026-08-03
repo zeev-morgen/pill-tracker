@@ -31,7 +31,7 @@ import uvicorn
 from . import db
 from .alert_engine import AlertEngine
 from .config import AppConfig, load_config
-from .dashboard import set_analyst, update_price_cache
+from .dashboard import set_analyst, set_data_feed, update_price_cache
 from .data_feed import StockDataFeed, get_market_session
 from .earnings import EarningsMonitor
 from .notifier import NotificationDispatcher
@@ -75,6 +75,9 @@ class StockMonitorApp:
     def __init__(self, config: AppConfig) -> None:
         self.config     = config
         self.data_feed  = StockDataFeed()
+        # Share the feed with the dashboard so its analysis endpoint reuses
+        # this instance instead of opening a second one.
+        set_data_feed(self.data_feed)
         self.engine     = AlertEngine(config, self.data_feed)
         self.dispatcher = NotificationDispatcher(config.notifications)
         self.scheduler  = MarketScheduler(
