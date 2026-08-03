@@ -31,7 +31,7 @@ import uvicorn
 from . import db
 from .alert_engine import AlertEngine
 from .config import AppConfig, load_config
-from .dashboard import update_price_cache
+from .dashboard import set_analyst, update_price_cache
 from .data_feed import StockDataFeed, get_market_session
 from .earnings import EarningsMonitor
 from .notifier import NotificationDispatcher
@@ -90,6 +90,8 @@ class StockMonitorApp:
         if config.ai.enabled and config.ai.api_key:
             from .ai_analyst import StockAnalyst
             self._analyst = StockAnalyst(api_key=config.ai.api_key, model=config.ai.model)
+            # Share it with the dashboard so /api/portfolio/analyze can use it.
+            set_analyst(self._analyst)
             self._log.info("AI analyst enabled (model=%s)", config.ai.model)
 
         self._earnings: Optional[EarningsMonitor] = None

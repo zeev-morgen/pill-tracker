@@ -23,6 +23,19 @@ router = APIRouter()
 
 _risk_analyzer = PortfolioRiskAnalyzer(portfolio_store)
 
+# The AI analyst is built by main.py only when a key is configured, so the
+# dashboard receives it through this registry rather than constructing its own.
+_analyst = None
+
+
+def set_analyst(analyst) -> None:
+    global _analyst
+    _analyst = analyst
+
+
+def get_analyst():
+    return _analyst
+
 # ── Shared live-price cache (written by monitor_cycle, read by dashboard) ────
 _price_cache: Dict[str, dict] = {}
 
@@ -89,6 +102,28 @@ async def api_delete_holding(ticker: str):
     if not portfolio_store.delete(ticker):
         raise HTTPException(status_code=404, detail="הפוזיציה לא נמצאה")
     return JSONResponse({"status": "deleted", "ticker": ticker.strip().upper()})
+
+
+@router.post("/api/portfolio/analyze")
+async def api_analyze_portfolio():
+    """Whole-portfolio AI analysis, on demand.
+
+    POST rather than GET because each call spends Anthropic tokens — this must
+    never be triggered by a browser prefetch or a refresh.
+    """
+    analyst = get_analyst()
+    if analyst is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true",
+        )
+    try:
+        report = await run_in_threadpool(_risk_analyzer.full_report)
+        analysis = await run_in_threadpool(analyst.analyze_portfolio, report)
+    except Exception as exc:
+        logger.error("Portfolio analysis failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="שגיאה בניתוח התיק") from exc
+    return JSONResponse({"analysis": analysis})
 
 
 @router.get("/api/portfolio")
@@ -231,6 +266,11 @@ _HTML = """<!DOCTYPE html>
   .modal-actions { display: flex; gap: 8px; margin-top: 18px; }
   .form-error { color: var(--red); font-size: 0.78rem; margin-top: 8px; min-height: 15px; }
   .empty { padding: 32px; text-align: center; color: var(--muted); font-size: 0.9rem; }
+  .analysis-text {
+    padding: 18px; white-space: pre-wrap; line-height: 1.7; font-size: 0.9rem;
+    direction: rtl; text-align: right;
+  }
+  #build-label { color: var(--muted); font-size: 0.72rem; }
 </style>
 </head>
 <body>
@@ -240,6 +280,7 @@ _HTML = """<!DOCTYPE html>
   <div id="refresh-indicator"></div>
   <h1>📈 Stock Monitor</h1>
   <span id="session-badge">—</span>
+  <span id="build-label"></span>
   <span id="server-time">Loading…</span>
 </header>
 
@@ -274,10 +315,16 @@ _HTML = """<!DOCTYPE html>
       <div class="card-title">הפוזיציות שלי</div>
       <div class="card-actions">
         <button class="btn primary" onclick="openModal()">+ הוספת פוזיציה</button>
+        <button class="btn" onclick="analyzePortfolio()">🧠 ניתוח AI של התיק</button>
         <button class="btn" onclick="loadPortfolio()">רענון</button>
         <span id="portfolio-total" class="volume" style="margin-right:12px"></span>
       </div>
       <div id="holdings-wrap"><div class="empty">טוען…</div></div>
+    </div>
+
+    <div class="card" id="analysis-card" style="display:none">
+      <div class="card-title">ניתוח AI — התיק כמכלול</div>
+      <div id="analysis-body" class="analysis-text">—</div>
     </div>
 
     <div class="charts">
@@ -609,11 +656,35 @@ async function loadPortfolio() {
   }
 }
 
+/* ── Whole-portfolio AI analysis ── */
+async function analyzePortfolio() {
+  const card = document.getElementById('analysis-card');
+  const body = document.getElementById('analysis-body');
+  card.style.display = 'block';
+  body.textContent = 'מנתח את התיק… (עשוי לקחת עד דקה)';
+  card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  try {
+    const data = await api('/api/portfolio/analyze', {method: 'POST'});
+    body.textContent = data.analysis;
+  } catch (e) {
+    body.innerHTML = `<span class="down">שגיאה: ${esc(e.message)}</span>`;
+  }
+}
+
+/* ── Build label: makes a stale deploy obvious instead of invisible ── */
+async function loadBuild() {
+  try {
+    const b = await api('/health');
+    document.getElementById('build-label').textContent = `v${b.version} · ${b.revision}`;
+  } catch (_) { /* diagnostics only */ }
+}
+
 document.getElementById('modal').addEventListener('click', (e) => {
   if (e.target.id === 'modal') closeModal();
 });
 
 refresh();
+loadBuild();
 loadPortfolio();
 setInterval(refresh, INTERVAL);
 setInterval(loadPortfolio, 120000);   // portfolio prices refresh every 2 min

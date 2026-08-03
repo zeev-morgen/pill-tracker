@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .notifier import NotificationDispatcher
 from .dashboard import router as dashboard_router
+from .version import build_info
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,12 @@ def create_webhook_app(
 
     @app.get("/health")
     async def health():
-        return {"status": "running", "utc": datetime.now(timezone.utc).isoformat()}
+        # Also the uptime-ping target, so it stays cheap and public. The build
+        # fields make it possible to confirm which revision is deployed.
+        return {
+            "status": "running",
+            "utc": datetime.now(timezone.utc).isoformat(),
+            **build_info(),
+        }
 
     return app

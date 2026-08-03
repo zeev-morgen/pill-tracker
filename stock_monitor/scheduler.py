@@ -7,6 +7,7 @@ Cron jobs log market open/close events at the correct ET times.
 """
 
 import logging
+from datetime import datetime
 from typing import Callable, List
 
 import pytz
@@ -45,13 +46,16 @@ class MarketScheduler:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        # Main polling job
+        # Main polling job. next_run_time makes the first scan fire immediately
+        # instead of one full interval later, so prices and the dashboard are
+        # populated at startup rather than after a minute of apparent silence.
         self._scheduler.add_job(
             self._tick,
             trigger=IntervalTrigger(seconds=self.interval_seconds),
             id="stock_monitor_tick",
             replace_existing=True,
             max_instances=1,       # never overlap
+            next_run_time=datetime.now(NYSE_TZ),
         )
 
         # Market open / close announcements (ET)

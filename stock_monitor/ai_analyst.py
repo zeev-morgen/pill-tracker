@@ -31,6 +31,22 @@ _SYSTEM_PROMPT = (
     "מגבלת אורך: עד 500 מילים. התאמה להודעת Telegram."
 )
 
+_PORTFOLIO_SYSTEM_PROMPT = (
+    "אתה מנהל תיקים מקצועי שעונה אך ורק בעברית.\n"
+    "אתה מנתח תיק השקעות כמכלול — לא מניה-מניה.\n\n"
+    "מבנה התשובה:\n"
+    "📊 *תמונת מצב*: שורה אחת על מצב התיק והתשואה הכוללת\n"
+    "⚖️ *פיזור וריכוזיות*: האם התיק מפוזר נכון? איזה סקטור או מניה דומיננטיים מדי?\n"
+    "🌪️ *סיכון ותנודתיות*: מה ה-ATR מלמד על רמת הסיכון בפועל\n"
+    "🏆 *מובילים וגוררים*: הפוזיציות שתורמות ושפוגעות בתשואה\n"
+    "🎯 *המלצות פעולה*: 2-4 צעדים קונקרטיים ומדורגים לפי חשיבות\n\n"
+    "התייחס לגדלים היחסיים: פוזיציה של 2% מהתיק לא מצדיקה אותה תשומת לב\n"
+    "כמו פוזיציה של 40%, גם אם התשואה עליה דרמטית יותר.\n"
+    "אל תמציא מידע. אם חסר נתון — כתוב 'אין נתון'.\n"
+    "מגבלת אורך: עד 450 מילים. זו תמיכה בקבלת החלטות, לא ייעוץ השקעות — "
+    "ציין זאת במשפט אחד בסוף."
+)
+
 
 class StockAnalyst:
     """Generates a Hebrew AI analysis for a stock symbol using Claude."""
@@ -51,7 +67,12 @@ class StockAnalyst:
             )
         return self._insecure_client
 
-    def _stream_once(self, client: anthropic.Anthropic, prompt: str):
+    def _stream_once(
+        self,
+        client: anthropic.Anthropic,
+        prompt: str,
+        system_prompt: str = _SYSTEM_PROMPT,
+    ):
         with client.messages.stream(
             model=self._model,
             max_tokens=1500,
@@ -59,7 +80,7 @@ class StockAnalyst:
             system=[
                 {
                     "type": "text",
-                    "text": _SYSTEM_PROMPT,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -96,6 +117,92 @@ class StockAnalyst:
         except Exception as exc:
             logger.error("AI analysis failed for %s: %s", symbol, exc, exc_info=True)
             return f"❌ שגיאה בניתוח AI עבור {symbol}: {exc}"
+
+    # ── Portfolio-level analysis ──────────────────────────────────────────────
+
+    def analyze_portfolio(self, report: dict) -> str:
+        """Analyze the portfolio as a whole from a portfolio_risk full_report().
+
+        Looks at the positions together — concentration, volatility exposure,
+        winners and losers — rather than rating each stock in isolation.
+        """
+        positions = report.get("positions") or []
+        if not positions:
+            return "אין פוזיציות בתיק לניתוח. הוסף פוזיציות בטאב \"התיק שלי\"."
+
+        prompt = self._build_portfolio_prompt(report)
+        try:
+            try:
+                msg = self._stream_once(self._client, prompt, _PORTFOLIO_SYSTEM_PROMPT)
+            except (anthropic.APIConnectionError, httpx.ConnectError) as exc:
+                logger.warning(
+                    "Anthropic API connection error (%s) — retrying with SSL verify=False.",
+                    exc.__class__.__name__,
+                )
+                msg = self._stream_once(
+                    self._get_insecure_client(), prompt, _PORTFOLIO_SYSTEM_PROMPT
+                )
+            return next(
+                (b.text for b in msg.content if b.type == "text"), "לא התקבל ניתוח."
+            )
+        except Exception as exc:
+            logger.error("Portfolio AI analysis failed: %s", exc, exc_info=True)
+            return f"❌ שגיאה בניתוח התיק: {exc}"
+
+    @staticmethod
+    def _build_portfolio_prompt(report: dict) -> str:
+        positions = report["positions"]
+        volatility = report.get("volatility", {})
+        sector = report.get("sector", {})
+        allocation = report.get("allocation", {})
+
+        parts = [
+            "נתח את התיק הבא כמכלול.",
+            "",
+            f"**שווי תיק כולל:** ${report.get('total_value', 0):,.2f}",
+            f"**רווח/הפסד כולל:** "
+            f"{'+' if report.get('total_pnl_value', 0) >= 0 else '-'}"
+            f"${abs(report.get('total_pnl_value', 0)):,.2f}",
+            "",
+            "**פוזיציות:**",
+        ]
+        for p in positions:
+            atr = f"{p['atr_pct']:.2f}%" if p.get("atr_pct") is not None else "אין נתון"
+            parts.append(
+                f"• {p['ticker']}: {p['quantity']:g} מניות | כניסה ${p['entry_price']:.2f} "
+                f"| נוכחי ${p['current_price']:.2f} | תשואה {p['pnl_pct']:+.2f}% "
+                f"| שווי ${p['market_value']:,.2f} | ATR {atr} | סקטור {p['sector']}"
+            )
+
+        if sector.get("sectors"):
+            parts += ["", "**פיזור סקטוריאלי:**"]
+            for s in sector["sectors"]:
+                parts.append(f"• {s['sector']}: {s['weight_pct']:.1f}% מהתיק")
+            if sector.get("alert"):
+                names = ", ".join(s["sector"] for s in sector.get("concentrated_sectors", []))
+                parts.append(
+                    f"⚠️ ריכוזיות מעל סף {sector.get('threshold_pct')}% בסקטור: {names}"
+                )
+
+        parts += [
+            "",
+            "**חשיפת תנודתיות:**",
+            f"• {volatility.get('exposure_pct', 0):.1f}% משווי התיק במניות בעלות ATR גבוה "
+            f"(סף: {volatility.get('threshold_pct')}%)",
+        ]
+        if volatility.get("high_volatility_positions"):
+            names = ", ".join(
+                f"{p['ticker']} ({p['atr_pct']:.1f}%)"
+                for p in volatility["high_volatility_positions"]
+            )
+            parts.append(f"• מניות תנודתיות: {names}")
+
+        if allocation.get("by_index"):
+            parts += ["", "**חשיפה למדדים:**"]
+            for i in allocation["by_index"]:
+                parts.append(f"• {i['label']}: {i['weight_pct']:.1f}%")
+
+        return "\n".join(parts)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
