@@ -100,14 +100,22 @@ class HoldingError(ValueError):
     """Raised when a holding fails validation."""
 
 
+#: Portfolio is split by these for the index-vs-single-stock breakdown.
+ASSET_TYPES = ("stock", "etf")
+
+
 @dataclass
 class Holding:
     ticker: str
     quantity: float
     entry_price: float
+    #: Manual sector override. None means "use whatever yfinance reports".
+    sector: Optional[str] = None
+    #: 'stock' or 'etf'. None means "detect automatically".
+    asset_type: Optional[str] = None
 
     @staticmethod
-    def create(ticker: str, quantity, entry_price) -> "Holding":
+    def create(ticker: str, quantity, entry_price, sector=None, asset_type=None) -> "Holding":
         """Validate and normalize user input. Raises HoldingError on bad input."""
         ticker = str(ticker).strip().upper()
         if not ticker or len(ticker) > 16:
@@ -123,14 +131,43 @@ class Holding:
             raise HoldingError("כמות חייבת להיות גדולה מאפס")
         if entry_price <= 0:
             raise HoldingError("מחיר כניסה חייב להיות גדול מאפס")
-        return Holding(ticker=ticker, quantity=quantity, entry_price=entry_price)
+
+        # Blank input means "no override", not an empty-string sector.
+        sector = (str(sector).strip() or None) if sector is not None else None
+        if sector is not None and len(sector) > 64:
+            raise HoldingError("שם סקטור ארוך מדי (עד 64 תווים)")
+
+        if asset_type is not None:
+            asset_type = str(asset_type).strip().lower() or None
+        if asset_type is not None and asset_type not in ASSET_TYPES:
+            raise HoldingError("סוג נכס חייב להיות 'stock' או 'etf'")
+
+        return Holding(
+            ticker=ticker,
+            quantity=quantity,
+            entry_price=entry_price,
+            sector=sector,
+            asset_type=asset_type,
+        )
 
     def as_dict(self) -> dict:
         return {
             "ticker": self.ticker,
             "quantity": self.quantity,
             "entry_price": self.entry_price,
+            "sector": self.sector,
+            "asset_type": self.asset_type,
         }
+
+
+def _row_to_holding(row) -> Holding:
+    return Holding(
+        ticker=row.ticker,
+        quantity=row.quantity,
+        entry_price=row.entry_price,
+        sector=row.sector,
+        asset_type=row.asset_type,
+    )
 
 
 class PortfolioStore:
@@ -158,11 +195,15 @@ class PortfolioStore:
                                 ticker=holding.ticker,
                                 quantity=holding.quantity,
                                 entry_price=holding.entry_price,
+                                sector=holding.sector,
+                                asset_type=holding.asset_type,
                             )
                         )
                     else:
                         row.quantity = holding.quantity
                         row.entry_price = holding.entry_price
+                        row.sector = holding.sector
+                        row.asset_type = holding.asset_type
                         row.updated_at = datetime.now()
             except (SQLAlchemyError, RuntimeError) as exc:
                 logger.error("Failed to persist holding %s: %s", holding.ticker, exc)
@@ -174,11 +215,7 @@ class PortfolioStore:
             try:
                 with db.session_scope() as session:
                     row = session.get(db.HoldingRow, ticker)
-                return (
-                    Holding(ticker=row.ticker, quantity=row.quantity, entry_price=row.entry_price)
-                    if row
-                    else None
-                )
+                return _row_to_holding(row) if row else None
             except (SQLAlchemyError, RuntimeError) as exc:
                 logger.error("Failed to read holding %s: %s", ticker, exc)
         with self._lock:
@@ -191,10 +228,7 @@ class PortfolioStore:
                     rows = session.scalars(
                         select(db.HoldingRow).order_by(db.HoldingRow.ticker)
                     ).all()
-                return [
-                    Holding(ticker=r.ticker, quantity=r.quantity, entry_price=r.entry_price)
-                    for r in rows
-                ]
+                return [_row_to_holding(r) for r in rows]
             except (SQLAlchemyError, RuntimeError) as exc:
                 logger.error("Failed to read holdings: %s", exc)
         with self._lock:

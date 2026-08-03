@@ -20,7 +20,16 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine
+from sqlalchemy import (
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -54,6 +63,10 @@ class HoldingRow(Base):
     ticker: Mapped[str] = mapped_column(String(16), primary_key=True)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    # User-supplied overrides. yfinance frequently returns no sector at all, so
+    # the dashboard lets the user set one; NULL means "fall back to yfinance".
+    sector: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    asset_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -95,6 +108,7 @@ def init_db(url: Optional[str] = None) -> bool:
             echo=False,
         )
         Base.metadata.create_all(_engine)
+        _add_missing_columns()
         _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
         logger.info("PostgreSQL connected — alerts and holdings are persisted")
         return True
@@ -112,6 +126,31 @@ def init_db(url: Optional[str] = None) -> bool:
         _engine = None
         _SessionFactory = None
         return False
+
+
+def _add_missing_columns() -> None:
+    """Add columns introduced after a database was first created.
+
+    ``create_all`` only creates missing *tables*, so an existing deployment
+    would keep an outdated ``holdings`` table and every query naming a new
+    column would fail. This keeps the schema current without pulling in a
+    migration framework, which is overkill at this scale. Each statement is
+    additive and nullable, so it is safe to re-run and never touches data.
+    """
+    inspector = inspect(_engine)
+    if "holdings" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("holdings")}
+    additions = {
+        "sector": "VARCHAR(64)",
+        "asset_type": "VARCHAR(16)",
+    }
+    with _engine.begin() as connection:
+        for column, ddl_type in additions.items():
+            if column in existing:
+                continue
+            connection.execute(text(f"ALTER TABLE holdings ADD COLUMN {column} {ddl_type}"))
+            logger.info("Schema updated: added holdings.%s", column)
 
 
 def is_enabled() -> bool:

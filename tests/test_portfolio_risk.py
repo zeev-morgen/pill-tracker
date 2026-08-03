@@ -132,3 +132,41 @@ def test_allocation_empty_portfolio():
     alloc = build_allocation([])
     assert alloc["by_sector"] == []
     assert alloc["by_index"] == []
+
+
+# ── Asset-type split: index funds vs individual stocks ────────────────────────
+
+def test_asset_split_separates_etfs_from_stocks():
+    positions = [
+        {"ticker": "VOO", "market_value": 6000.0, "sector": "Diversified",
+         "asset_type": "etf", "indexes": ["S&P 500"]},
+        {"ticker": "AVGO", "market_value": 4000.0, "sector": "Technology",
+         "asset_type": "stock", "indexes": ["S&P 500"]},
+    ]
+    split = build_allocation(positions)["by_asset_type"]
+    assert split["etf_pct"] == 60.0
+    assert split["stock_pct"] == 40.0
+    assert split["etf_value"] == 6000.0
+    assert split["stock_value"] == 4000.0
+
+
+def test_asset_split_always_totals_100():
+    positions = [
+        {"ticker": "A", "market_value": 1234.56, "sector": "X", "asset_type": "etf", "indexes": []},
+        {"ticker": "B", "market_value": 765.44, "sector": "Y", "asset_type": "stock", "indexes": []},
+    ]
+    split = build_allocation(positions)["by_asset_type"]
+    assert split["etf_pct"] + split["stock_pct"] == pytest.approx(100.0, abs=0.05)
+
+
+def test_positions_without_asset_type_count_as_stocks():
+    # An older holding saved before the field existed must not vanish from the split.
+    positions = [{"ticker": "A", "market_value": 500.0, "sector": "X", "indexes": []}]
+    split = build_allocation(positions)["by_asset_type"]
+    assert split["stock_pct"] == 100.0
+    assert split["etf_pct"] == 0.0
+
+
+def test_asset_split_on_empty_portfolio_is_zero_not_a_crash():
+    split = build_allocation([])["by_asset_type"]
+    assert split["etf_pct"] == 0.0 and split["stock_pct"] == 0.0

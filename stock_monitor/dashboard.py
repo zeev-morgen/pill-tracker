@@ -90,6 +90,8 @@ async def api_upsert_holding(payload: dict = Body(...)):
             ticker=payload.get("ticker", ""),
             quantity=payload.get("quantity"),
             entry_price=payload.get("entry_price"),
+            sector=payload.get("sector"),
+            asset_type=payload.get("asset_type"),
         )
     except HoldingError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -263,6 +265,18 @@ _HTML = """<!DOCTYPE html>
     background: var(--bg); color: var(--text); font-size: 0.9rem; font-family: inherit;
   }
   .modal input:disabled { color: var(--muted); }
+  .modal select {
+    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 0.9rem; font-family: inherit;
+  }
+  .muted-hint { color: var(--muted); font-weight: 400; }
+  .sector-cell { cursor: pointer; border-bottom: 1px dotted var(--border); }
+  .sector-cell.unknown { color: var(--yellow); }
+  .split-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 4px 0 10px; }
+  .split-bar span { display: block; }
+  .split-legend { display: flex; gap: 18px; font-size: 0.82rem; flex-wrap: wrap; }
+  .split-legend b { font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-left: 6px; }
   .modal-actions { display: flex; gap: 8px; margin-top: 18px; }
   .form-error { color: var(--red); font-size: 0.78rem; margin-top: 8px; min-height: 15px; }
   .empty { padding: 32px; text-align: center; color: var(--muted); font-size: 0.9rem; }
@@ -334,6 +348,10 @@ _HTML = """<!DOCTYPE html>
       </div>
       <div class="card">
         <div class="card-title">חלוקה לפי מדדים</div>
+        <div style="padding:14px 18px 0">
+          <div class="split-bar" id="split-bar"></div>
+          <div class="split-legend" id="split-legend"></div>
+        </div>
         <div class="chart-box"><canvas id="indexChart"></canvas></div>
       </div>
     </div>
@@ -368,6 +386,20 @@ _HTML = """<!DOCTYPE html>
     <input id="f-qty" type="number" min="0.0001" step="any" placeholder="לדוגמה: 10">
     <label for="f-price">מחיר כניסה (למניה)</label>
     <input id="f-price" type="number" min="0.0001" step="any" placeholder="לדוגמה: 187.50">
+    <label for="f-sector">סקטור <span class="muted-hint">(אופציונלי — ממלא אוטומטית אם ריק)</span></label>
+    <input id="f-sector" list="sector-options" maxlength="64" placeholder="לדוגמה: Technology" autocomplete="off">
+    <datalist id="sector-options">
+      <option value="Technology"><option value="Healthcare"><option value="Financial Services">
+      <option value="Consumer Cyclical"><option value="Consumer Defensive"><option value="Energy">
+      <option value="Basic Materials"><option value="Industrials"><option value="Utilities">
+      <option value="Real Estate"><option value="Communication Services">
+    </datalist>
+    <label for="f-asset-type">סוג נכס</label>
+    <select id="f-asset-type">
+      <option value="">זיהוי אוטומטי</option>
+      <option value="stock">מניה בודדת</option>
+      <option value="etf">מדד / קרן סל</option>
+    </select>
     <div class="form-error" id="f-error"></div>
     <div class="modal-actions">
       <button class="btn primary" onclick="saveHolding()">שמירה</button>
@@ -515,11 +547,17 @@ function openModal(existing) {
     tickerEl.disabled = true;
     document.getElementById('f-qty').value = existing.quantity;
     document.getElementById('f-price').value = existing.entry_price;
+    // Only a manually set sector is pre-filled; an auto-detected one stays
+    // blank so saving does not silently freeze today's yfinance answer.
+    document.getElementById('f-sector').value = existing.sector_is_manual ? existing.sector : '';
+    document.getElementById('f-asset-type').value = existing.asset_type_is_manual ? existing.asset_type : '';
   } else {
     document.getElementById('modal-title').textContent = 'הזנת פוזיציה';
     tickerEl.value = ''; tickerEl.disabled = false;
     document.getElementById('f-qty').value = '';
     document.getElementById('f-price').value = '';
+    document.getElementById('f-sector').value = '';
+    document.getElementById('f-asset-type').value = '';
   }
   document.getElementById('modal').classList.add('open');
 }
@@ -534,13 +572,18 @@ async function saveHolding() {
   const ticker = document.getElementById('f-ticker').value.trim().toUpperCase();
   const quantity = parseFloat(document.getElementById('f-qty').value);
   const entry_price = parseFloat(document.getElementById('f-price').value);
+  const sector = document.getElementById('f-sector').value.trim() || null;
+  const asset_type = document.getElementById('f-asset-type').value || null;
   const errEl = document.getElementById('f-error');
   errEl.textContent = '';
   if (!ticker) { errEl.textContent = 'יש להזין טיקר'; return; }
   if (!Number.isFinite(quantity) || quantity <= 0) { errEl.textContent = 'כמות חייבת להיות מספר חיובי'; return; }
   if (!Number.isFinite(entry_price) || entry_price <= 0) { errEl.textContent = 'מחיר כניסה חייב להיות מספר חיובי'; return; }
   try {
-    await api('/api/holdings', {method: 'POST', body: JSON.stringify({ticker, quantity, entry_price})});
+    await api('/api/holdings', {
+      method: 'POST',
+      body: JSON.stringify({ticker, quantity, entry_price, sector, asset_type}),
+    });
     closeModal();
     loadPortfolio();
   } catch (e) { errEl.textContent = e.message; }
@@ -580,7 +623,11 @@ function renderHoldings(data) {
       <td>${money(p.market_value)}</td>
       <td>${pctCell(p.pnl_pct)} <span class="volume">(${money(p.pnl_value)})</span></td>
       <td><span class="volume">${p.atr_pct == null ? '—' : p.atr_pct.toFixed(2) + '%'}</span></td>
-      <td><span class="volume">${esc(p.sector)}</span></td>
+      <td>
+        <span class="sector-cell ${p.sector === 'Unknown' ? 'unknown' : ''}"
+              onclick="editHolding('${esc(p.ticker)}')"
+              title="לחץ לעריכת הסקטור">${esc(p.sector)}${p.sector_is_manual ? ' ✎' : ''}</span>
+      </td>
       <td style="white-space:nowrap">
         <button class="btn" onclick="editHolding('${esc(p.ticker)}')">עריכה</button>
         <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')">מחיקה</button>
@@ -611,6 +658,25 @@ function renderPie(canvasId, existing, entries) {
       },
     },
   });
+}
+
+/* How much of the portfolio is held through index funds / ETFs versus picked
+   as individual stocks — a different question from index *membership* below. */
+function renderAssetSplit(split) {
+  const bar = document.getElementById('split-bar');
+  const legend = document.getElementById('split-legend');
+  if (!split || (split.etf_pct === 0 && split.stock_pct === 0)) {
+    bar.innerHTML = ''; legend.innerHTML = '';
+    return;
+  }
+  bar.innerHTML =
+    `<span style="width:${split.etf_pct}%;background:#bc8cff"></span>` +
+    `<span style="width:${split.stock_pct}%;background:#58a6ff"></span>`;
+  legend.innerHTML =
+    `<span><i class="dot" style="background:#bc8cff"></i>מדדים / קרנות סל: ` +
+    `<b>${split.etf_pct.toFixed(1)}%</b> <span class="volume">(${money(split.etf_value)})</span></span>` +
+    `<span><i class="dot" style="background:#58a6ff"></i>מניות בודדות: ` +
+    `<b>${split.stock_pct.toFixed(1)}%</b> <span class="volume">(${money(split.stock_value)})</span></span>`;
 }
 
 function renderRisk(data) {
@@ -650,6 +716,7 @@ async function loadPortfolio() {
     renderRisk(data);
     sectorChart = renderPie('sectorChart', sectorChart, data.allocation.by_sector);
     indexChart  = renderPie('indexChart',  indexChart,  data.allocation.by_index);
+    renderAssetSplit(data.allocation.by_asset_type);
   } catch (e) {
     document.getElementById('holdings-wrap').innerHTML =
       `<div class="empty" style="color:var(--red)">שגיאה: ${esc(e.message)}</div>`;

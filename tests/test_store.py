@@ -121,3 +121,39 @@ def test_bad_database_url_degrades_instead_of_crashing(bad_url):
 
     assert db.init_db(bad_url) is False
     assert db.is_enabled() is False
+
+
+# ── Manual sector / asset-type overrides ──────────────────────────────────────
+
+def test_sector_override_is_stored():
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 6.76, 374.67, sector="Technology"))
+    assert store.get("AVGO").sector == "Technology"
+
+
+def test_blank_sector_means_no_override():
+    # An empty field must fall back to yfinance, not store an empty sector.
+    holding = Holding.create("AVGO", 1, 100, sector="   ")
+    assert holding.sector is None
+
+
+def test_sector_override_can_be_cleared_by_saving_blank():
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 1, 100, sector="Technology"))
+    store.upsert(Holding.create("AVGO", 1, 100, sector=""))
+    assert store.get("AVGO").sector is None
+
+
+def test_overlong_sector_is_rejected():
+    with pytest.raises(HoldingError):
+        Holding.create("AVGO", 1, 100, sector="x" * 65)
+
+
+@pytest.mark.parametrize("asset_type,expected", [("etf", "etf"), ("ETF", "etf"), ("", None), (None, None)])
+def test_asset_type_is_normalized(asset_type, expected):
+    assert Holding.create("VOO", 1, 100, asset_type=asset_type).asset_type == expected
+
+
+def test_invalid_asset_type_is_rejected():
+    with pytest.raises(HoldingError):
+        Holding.create("VOO", 1, 100, asset_type="bond")

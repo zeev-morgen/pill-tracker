@@ -58,6 +58,11 @@ class Fundamentals:
     sector: str = "Unknown"
     name: str = ""
     indexes: List[str] = field(default_factory=lambda: ["Other"])
+    #: 'etf' for index funds / ETFs, 'stock' otherwise.
+    asset_type: str = "stock"
+
+
+UNKNOWN_SECTOR = "Unknown"
 
 
 # ── Pure analytics ────────────────────────────────────────────────────────────
@@ -134,17 +139,26 @@ def build_sector_report(positions: List[dict], thresholds: RiskThresholds) -> di
 
 
 def build_allocation(positions: List[dict]) -> dict:
-    """Percentage weights by sector and by index membership.
+    """Percentage weights by sector, by index membership, and by asset type.
 
-    A stock belonging to several indexes contributes to each of them; weights
-    are normalized per bucket so every pie still sums to 100%.
+    A stock belonging to several indexes contributes to each of them; those
+    weights are normalized per bucket so the pie still sums to 100%.
+
+    ``by_asset_type`` answers a different question and is therefore computed
+    against the portfolio total, not normalized per bucket: how much is held
+    through index funds / ETFs versus picked as individual stocks.
     """
     by_sector: Dict[str, float] = {}
     by_index: Dict[str, float] = {}
+    etf_value = 0.0
+    total = sum(p["market_value"] for p in positions)
+
     for p in positions:
         by_sector[p["sector"]] = by_sector.get(p["sector"], 0.0) + p["market_value"]
         for index_name in p.get("indexes") or ["Other"]:
             by_index[index_name] = by_index.get(index_name, 0.0) + p["market_value"]
+        if p.get("asset_type") == "etf":
+            etf_value += p["market_value"]
 
     def to_weights(bucket: Dict[str, float]) -> List[dict]:
         bucket_total = sum(bucket.values())
@@ -155,10 +169,17 @@ def build_allocation(positions: List[dict]) -> dict:
             for label, value in sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)
         ]
 
+    stock_value = total - etf_value
     return {
-        "total_value": round(sum(p["market_value"] for p in positions), 2),
+        "total_value": round(total, 2),
         "by_sector": to_weights(by_sector),
         "by_index": to_weights(by_index),
+        "by_asset_type": {
+            "etf_value": round(etf_value, 2),
+            "stock_value": round(stock_value, 2),
+            "etf_pct": round(etf_value / total * 100.0, 2) if total > 0 else 0.0,
+            "stock_pct": round(stock_value / total * 100.0, 2) if total > 0 else 0.0,
+        },
     }
 
 
@@ -166,17 +187,23 @@ def build_allocation(positions: List[dict]) -> dict:
 
 @lru_cache(maxsize=256)
 def fetch_fundamentals(ticker: str) -> Fundamentals:
-    """Sector/name via yfinance; index membership via the local mapping."""
+    """Sector/name/asset type via yfinance; index membership via the mapping.
+
+    yfinance often returns no sector at all (empty ``.info``, throttling), which
+    is why holdings carry a manual sector override — see ``collect_positions``.
+    """
     info: dict = {}
     try:
         info = yf.Ticker(ticker).info or {}
     except Exception as exc:
         logger.warning("fundamentals fetch failed for %s: %s", ticker, exc)
+    quote_type = str(info.get("quoteType") or "").upper()
     return Fundamentals(
         ticker=ticker,
-        sector=info.get("sector") or "Unknown",
+        sector=info.get("sector") or UNKNOWN_SECTOR,
         name=info.get("shortName") or ticker,
         indexes=INDEX_MEMBERSHIP.get(ticker, ["Other"]),
+        asset_type="etf" if quote_type in {"ETF", "MUTUALFUND", "INDEX"} else "stock",
     )
 
 
@@ -212,6 +239,11 @@ class PortfolioRiskAnalyzer:
             atr = compute_atr(history, self.thresholds.atr_period)
             fundamentals = fetch_fundamentals(holding.ticker)
             market_value = price * holding.quantity
+            # A user-set sector or asset type always wins: yfinance regularly
+            # reports nothing, and the manual value is the whole point of the
+            # override.
+            sector = holding.sector or fundamentals.sector
+            asset_type = holding.asset_type or fundamentals.asset_type
             positions.append(
                 {
                     "ticker": holding.ticker,
@@ -223,7 +255,10 @@ class PortfolioRiskAnalyzer:
                     "pnl_value": (price - holding.entry_price) * holding.quantity,
                     "atr": atr,
                     "atr_pct": (atr / price * 100.0) if atr and price > 0 else None,
-                    "sector": fundamentals.sector,
+                    "sector": sector,
+                    "sector_is_manual": holding.sector is not None,
+                    "asset_type": asset_type,
+                    "asset_type_is_manual": holding.asset_type is not None,
                     "indexes": fundamentals.indexes,
                 }
             )
@@ -244,6 +279,9 @@ class PortfolioRiskAnalyzer:
                     "pnl_value": round(p["pnl_value"], 2),
                     "atr_pct": round(p["atr_pct"], 2) if p["atr_pct"] is not None else None,
                     "sector": p["sector"],
+                    "sector_is_manual": p["sector_is_manual"],
+                    "asset_type": p["asset_type"],
+                    "asset_type_is_manual": p["asset_type_is_manual"],
                 }
                 for p in positions
             ],
