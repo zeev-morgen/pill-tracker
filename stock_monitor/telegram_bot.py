@@ -27,7 +27,7 @@ import urllib3
 
 from .data_feed import StockDataFeed, get_market_session
 from .portfolio_risk import PortfolioRiskAnalyzer
-from .store import portfolio_store
+from .store import portfolio_store, watchlist_store
 
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
@@ -140,12 +140,21 @@ class TelegramCommandBot:
     ) -> None:
         self._base               = f"https://api.telegram.org/bot{bot_token}"
         self._feed               = data_feed
-        self._syms               = [s.upper() for s in monitored_symbols]
+        self._config_syms        = [s.upper() for s in monitored_symbols]
         self._rc_ref             = regular_close_ref  # shared dict from StockMonitorApp
         self._analyst            = analyst
-        self._risk               = PortfolioRiskAnalyzer(portfolio_store)
+        self._risk               = PortfolioRiskAnalyzer(portfolio_store, data_feed=data_feed)
         self._authorized_chat_id = authorized_chat_id
         self._offset             = 0
+
+    @property
+    def _syms(self) -> List[str]:
+        """The live watchlist, so /status reflects dashboard edits immediately.
+
+        Falls back to the symbols passed at construction while the store is
+        empty, which is what happens when no database is configured.
+        """
+        return watchlist_store.all() or self._config_syms
 
     # ── Polling loop ──────────────────────────────────────────────────────────
 

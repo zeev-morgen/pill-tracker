@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -230,9 +231,40 @@ class PortfolioRiskAnalyzer:
         self,
         store: PortfolioStore,
         thresholds: RiskThresholds = RiskThresholds(),
+        data_feed=None,
     ) -> None:
         self._store = store
         self.thresholds = thresholds
+        # Optional: supplies extended-hours quotes. Injected by the app so the
+        # running StockDataFeed is reused rather than a second one created.
+        self._feed = data_feed
+
+    def set_data_feed(self, feed) -> None:
+        """Attach the feed after construction (the dashboard's analyzer is a
+        module-level singleton built before the app owns a feed)."""
+        self._feed = feed
+
+    def _extended_hours(self, ticker: str) -> dict:
+        """Pre/post-market price and move, when the feed can supply them.
+
+        Returns empty rather than raising: extended-hours quotes are a display
+        extra, and losing them must not cost the whole portfolio report.
+        """
+        if self._feed is None:
+            return {}
+        try:
+            data = self._feed.get_current_data(ticker) or {}
+        except Exception as exc:
+            logger.debug("extended-hours fetch failed for %s: %s", ticker, exc)
+            return {}
+        session = data.get("session")
+        if session not in ("pre", "after"):
+            return {"session": session}
+        return {
+            "session": session,
+            "extended_price": data.get("price"),
+            "extended_change_pct": data.get("since_close_pct"),
+        }
 
     def collect_positions(self) -> List[dict]:
         """One entry per holding, enriched with price, ATR, sector and P/L.
@@ -276,6 +308,8 @@ class PortfolioRiskAnalyzer:
                     "asset_type": asset_type,
                     "asset_type_is_manual": holding.asset_type is not None,
                     "indexes": fundamentals.indexes,
+                    "purchase_date": holding.purchase_date,
+                    **self._extended_hours(holding.ticker),
                 }
             )
         return positions
@@ -298,6 +332,22 @@ class PortfolioRiskAnalyzer:
                     "sector_is_manual": p["sector_is_manual"],
                     "asset_type": p["asset_type"],
                     "asset_type_is_manual": p["asset_type_is_manual"],
+                    "purchase_date": (
+                        p["purchase_date"].isoformat() if p.get("purchase_date") else None
+                    ),
+                    "holding_days": (
+                        (date.today() - p["purchase_date"]).days
+                        if p.get("purchase_date") else None
+                    ),
+                    "session": p.get("session"),
+                    "extended_price": (
+                        round(p["extended_price"], 2)
+                        if p.get("extended_price") is not None else None
+                    ),
+                    "extended_change_pct": (
+                        round(p["extended_change_pct"], 2)
+                        if p.get("extended_change_pct") is not None else None
+                    ),
                 }
                 for p in positions
             ],

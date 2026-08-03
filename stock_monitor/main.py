@@ -24,21 +24,31 @@ import logging.handlers
 import signal
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import uvicorn
 
 from . import db
 from .alert_engine import AlertEngine
-from .config import AppConfig, load_config
-from .dashboard import set_analyst, set_data_feed, update_price_cache
+from .config import AppConfig, StockConfig, default_alerts, load_config
+from .dashboard import (
+    prune_price_cache,
+    set_analyst,
+    set_data_feed,
+    set_news_monitor,
+    update_price_cache,
+)
 from .data_feed import StockDataFeed, get_market_session
 from .earnings import EarningsMonitor
+from .news_monitor import NewsMonitor
 from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
-from .store import alert_store
+from .store import alert_store, portfolio_store, watchlist_store
 from .telegram_bot import TelegramCommandBot
 from .webhook_server import create_webhook_app
+
+#: The pre-market news scan runs 30 minutes before the 09:30 ET opening bell.
+NEWS_SCAN_TIME = (9, 0)
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -110,11 +120,37 @@ class StockMonitorApp:
                 "Earnings monitor enabled — daily check at %s ET", config.earnings.check_time
             )
 
+        # Breaking news for held tickers, scanned once before the open. The
+        # dashboard reads the same instance, so its tab serves the cached scan
+        # instead of re-fetching every headline on each page load.
+        self._news = NewsMonitor(portfolio_store)
+        set_news_monitor(self._news)
+        self.scheduler.add_daily_job(
+            self._news.daily_scan, hour=NEWS_SCAN_TIME[0], minute=NEWS_SCAN_TIME[1]
+        )
+
+    # ── Watchlist ─────────────────────────────────────────────────────────────
+
+    def watched_stocks(self) -> List[StockConfig]:
+        """Symbols to poll, read fresh each cycle so dashboard edits take effect.
+
+        The store falls back to config.yaml while it is empty; a symbol that
+        exists in config keeps its tuned alert rules, and one added from the UI
+        gets the defaults.
+        """
+        configured = {s.symbol: s for s in self.config.stocks}
+        symbols = watchlist_store.all() or list(configured)
+        return [
+            configured.get(symbol) or StockConfig(symbol=symbol, alerts=default_alerts())
+            for symbol in symbols
+        ]
+
     # ── Core monitoring loop ──────────────────────────────────────────────────
 
     async def monitor_cycle(self) -> None:
         session   = get_market_session()
-        stock_map = {sc.symbol: sc for sc in self.config.stocks}
+        stock_map = {sc.symbol: sc for sc in self.watched_stocks()}
+        prune_price_cache(stock_map)
 
         for symbol, stock_cfg in stock_map.items():
             try:
@@ -158,7 +194,7 @@ class StockMonitorApp:
     async def run(self) -> None:
         self._log.info("=" * 60)
         self._log.info("Stock Monitor v1.0.0  starting up")
-        self._log.info("Watching: %s", [s.symbol for s in self.config.stocks])
+        self._log.info("Watching: %s", [s.symbol for s in self.watched_stocks()])
         self._log.info(
             "Notifications — telegram: %s  discord: %s  desktop: %s",
             self.config.notifications.telegram.enabled,
@@ -176,7 +212,7 @@ class StockMonitorApp:
             tg_bot = TelegramCommandBot(
                 bot_token=tg_cfg.bot_token,
                 data_feed=self.data_feed,
-                monitored_symbols=[s.symbol for s in self.config.stocks],
+                monitored_symbols=[s.symbol for s in self.watched_stocks()],
                 regular_close_ref=self._regular_close,
                 analyst=self._analyst,
                 authorized_chat_id=tg_cfg.chat_id,
@@ -230,5 +266,8 @@ def run_app(config_path: str = "config/config.yaml") -> None:
     # Connect to PostgreSQL when DATABASE_URL is set; otherwise the stores stay
     # in memory and the monitor runs exactly as before.
     db.init_db()
+    # First run only: copy config.yaml's symbols into the editable watchlist.
+    # Once it holds anything, the user's edits are the source of truth.
+    watchlist_store.seed([s.symbol for s in config.stocks])
     app = StockMonitorApp(config)
     asyncio.run(app.run())

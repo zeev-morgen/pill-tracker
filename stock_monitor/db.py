@@ -17,10 +17,11 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Iterator, Optional
 
 from sqlalchemy import (
+    Date,
     DateTime,
     Float,
     Integer,
@@ -67,7 +68,57 @@ class HoldingRow(Base):
     # the dashboard lets the user set one; NULL means "fall back to yfinance".
     sector: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     asset_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    #: When the position was opened — drives holding duration in the journal.
+    purchase_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class ClosedPositionRow(Base):
+    """A sold position — the trade journal entry.
+
+    A partial sale writes a row for the sold portion and leaves the remainder
+    in ``holdings``, so one ticker can appear here several times.
+    """
+
+    __tablename__ = "closed_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    exit_price: Mapped[float] = mapped_column(Float, nullable=False)
+    purchase_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    sold_date: Mapped[date] = mapped_column(Date, nullable=False)
+    holding_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pnl_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    pnl_value: Mapped[float] = mapped_column(Float, nullable=False)
+    #: Fraction of the original position this sale represents (1.0 = full exit).
+    fraction_sold: Mapped[float] = mapped_column(Float, default=1.0)
+    atr_pct_at_close: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sector: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    #: Claude's verdict: 'green' | 'orange' | 'red'.
+    rating: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    ai_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: The user's own retrospective — never written by the system.
+    personal_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class WatchlistRow(Base):
+    """Symbols monitored for alerts, editable from the dashboard.
+
+    When empty the app falls back to the symbols in config.yaml, so an existing
+    deployment keeps its watchlist until the user edits one from the UI.
+    """
+
+    __tablename__ = "watchlist"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
 
@@ -144,13 +195,26 @@ def _add_missing_columns() -> None:
     additions = {
         "sector": "VARCHAR(64)",
         "asset_type": "VARCHAR(16)",
+        "purchase_date": "DATE",
     }
-    with _engine.begin() as connection:
-        for column, ddl_type in additions.items():
-            if column in existing:
-                continue
-            connection.execute(text(f"ALTER TABLE holdings ADD COLUMN {column} {ddl_type}"))
+    for column, ddl_type in additions.items():
+        if column in existing:
+            continue
+        # One statement per transaction, and failures are contained: if the
+        # database user cannot ALTER (or the column arrives another way), that
+        # must not abort init_db and cost us persistence for every other table.
+        try:
+            with _engine.begin() as connection:
+                connection.execute(
+                    text(f"ALTER TABLE holdings ADD COLUMN {column} {ddl_type}")
+                )
             logger.info("Schema updated: added holdings.%s", column)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "Could not add holdings.%s (%s) — portfolio reads may fall back to "
+                "memory. Grant the database user ALTER on 'holdings' to fix this.",
+                column, exc.__class__.__name__,
+            )
 
 
 def is_enabled() -> bool:

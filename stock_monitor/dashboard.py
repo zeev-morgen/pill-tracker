@@ -15,7 +15,15 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .portfolio_risk import PortfolioRiskAnalyzer
-from .store import Holding, HoldingError, alert_store, portfolio_store
+from .store import (
+    ClosedPosition,
+    Holding,
+    HoldingError,
+    alert_store,
+    closed_position_store,
+    portfolio_store,
+    watchlist_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +50,8 @@ def get_analyst():
 def set_data_feed(feed) -> None:
     global _data_feed
     _data_feed = feed
+    # The analyzer needs it too, for the pre/post-market columns.
+    _risk_analyzer.set_data_feed(feed)
 
 
 def get_data_feed():
@@ -50,11 +60,39 @@ def get_data_feed():
     if _data_feed is None:
         from .data_feed import StockDataFeed
 
-        _data_feed = StockDataFeed()
+        set_data_feed(StockDataFeed())
     return _data_feed
+
+
+_news_monitor = None
+
+
+def set_news_monitor(monitor) -> None:
+    global _news_monitor
+    _news_monitor = monitor
+
+
+def get_news_monitor():
+    global _news_monitor
+    if _news_monitor is None:
+        from .news_monitor import NewsMonitor
+
+        _news_monitor = NewsMonitor(portfolio_store)
+    return _news_monitor
 
 # ── Shared live-price cache (written by monitor_cycle, read by dashboard) ────
 _price_cache: Dict[str, dict] = {}
+
+
+def prune_price_cache(symbols) -> None:
+    """Drop cached quotes for symbols no longer watched.
+
+    Without this a symbol removed from the watchlist would keep showing its
+    last price on the live tab forever, since nothing else ever evicts it.
+    """
+    keep = {str(s).upper() for s in symbols}
+    for symbol in [s for s in _price_cache if s not in keep]:
+        _price_cache.pop(symbol, None)
 
 
 def update_price_cache(data: dict) -> None:
@@ -109,6 +147,7 @@ async def api_upsert_holding(payload: dict = Body(...)):
             entry_price=payload.get("entry_price"),
             sector=payload.get("sector"),
             asset_type=payload.get("asset_type"),
+            purchase_date=payload.get("purchase_date"),
         )
     except HoldingError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -121,6 +160,125 @@ async def api_delete_holding(ticker: str):
     if not portfolio_store.delete(ticker):
         raise HTTPException(status_code=404, detail="הפוזיציה לא נמצאה")
     return JSONResponse({"status": "deleted", "ticker": ticker.strip().upper()})
+
+
+# ── Trade journal ─────────────────────────────────────────────────────────────
+
+@router.post("/api/holdings/{ticker}/sell")
+async def api_sell_holding(ticker: str, payload: dict = Body(...)):
+    """Record a sale. Selling the whole quantity closes the position.
+
+    A partial sale reduces the remaining holding and still writes a journal
+    entry for the portion sold, so averaging out is recorded trade by trade.
+    """
+    holding = portfolio_store.get(ticker)
+    if holding is None:
+        raise HTTPException(status_code=404, detail="הפוזיציה לא נמצאה")
+
+    # ATR and sector are captured now: after the position is gone there is no
+    # way to reconstruct how volatile the stock was while it was held.
+    atr_pct = sector = None
+    try:
+        get_data_feed()   # makes sure the analyzer can price the position
+        snapshot = await run_in_threadpool(_risk_analyzer.collect_positions)
+        current = next((p for p in snapshot if p["ticker"] == holding.ticker), None)
+        if current:
+            atr_pct, sector = current.get("atr_pct"), current.get("sector")
+    except Exception as exc:
+        logger.warning("Could not snapshot risk data for %s: %s", holding.ticker, exc)
+
+    try:
+        closed = ClosedPosition.from_sale(
+            holding=holding,
+            quantity_sold=payload.get("quantity"),
+            exit_price=payload.get("exit_price"),
+            sold_date=payload.get("sold_date"),
+            atr_pct=atr_pct,
+            sector=sector,
+        )
+    except HoldingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    closed_position_store.add(closed)
+
+    remaining = holding.quantity - closed.quantity
+    if remaining > 1e-9:
+        portfolio_store.upsert(
+            Holding(
+                ticker=holding.ticker,
+                quantity=remaining,
+                entry_price=holding.entry_price,
+                sector=holding.sector,
+                asset_type=holding.asset_type,
+                purchase_date=holding.purchase_date,
+            )
+        )
+    else:
+        portfolio_store.delete(holding.ticker)
+
+    return JSONResponse(
+        {"closed": closed.as_dict(), "remaining_quantity": round(max(remaining, 0.0), 6)},
+        status_code=201,
+    )
+
+
+@router.get("/api/journal")
+async def api_journal():
+    entries = [e.as_dict() for e in closed_position_store.all()]
+    wins = [e for e in entries if e["pnl_pct"] > 0]
+    return JSONResponse({
+        "entries": entries,
+        "summary": {
+            "count": len(entries),
+            "total_pnl": round(sum(e["pnl_value"] for e in entries), 2),
+            "win_rate_pct": round(len(wins) / len(entries) * 100.0, 1) if entries else 0.0,
+            "avg_holding_days": (
+                round(
+                    sum(e["holding_days"] for e in entries if e["holding_days"] is not None)
+                    / max(sum(1 for e in entries if e["holding_days"] is not None), 1)
+                )
+                if any(e["holding_days"] is not None for e in entries) else None
+            ),
+        },
+    })
+
+
+@router.post("/api/journal/{entry_id}/analyze")
+async def api_analyze_closed_position(entry_id: int):
+    """Have Claude grade a closed trade; the result is stored, not recomputed."""
+    analyst = get_analyst()
+    if analyst is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true",
+        )
+    entry = closed_position_store.get(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="הרשומה לא נמצאה")
+
+    try:
+        review = await run_in_threadpool(analyst.review_closed_position, entry.as_dict())
+    except Exception as exc:
+        logger.error("Closed-position review failed for %s: %s", entry_id, exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="שגיאה בניתוח העסקה") from exc
+
+    updated = closed_position_store.update_fields(
+        entry_id, rating=review["rating"], ai_analysis=review["explanation"]
+    )
+    return JSONResponse((updated or entry).as_dict())
+
+
+@router.patch("/api/journal/{entry_id}")
+async def api_update_journal_entry(entry_id: int, payload: dict = Body(...)):
+    """Save the user's own note. Deliberately the only user-writable field."""
+    if "personal_note" not in payload:
+        raise HTTPException(status_code=422, detail="ניתן לעדכן רק את חוות הדעת האישית")
+    note = payload["personal_note"]
+    note = str(note).strip() if note is not None else None
+    updated = closed_position_store.update_fields(entry_id, personal_note=note or None)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="הרשומה לא נמצאה")
+    return JSONResponse(updated.as_dict())
 
 
 @router.post("/api/analyze/{ticker}")
@@ -184,10 +342,53 @@ async def api_portfolio():
     Runs in a worker thread: it performs blocking yfinance calls per holding.
     """
     try:
+        get_data_feed()   # attaches the feed that supplies pre/post-market data
         return JSONResponse(await run_in_threadpool(_risk_analyzer.full_report))
     except Exception as exc:
         logger.error("Portfolio report failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="שגיאה בשליפת נתוני התיק") from exc
+
+
+# ── Watchlist ─────────────────────────────────────────────────────────────────
+
+@router.get("/api/watchlist")
+async def api_watchlist():
+    return JSONResponse({"symbols": watchlist_store.all()})
+
+
+@router.post("/api/watchlist")
+async def api_add_watchlist(payload: dict = Body(...)):
+    try:
+        symbol = watchlist_store.add(payload.get("symbol", ""))
+    except HoldingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse({"symbols": watchlist_store.all(), "added": symbol}, status_code=201)
+
+
+@router.delete("/api/watchlist/{symbol}")
+async def api_remove_watchlist(symbol: str):
+    if not watchlist_store.remove(symbol):
+        raise HTTPException(status_code=404, detail="הסמל לא נמצא ברשימת המעקב")
+    return JSONResponse({"symbols": watchlist_store.all()})
+
+
+# ── Breaking news ─────────────────────────────────────────────────────────────
+
+@router.get("/api/news")
+async def api_news(max_age_minutes: int = 60):
+    """Recent headlines for held tickers, from the pre-market scan cache.
+
+    ``max_age_minutes=0`` forces a fresh scan — that is the "סריקה מחדש"
+    button. The default serves the cache so opening the tab is instant.
+    """
+    monitor = get_news_monitor()
+    try:
+        return JSONResponse(
+            await run_in_threadpool(monitor.snapshot, max(max_age_minutes, 0))
+        )
+    except Exception as exc:
+        logger.error("News snapshot failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="שגיאה בשליפת החדשות") from exc
 
 
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
@@ -223,12 +424,26 @@ _HTML = """<!DOCTYPE html>
   }
   #server-time { margin-left: auto; color: var(--muted); font-size: 0.8rem; }
   #refresh-indicator { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
-  main { padding: 24px; display: grid; gap: 24px; max-width: 1200px; margin: 0 auto; }
+  /* 1320, not 1200: the portfolio table carries eleven columns plus the row
+     actions and needed the extra width to fit without a horizontal scroll. */
+  main { padding: 24px; display: grid; gap: 24px; max-width: 1320px; margin: 0 auto; }
 
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .card-title { padding: 14px 18px; font-size: 0.85rem; font-weight: 600;
     color: var(--muted); border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .05em; }
 
+  /* The card clips overflow, so a wide table has to scroll inside its own
+     wrapper — otherwise the last columns (the row actions) are cut off on a
+     narrow window or a phone. */
+  #stocks-wrap, #alerts-wrap, #holdings-wrap, #atr-wrap, #sector-wrap { overflow-x: auto; }
+  /* max-content, not 100%: the row-action buttons cannot wrap, so a table
+     pinned to the container width has them clipped instead of scrolled. */
+  #holdings-wrap table { width: max-content; min-width: 100%; }
+  #holdings-wrap td, #holdings-wrap th { padding-left: 12px; padding-right: 12px; }
+  /* Icons rather than labels: with eleven columns the words pushed the actions
+     off-screen. Each button carries a title, so hovering still explains it. */
+  .row-actions { white-space: nowrap; }
+  .row-actions .btn { padding: 5px 8px; margin-left: 2px; font-size: 0.9rem; }
   table { width: 100%; border-collapse: collapse; }
   th { padding: 10px 18px; text-align: left; font-size: 0.75rem; color: var(--muted);
     font-weight: 500; border-bottom: 1px solid var(--border); }
@@ -333,6 +548,81 @@ _HTML = """<!DOCTYPE html>
     direction: rtl; text-align: right;
   }
   #build-label { color: var(--muted); font-size: 0.72rem; }
+
+  /* ── Watchlist chips ──────────────────────────────────── */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 18px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 20px; background: #1f6feb22; border: 1px solid #1f6feb55;
+    color: var(--blue); font-size: 0.82rem; font-weight: 600;
+  }
+  .chip button {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 0.95rem; line-height: 1; padding: 0; font-family: inherit;
+  }
+  .chip button:hover { color: var(--red); }
+  .inline-form { display: flex; gap: 8px; padding: 0 18px 14px; flex-wrap: wrap; }
+  .inline-form input {
+    padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 0.85rem;
+    font-family: inherit; width: 150px;
+  }
+
+  /* ── Trade journal ────────────────────────────────────── */
+  .summary { display: flex; flex-wrap: wrap; gap: 26px; padding: 16px 18px; }
+  .summary div { font-size: 0.82rem; color: var(--muted); }
+  .summary b { display: block; font-size: 1.25rem; color: var(--text);
+    font-variant-numeric: tabular-nums; margin-top: 3px; }
+  .journal { display: grid; gap: 16px; }
+  .entry { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+  .entry-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+  }
+  .entry-head .grow { flex: 1; }
+  .light {
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+    border: 1px solid #0006; flex-shrink: 0;
+  }
+  .light-green  { background: var(--green); box-shadow: 0 0 8px #3fb95088; }
+  .light-orange { background: var(--yellow); box-shadow: 0 0 8px #d2992288; }
+  .light-red    { background: var(--red);   box-shadow: 0 0 8px #f8514988; }
+  .light-none   { background: var(--border); }
+  .badge {
+    padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 600;
+    background: #d2992222; color: var(--yellow);
+  }
+  .entry-stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 12px; padding: 14px 18px; border-bottom: 1px solid #21262d;
+  }
+  .entry-stats span { font-size: 0.75rem; color: var(--muted); display: block; }
+  .entry-stats b { font-size: 0.95rem; font-variant-numeric: tabular-nums; }
+  .entry-section { padding: 14px 18px; border-bottom: 1px solid #21262d; }
+  .entry-section:last-child { border-bottom: none; }
+  .entry-section h4 {
+    font-size: 0.75rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .05em; margin-bottom: 8px; font-weight: 600;
+  }
+  .entry-section .body {
+    white-space: pre-wrap; line-height: 1.7; font-size: 0.88rem;
+    direction: rtl; text-align: right;
+  }
+  textarea.note {
+    width: 100%; min-height: 70px; padding: 9px 11px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.88rem; font-family: inherit; direction: rtl; resize: vertical;
+  }
+  .save-hint { font-size: 0.75rem; color: var(--green); margin-right: 8px; }
+
+  /* ── News ─────────────────────────────────────────────── */
+  .news-item { padding: 13px 18px; border-bottom: 1px solid #21262d; }
+  .news-item:last-child { border-bottom: none; }
+  .news-item a { color: var(--text); text-decoration: none; font-size: 0.9rem; }
+  .news-item a:hover { color: var(--blue); text-decoration: underline; }
+  .news-meta { color: var(--muted); font-size: 0.76rem; margin-top: 4px; }
+  .news-fresh { color: var(--yellow); font-weight: 600; }
+  .ext-price { font-size: 0.78rem; }
 </style>
 </head>
 <body>
@@ -350,12 +640,24 @@ _HTML = """<!DOCTYPE html>
   <div class="tabs">
     <button class="tab active" data-panel="live">מעקב חי</button>
     <button class="tab" data-panel="portfolio">התיק שלי</button>
+    <button class="tab" data-panel="journal">יומן מסחר</button>
+    <button class="tab" data-panel="news">חדשות מתפרצות</button>
     <button class="tab" data-panel="atr">חשיפת תנודתיות (ATR)</button>
     <button class="tab" data-panel="sector">פיזור סקטוריאלי</button>
   </div>
 
   <!-- ═══ Live monitoring (original view) ═══ -->
   <div id="panel-live" class="panel active">
+    <div class="card">
+      <div class="card-title">מניות במעקב</div>
+      <div id="watchlist-chips" class="chips"><span class="volume">טוען…</span></div>
+      <div class="inline-form">
+        <input id="w-symbol" placeholder="טיקר חדש" maxlength="16" autocomplete="off">
+        <button class="btn primary" onclick="addWatch()">+ הוספה למעקב</button>
+        <span id="w-error" class="down" style="font-size:.78rem;align-self:center"></span>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-title">Live Prices</div>
       <div id="stocks-wrap">
@@ -405,6 +707,30 @@ _HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ═══ Trade journal ═══ -->
+  <div id="panel-journal" class="panel">
+    <div class="card">
+      <div class="card-title">סיכום יומן המסחר</div>
+      <div class="summary" id="journal-summary"><div class="volume">טוען…</div></div>
+      <div class="card-actions" style="border-top:1px solid var(--border);border-bottom:none">
+        <button class="btn" onclick="loadJournal()">רענון</button>
+      </div>
+    </div>
+    <div id="journal-wrap" class="journal"></div>
+  </div>
+
+  <!-- ═══ Breaking news ═══ -->
+  <div id="panel-news" class="panel">
+    <div class="card">
+      <div class="card-title">חדשות על מניות בתיק</div>
+      <div class="card-actions">
+        <button class="btn" onclick="loadNews(true)">סריקה מחדש</button>
+        <span id="news-scanned" class="volume" style="margin-right:12px"></span>
+      </div>
+      <div id="news-wrap"><div class="empty">טוען…</div></div>
+    </div>
+  </div>
+
   <!-- ═══ ATR volatility ═══ -->
   <div id="panel-atr" class="panel">
     <div id="atr-banner" class="banner ok">טוען…</div>
@@ -434,6 +760,8 @@ _HTML = """<!DOCTYPE html>
     <input id="f-qty" type="number" min="0.0001" step="any" placeholder="לדוגמה: 10">
     <label for="f-price">מחיר כניסה (למניה)</label>
     <input id="f-price" type="number" min="0.0001" step="any" placeholder="לדוגמה: 187.50">
+    <label for="f-date">תאריך קנייה <span class="muted-hint">(אופציונלי — מחשב זמן החזקה)</span></label>
+    <input id="f-date" type="date">
     <label for="f-sector">סקטור <span class="muted-hint">(אופציונלי — ממלא אוטומטית אם ריק)</span></label>
     <input id="f-sector" list="sector-options" maxlength="64" placeholder="לדוגמה: Technology" autocomplete="off">
     <datalist id="sector-options">
@@ -452,6 +780,29 @@ _HTML = """<!DOCTYPE html>
     <div class="modal-actions">
       <button class="btn primary" onclick="saveHolding()">שמירה</button>
       <button class="btn" onclick="closeModal()">ביטול</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Sell modal ═══ -->
+<div class="modal-overlay" id="sell-modal">
+  <div class="modal">
+    <h3 id="sell-title">מכירת פוזיציה</h3>
+    <label>כמות למכירה <span class="muted-hint" id="sell-held"></span></label>
+    <input id="s-qty" type="number" min="0.0001" step="any">
+    <div style="margin-top:6px">
+      <button class="btn" onclick="fillSell(1)">הכל</button>
+      <button class="btn" onclick="fillSell(0.5)">50%</button>
+      <button class="btn" onclick="fillSell(0.25)">25%</button>
+    </div>
+    <label for="s-price">מחיר מכירה (למניה)</label>
+    <input id="s-price" type="number" min="0.0001" step="any">
+    <label for="s-date">תאריך המכירה</label>
+    <input id="s-date" type="date">
+    <div class="form-error" id="s-error"></div>
+    <div class="modal-actions">
+      <button class="btn primary" onclick="confirmSell()">רישום מכירה</button>
+      <button class="btn" onclick="closeSell()">ביטול</button>
     </div>
   </div>
 </div>
@@ -558,8 +909,16 @@ let sectorChart = null, indexChart = null, currentPositions = [];
 
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* Losses read as -$134.00, never $-134.00. */
 const money = (n) => n == null ? '—' :
-  '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  (n < 0 ? '-$' : '$') +
+  Math.abs(Number(n)).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+/* The page is laid out LTR, so a Hebrew word after a number comes out reversed
+   unless the run is explicitly marked. */
+const days = (n) => n == null ? '—'
+  : n === 0 ? 'היום'
+  : `<bdi dir="rtl">${n} ימים</bdi>`;
 
 async function api(path, options = {}) {
   const res = await fetch(path, {headers: {'Content-Type': 'application/json'}, ...options});
@@ -572,17 +931,25 @@ async function api(path, options = {}) {
 }
 
 /* ── Tabs ── */
+let newsLoaded = false;
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach((t) =>
+    t.classList.toggle('active', t.dataset.panel === name));
+  document.querySelectorAll('.panel').forEach((p) =>
+    p.classList.toggle('active', p.id === 'panel-' + name));
+
+  // Charts need a visible canvas to size correctly.
+  if (name === 'portfolio' && sectorChart) {
+    sectorChart.resize(); indexChart && indexChart.resize();
+  }
+  // The news scan hits yfinance once per holding, so it waits until the tab is
+  // actually opened instead of slowing down every page load.
+  if (name === 'news' && !newsLoaded) { newsLoaded = true; loadNews(false); }
+}
+
 document.querySelectorAll('.tab').forEach((tab) => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
-    document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
-    tab.classList.add('active');
-    document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
-    // Charts need a visible canvas to size correctly.
-    if (tab.dataset.panel === 'portfolio' && sectorChart) {
-      sectorChart.resize(); indexChart && indexChart.resize();
-    }
-  });
+  tab.addEventListener('click', () => showTab(tab.dataset.panel));
 });
 
 /* ── Modal (add + edit share one form) ── */
@@ -595,6 +962,7 @@ function openModal(existing) {
     tickerEl.disabled = true;
     document.getElementById('f-qty').value = existing.quantity;
     document.getElementById('f-price').value = existing.entry_price;
+    document.getElementById('f-date').value = existing.purchase_date || '';
     // Only a manually set sector is pre-filled; an auto-detected one stays
     // blank so saving does not silently freeze today's yfinance answer.
     document.getElementById('f-sector').value = existing.sector_is_manual ? existing.sector : '';
@@ -604,6 +972,7 @@ function openModal(existing) {
     tickerEl.value = ''; tickerEl.disabled = false;
     document.getElementById('f-qty').value = '';
     document.getElementById('f-price').value = '';
+    document.getElementById('f-date').value = '';
     document.getElementById('f-sector').value = '';
     document.getElementById('f-asset-type').value = '';
   }
@@ -620,6 +989,7 @@ async function saveHolding() {
   const ticker = document.getElementById('f-ticker').value.trim().toUpperCase();
   const quantity = parseFloat(document.getElementById('f-qty').value);
   const entry_price = parseFloat(document.getElementById('f-price').value);
+  const purchase_date = document.getElementById('f-date').value || null;
   const sector = document.getElementById('f-sector').value.trim() || null;
   const asset_type = document.getElementById('f-asset-type').value || null;
   const errEl = document.getElementById('f-error');
@@ -630,7 +1000,7 @@ async function saveHolding() {
   try {
     await api('/api/holdings', {
       method: 'POST',
-      body: JSON.stringify({ticker, quantity, entry_price, sector, asset_type}),
+      body: JSON.stringify({ticker, quantity, entry_price, purchase_date, sector, asset_type}),
     });
     closeModal();
     loadPortfolio();
@@ -661,33 +1031,59 @@ function renderHoldings(data) {
   wrap.innerHTML = `<table>
     <thead><tr>
       <th>סמל</th><th>כמות</th><th>מחיר כניסה</th><th>מחיר נוכחי</th>
-      <th>שווי</th><th>רווח/הפסד</th><th>ATR%</th><th>סקטור</th><th></th>
+      <th>פרי / פוסט</th><th>שווי</th><th>רווח/הפסד</th><th>ימי החזקה</th>
+      <th>ATR%</th><th>סקטור</th><th></th>
     </tr></thead>
     <tbody>${data.positions.map((p) => `<tr>
       <td><span class="symbol">${esc(p.ticker)}</span></td>
       <td>${p.quantity}</td>
       <td><span class="price">${money(p.entry_price)}</span></td>
       <td><span class="price">${money(p.current_price)}</span></td>
+      <td>${extendedCell(p)}</td>
       <td>${money(p.market_value)}</td>
       <td>${pctCell(p.pnl_pct)} <span class="volume">(${money(p.pnl_value)})</span></td>
+      <td><span class="volume">${days(p.holding_days)}</span></td>
       <td><span class="volume">${p.atr_pct == null ? '—' : p.atr_pct.toFixed(2) + '%'}</span></td>
       <td>
         <span class="sector-cell ${p.sector === 'Unknown' ? 'unknown' : ''}"
               onclick="editHolding('${esc(p.ticker)}')"
               title="לחץ לעריכת הסקטור">${esc(p.sector)}${p.sector_is_manual ? ' ✎' : ''}</span>
       </td>
-      <td style="white-space:nowrap">
+      <td class="row-actions">
         <button class="btn" onclick="analyzeTicker('${esc(p.ticker)}')" title="ניתוח AI של המניה">🧠</button>
-        <button class="btn" onclick="editHolding('${esc(p.ticker)}')">עריכה</button>
-        <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')">מחיקה</button>
+        <button class="btn" onclick="openSell('${esc(p.ticker)}')" title="רישום מכירה">💵</button>
+        <button class="btn" onclick="editHolding('${esc(p.ticker)}')" title="עריכת הפוזיציה">✏️</button>
+        <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')" title="מחיקת הפוזיציה">🗑️</button>
       </td></tr>`).join('')}</tbody>
   </table>`;
 }
+
+/* Pre/post-market price. Outside those sessions the regular price already on
+   the row is the whole story, so the cell stays empty rather than repeating it. */
+function extendedCell(p) {
+  if (p.session !== 'pre' && p.session !== 'after') return '<span class="flat">—</span>';
+  const label = p.session === 'pre' ? 'Pre' : 'After';
+  const price = p.extended_price == null ? '' : ' ' + money(p.extended_price);
+  return `<span class="session-tag session-${p.session}">${label}</span>` +
+         `<span class="ext-price">${price} ${pctCell(p.extended_change_pct)}</span>`;
+}
+
 
 function renderPie(canvasId, existing, entries, colors) {
   const ctx = document.getElementById(canvasId);
   if (existing) existing.destroy();
   if (!entries.length) return null;
+  // Chart.js comes from a CDN. If it is blocked the tables must still render,
+  // so a missing library degrades to "no chart" instead of throwing.
+  if (typeof Chart === 'undefined') {
+    ctx.style.display = 'none';
+    const fallbackId = canvasId + '-fallback';
+    if (!document.getElementById(fallbackId)) {
+      ctx.insertAdjacentHTML('afterend',
+        `<div id="${fallbackId}" class="empty">הגרפים לא נטענו (Chart.js לא זמין)</div>`);
+    }
+    return null;
+  }
   return new Chart(ctx, {
     type: 'doughnut',
     data: {
@@ -771,17 +1167,21 @@ function renderRisk(data) {
 }
 
 async function loadPortfolio() {
+  let data;
+  // Only the fetch is guarded. Folding the rendering into the same try meant a
+  // chart failure reported itself as a data error and wiped the position table.
   try {
-    const data = await api('/api/portfolio');
-    currentPositions = data.positions;
-    renderHoldings(data);
-    renderRisk(data);
-    sectorChart = renderPie('sectorChart', sectorChart, data.allocation.by_sector);
-    renderAssetSplit(data.allocation.by_asset_type, data.allocation.by_index);
+    data = await api('/api/portfolio');
   } catch (e) {
     document.getElementById('holdings-wrap').innerHTML =
       `<div class="empty" style="color:var(--red)">שגיאה: ${esc(e.message)}</div>`;
+    return;
   }
+  currentPositions = data.positions;
+  renderHoldings(data);
+  renderRisk(data);
+  sectorChart = renderPie('sectorChart', sectorChart, data.allocation.by_sector);
+  renderAssetSplit(data.allocation.by_asset_type, data.allocation.by_index);
 }
 
 /* ── AI analysis: one stock, or the whole portfolio ── */
@@ -810,6 +1210,248 @@ function analyzeTicker(ticker) {
                      `מנתח את ${ticker}… (עשוי לקחת עד דקה)`);
 }
 
+/* ═══════════════════ Selling a position ═══════════════════ */
+
+let sellTarget = null;
+
+function openSell(ticker) {
+  const position = currentPositions.find((p) => p.ticker === ticker);
+  if (!position) return;
+  sellTarget = position;
+  document.getElementById('sell-title').textContent = 'מכירת פוזיציה — ' + ticker;
+  document.getElementById('sell-held').textContent = `(מוחזק: ${position.quantity})`;
+  document.getElementById('s-qty').value = position.quantity;
+  // Defaulting to the live price makes the common case — "I just sold at
+  // market" — a two-click operation, and it is still editable.
+  document.getElementById('s-price').value = position.current_price ?? '';
+  document.getElementById('s-date').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('s-error').textContent = '';
+  document.getElementById('sell-modal').classList.add('open');
+}
+
+function closeSell() { document.getElementById('sell-modal').classList.remove('open'); }
+
+function fillSell(fraction) {
+  if (!sellTarget) return;
+  const qty = sellTarget.quantity * fraction;
+  // Trim floating-point noise from e.g. 0.1 * 3 without truncating real
+  // fractional-share quantities.
+  document.getElementById('s-qty').value = parseFloat(qty.toFixed(6));
+}
+
+async function confirmSell() {
+  if (!sellTarget) return;
+  const quantity = parseFloat(document.getElementById('s-qty').value);
+  const exit_price = parseFloat(document.getElementById('s-price').value);
+  const sold_date = document.getElementById('s-date').value || null;
+  const errEl = document.getElementById('s-error');
+  errEl.textContent = '';
+  if (!Number.isFinite(quantity) || quantity <= 0) { errEl.textContent = 'כמות חייבת להיות מספר חיובי'; return; }
+  if (quantity > sellTarget.quantity + 1e-9) { errEl.textContent = 'לא ניתן למכור יותר מהכמות המוחזקת'; return; }
+  if (!Number.isFinite(exit_price) || exit_price <= 0) { errEl.textContent = 'מחיר מכירה חייב להיות מספר חיובי'; return; }
+  try {
+    await api('/api/holdings/' + encodeURIComponent(sellTarget.ticker) + '/sell', {
+      method: 'POST',
+      body: JSON.stringify({quantity, exit_price, sold_date}),
+    });
+    closeSell();
+    loadPortfolio();
+    loadJournal();
+    showTab('journal');
+  } catch (e) { errEl.textContent = e.message; }
+}
+
+/* ═══════════════════ Trade journal ═══════════════════ */
+
+const RATING_LABEL = {green: 'החלטה טובה', orange: 'בינונית', red: 'טעונה שיפור'};
+
+function renderJournal(data) {
+  const s = data.summary;
+  const pnlCls = s.total_pnl >= 0 ? 'up' : 'down';
+  document.getElementById('journal-summary').innerHTML =
+    `<div>עסקאות סגורות<b>${s.count}</b></div>` +
+    `<div>רווח/הפסד מצטבר<b class="${pnlCls}">${money(s.total_pnl)}</b></div>` +
+    `<div>אחוז עסקאות רווחיות<b>${s.win_rate_pct.toFixed(1)}%</b></div>` +
+    `<div>זמן החזקה ממוצע<b>${days(s.avg_holding_days)}</b></div>`;
+
+  const wrap = document.getElementById('journal-wrap');
+  if (!data.entries.length) {
+    wrap.innerHTML = '<div class="card"><div class="empty">' +
+      'עדיין לא נרשמו מכירות — לחצו "מכירה" על פוזיציה בתיק כדי לפתוח את היומן</div></div>';
+    return;
+  }
+  wrap.innerHTML = data.entries.map(renderEntry).join('');
+}
+
+function renderEntry(e) {
+  const pnlCls = e.pnl_pct >= 0 ? 'up' : 'down';
+  const lightCls = e.rating ? 'light-' + e.rating : 'light-none';
+  const lightText = e.rating ? RATING_LABEL[e.rating] : 'טרם נותח';
+  const partial = e.is_partial
+    ? `<span class="badge" dir="rtl">מכירה חלקית · ${(e.fraction_sold * 100).toFixed(0)}%</span>` : '';
+
+  const analysis = e.ai_analysis
+    ? `<div class="body">${esc(e.ai_analysis)}</div>`
+    : `<div class="volume" dir="rtl">טרם נותח. הניתוח נשמר במסד הנתונים ומורץ פעם אחת בלבד.</div>`;
+
+  return `<div class="entry">
+    <div class="entry-head">
+      <span class="light ${lightCls}" title="${lightText}"></span>
+      <span class="symbol">${esc(e.ticker)}</span>
+      ${partial}
+      <span class="grow volume" dir="rtl">נמכר ב-${esc(e.sold_date)}</span>
+      <button class="btn" onclick="analyzeEntry(${e.id})">
+        ${e.ai_analysis ? '🧠 ניתוח מחדש' : '🧠 נתח עסקה'}
+      </button>
+    </div>
+
+    <div class="entry-stats">
+      <div><span>כמות</span><b>${e.quantity}</b></div>
+      <div><span>כניסה → יציאה</span><b>${money(e.entry_price)} → ${money(e.exit_price)}</b></div>
+      <div><span>תשואה</span><b class="${pnlCls}">${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%</b></div>
+      <div><span>רווח/הפסד</span><b class="${pnlCls}">${money(e.pnl_value)}</b></div>
+      <div><span>זמן החזקה</span><b>${days(e.holding_days)}</b></div>
+      <div><span>ATR בעת המכירה</span><b>${e.atr_pct_at_close == null ? '—' : e.atr_pct_at_close.toFixed(2) + '%'}</b></div>
+      <div><span>סקטור</span><b>${esc(e.sector || '—')}</b></div>
+    </div>
+
+    <div class="entry-section">
+      <h4><span class="light ${lightCls}"></span> דירוג העסקה — ${lightText}</h4>
+      <div id="entry-analysis-${e.id}">${analysis}</div>
+    </div>
+
+    <div class="entry-section">
+      <h4>חוות דעת אישית</h4>
+      <textarea class="note" id="note-${e.id}"
+        placeholder="מה למדתי מהעסקה הזו?">${esc(e.personal_note || '')}</textarea>
+      <div style="margin-top:8px">
+        <button class="btn primary" onclick="saveNote(${e.id})">שמירה</button>
+        <span class="save-hint" id="note-hint-${e.id}"></span>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function loadJournal() {
+  try {
+    renderJournal(await api('/api/journal'));
+  } catch (e) {
+    document.getElementById('journal-wrap').innerHTML =
+      `<div class="card"><div class="empty" style="color:var(--red)">שגיאה: ${esc(e.message)}</div></div>`;
+  }
+}
+
+async function analyzeEntry(id) {
+  const box = document.getElementById('entry-analysis-' + id);
+  box.innerHTML = '<div class="volume">מנתח את העסקה… (עשוי לקחת עד דקה)</div>';
+  try {
+    await api('/api/journal/' + id + '/analyze', {method: 'POST'});
+    // Reload rather than patching in place: the rating light, the header
+    // button and the analysis text all change together.
+    loadJournal();
+  } catch (e) {
+    box.innerHTML = `<div class="down">שגיאה: ${esc(e.message)}</div>`;
+  }
+}
+
+async function saveNote(id) {
+  const hint = document.getElementById('note-hint-' + id);
+  hint.style.color = ''; hint.textContent = 'שומר…';
+  try {
+    await api('/api/journal/' + id, {
+      method: 'PATCH',
+      body: JSON.stringify({personal_note: document.getElementById('note-' + id).value}),
+    });
+    hint.textContent = '✓ נשמר';
+    setTimeout(() => { hint.textContent = ''; }, 2500);
+  } catch (e) {
+    hint.style.color = 'var(--red)';
+    hint.textContent = 'שגיאה: ' + e.message;
+  }
+}
+
+/* ═══════════════════ Breaking news ═══════════════════ */
+
+function renderNews(data) {
+  document.getElementById('news-scanned').textContent = data.scanned_at
+    ? 'סריקה אחרונה: ' + new Date(data.scanned_at).toLocaleString('he-IL')
+    : '';
+  const wrap = document.getElementById('news-wrap');
+  if (!data.items.length) {
+    wrap.innerHTML = `<div class="empty">אין חדשות מה-${data.fresh_window_hours} שעות האחרונות ` +
+                     `על המניות בתיק</div>`;
+    return;
+  }
+  wrap.innerHTML = data.items.map((n) => {
+    const age = n.age_hours == null ? ''
+      : n.age_hours < 3
+        ? `<bdi class="news-fresh" dir="rtl">לפני ${n.age_hours.toFixed(1)} שעות</bdi>`
+        : `<bdi dir="rtl">לפני ${n.age_hours.toFixed(1)} שעות</bdi>`;
+    const title = n.link
+      ? `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>`
+      : esc(n.title);
+    return `<div class="news-item">
+      <span class="symbol">${esc(n.ticker)}</span> ${title}
+      <div class="news-meta">${esc(n.publisher || '')} ${age ? '· ' + age : ''}</div>
+    </div>`;
+  }).join('');
+}
+
+async function loadNews(force) {
+  if (force) document.getElementById('news-wrap').innerHTML = '<div class="empty">סורק…</div>';
+  try {
+    renderNews(await api('/api/news' + (force ? '?max_age_minutes=0' : '')));
+  } catch (e) {
+    document.getElementById('news-wrap').innerHTML =
+      `<div class="empty" style="color:var(--red)">שגיאה: ${esc(e.message)}</div>`;
+  }
+}
+
+/* ═══════════════════ Watchlist ═══════════════════ */
+
+function renderWatchlist(symbols) {
+  const wrap = document.getElementById('watchlist-chips');
+  wrap.innerHTML = symbols.length
+    ? symbols.map((s) => `<span class="chip">${esc(s)}` +
+        `<button onclick="removeWatch('${esc(s)}')" title="הסרה ממעקב">×</button></span>`).join('')
+    : '<span class="volume">אין מניות במעקב — הוסיפו טיקר למטה</span>';
+}
+
+async function loadWatchlist() {
+  try {
+    renderWatchlist((await api('/api/watchlist')).symbols);
+  } catch (e) {
+    document.getElementById('watchlist-chips').innerHTML =
+      `<span class="down">שגיאה: ${esc(e.message)}</span>`;
+  }
+}
+
+async function addWatch() {
+  const input = document.getElementById('w-symbol');
+  const errEl = document.getElementById('w-error');
+  errEl.textContent = '';
+  const symbol = input.value.trim().toUpperCase();
+  if (!symbol) { errEl.textContent = 'יש להזין טיקר'; return; }
+  try {
+    renderWatchlist((await api('/api/watchlist', {
+      method: 'POST', body: JSON.stringify({symbol}),
+    })).symbols);
+    input.value = '';
+  } catch (e) { errEl.textContent = e.message; }
+}
+
+async function removeWatch(symbol) {
+  if (!confirm('להסיר את ' + symbol + ' מהמעקב?')) return;
+  try {
+    renderWatchlist((await api('/api/watchlist/' + encodeURIComponent(symbol),
+                               {method: 'DELETE'})).symbols);
+  } catch (e) { document.getElementById('w-error').textContent = e.message; }
+}
+
+document.getElementById('w-symbol').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') addWatch();
+});
+
 /* ── Build label: makes a stale deploy obvious instead of invisible ── */
 async function loadBuild() {
   try {
@@ -821,10 +1463,15 @@ async function loadBuild() {
 document.getElementById('modal').addEventListener('click', (e) => {
   if (e.target.id === 'modal') closeModal();
 });
+document.getElementById('sell-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'sell-modal') closeSell();
+});
 
 refresh();
 loadBuild();
 loadPortfolio();
+loadWatchlist();
+loadJournal();
 setInterval(refresh, INTERVAL);
 setInterval(loadPortfolio, 120000);   // portfolio prices refresh every 2 min
 tickProgress();

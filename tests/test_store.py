@@ -123,6 +123,41 @@ def test_bad_database_url_degrades_instead_of_crashing(bad_url):
     assert db.is_enabled() is False
 
 
+def test_a_failed_column_addition_does_not_abort_startup(monkeypatch):
+    """Losing one ALTER must not cost persistence for every other table.
+
+    A database user without ALTER on 'holdings' used to take down the whole
+    connection, silently dropping alerts and the journal into memory too.
+    """
+    from sqlalchemy.exc import ProgrammingError
+
+    from stock_monitor import db
+
+    class FakeInspector:
+        @staticmethod
+        def get_table_names():
+            return ["holdings"]
+
+        @staticmethod
+        def get_columns(table):
+            return [{"name": "ticker"}]      # every new column is missing
+
+    class DenyingEngine:
+        attempts = 0
+
+        def begin(self):
+            DenyingEngine.attempts += 1
+            raise ProgrammingError("ALTER TABLE holdings", {}, Exception("not owner"))
+
+    monkeypatch.setattr(db, "inspect", lambda engine: FakeInspector())
+    monkeypatch.setattr(db, "_engine", DenyingEngine())
+
+    db._add_missing_columns()   # logs and moves on rather than raising
+
+    # Each column is attempted independently: one refusal must not skip the rest.
+    assert DenyingEngine.attempts == 3
+
+
 # ── Manual sector / asset-type overrides ──────────────────────────────────────
 
 def test_sector_override_is_stored():

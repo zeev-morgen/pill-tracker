@@ -59,6 +59,24 @@ class StockConfig:
     alerts: List[AlertConfig] = field(default_factory=list)
 
 
+def default_alerts() -> List[AlertConfig]:
+    """Alert rules for a symbol added at runtime from the dashboard.
+
+    Symbols typed into the watchlist have no entry in config.yaml, so without
+    these they would be polled and charted but could never fire an alert. The
+    numbers match the middle of the range used by the configured stocks.
+    """
+    return [
+        AlertConfig(
+            type="price_change_pct",
+            threshold_pct=3.0,
+            window_minutes=10,
+            cooldown_minutes=30,
+        ),
+        AlertConfig(type="volume_spike", multiplier=2.5, cooldown_minutes=60),
+    ]
+
+
 @dataclass
 class TelegramConfig:
     enabled: bool = False

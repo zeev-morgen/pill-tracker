@@ -133,6 +133,9 @@ def ai_client(client):
         yield client
     finally:
         dashboard.set_analyst(None)
+        # The feed is also handed to the risk analyzer, so leaving the stub in
+        # place would follow other tests around.
+        dashboard.set_data_feed(None)
 
 
 def test_single_stock_analysis_returns_text(ai_client):

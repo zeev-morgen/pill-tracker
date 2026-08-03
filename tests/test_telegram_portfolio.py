@@ -50,7 +50,10 @@ def make_bot(recorder, analyst=None, report=REPORT):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run rather than get_event_loop(): the latter raises once any
+    # earlier test has closed the loop, which made these tests pass alone and
+    # fail in a full run.
+    return asyncio.run(coro)
 
 
 # ── Status message ────────────────────────────────────────────────────────────

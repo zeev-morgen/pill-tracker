@@ -1,6 +1,7 @@
 """AI stock analysis via Claude API (claude-opus-4-7), with Hebrew output."""
 
 import logging
+import math
 from typing import Optional
 
 import anthropic
@@ -8,9 +9,36 @@ import httpx
 import urllib3
 import yfinance as yf
 
+from . import reference_data
 from .data_feed import MIN_SESSION_FRACTION, session_elapsed_fraction
 
 logger = logging.getLogger(__name__)
+
+
+def _fast_get(fast_info, *names):
+    """Read a fast_info field; its key naming has changed across versions.
+
+    NaN counts as missing. yfinance hands back float('nan') for fields it could
+    not resolve, and NaN is truthy — left alone it reaches the prompt as a
+    literal "nan", which is worse than saying the figure is unavailable.
+    """
+    for name in names:
+        try:
+            value = getattr(fast_info, name, None)
+            if value is None and hasattr(fast_info, "get"):
+                value = fast_info.get(name)
+            if value is not None and math.isfinite(float(value)):
+                return float(value)
+        except Exception:
+            continue
+    return None
+
+
+def _finite_or_none(value):
+    """Drop NaN / infinity so the prompt says 'אין נתון' instead of 'nan'."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value if math.isfinite(value) else None
+    return value
 
 _SYSTEM_PROMPT = (
     "אתה אנליסט מניות מקצועי שעונה אך ורק בעברית.\n"
@@ -45,6 +73,26 @@ _PORTFOLIO_SYSTEM_PROMPT = (
     "אל תמציא מידע. אם חסר נתון — כתוב 'אין נתון'.\n"
     "מגבלת אורך: עד 450 מילים. זו תמיכה בקבלת החלטות, לא ייעוץ השקעות — "
     "ציין זאת במשפט אחד בסוף."
+)
+
+
+_CLOSED_POSITION_SYSTEM_PROMPT = (
+    "אתה מאמן מסחר שמנתח עסקאות שנסגרו, ועונה אך ורק בעברית.\n"
+    "המטרה: ללמוד מהעסקה, לא לחגוג אותה או לבקר אותה.\n\n"
+    "החזר JSON תקין בלבד, ללא טקסט לפני או אחרי, במבנה:\n"
+    '{\n'
+    '  \"rating\": \"green\" | \"orange\" | \"red\",\n'
+    '  \"explanation\": \"הסבר בעברית, 3-5 משפטים\"\n'
+    '}\n\n'
+    "קריטריון הדירוג — *איכות ההחלטה*, לא גודל הרווח:\n"
+    "• green  — עסקה מנוהלת היטב: יחס סיכון/תשואה סביר, זמן החזקה שתואם\n"
+    "           את התזה, יציאה מסודרת. גם הפסד קטן ומבוקר יכול להיות ירוק.\n"
+    "• orange — תוצאה סבירה עם ליקוי בניהול: יציאה מוקדמת או מאוחרת מדי,\n"
+    "           גודל פוזיציה לא פרופורציונלי, או החזקה ממושכת ללא תזה.\n"
+    "• red    — ניהול לקוי: הפסד גדול שנתנו לו להתפתח, החזקה ארוכה בהפסד,\n"
+    "           או סיכון שלא תאם את התנודתיות של המניה.\n\n"
+    "בהסבר: ציין מה נעשה נכון, מה ניתן לשפר, ולקח אחד קונקרטי להמשך.\n"
+    "אל תמציא נתונים שלא סופקו."
 )
 
 
@@ -204,29 +252,136 @@ class StockAnalyst:
 
         return "\n".join(parts)
 
+    # ── Closed-position review (trade journal) ────────────────────────────────
+
+    def review_closed_position(self, closed: dict) -> dict:
+        """Grade a completed trade.
+
+        Returns ``{"rating": "green|orange|red", "explanation": str}``. The
+        model is asked for JSON so the rating can drive the traffic-light in the
+        journal; if it answers with prose anyway we still keep the text and fall
+        back to a neutral rating rather than losing the review.
+        """
+        prompt = self._build_closed_position_prompt(closed)
+        try:
+            try:
+                msg = self._stream_once(self._client, prompt, _CLOSED_POSITION_SYSTEM_PROMPT)
+            except (anthropic.APIConnectionError, httpx.ConnectError) as exc:
+                logger.warning(
+                    "Anthropic API connection error (%s) — retrying with SSL verify=False.",
+                    exc.__class__.__name__,
+                )
+                msg = self._stream_once(
+                    self._get_insecure_client(), prompt, _CLOSED_POSITION_SYSTEM_PROMPT
+                )
+            text = next((b.text for b in msg.content if b.type == "text"), "")
+        except Exception as exc:
+            logger.error("Closed-position review failed: %s", exc, exc_info=True)
+            return {"rating": None, "explanation": f"❌ שגיאה בניתוח העסקה: {exc}"}
+        return _parse_review(text)
+
+    @staticmethod
+    def _build_closed_position_prompt(closed: dict) -> str:
+        parts = [
+            f"נתח את העסקה הסגורה הבאה במניית {closed['ticker']}.",
+            "",
+            f"• כמות שנמכרה: {closed['quantity']:g}"
+            + (" (מכירה חלקית)" if closed.get("is_partial") else " (יציאה מלאה)"),
+            f"• מחיר כניסה: ${closed['entry_price']:.2f}",
+            f"• מחיר יציאה: ${closed['exit_price']:.2f}",
+            f"• תוצאה: {closed['pnl_pct']:+.2f}% "
+            f"({'+' if closed['pnl_value'] >= 0 else '-'}${abs(closed['pnl_value']):,.2f})",
+        ]
+        if closed.get("holding_days") is not None:
+            parts.append(f"• זמן החזקה: {closed['holding_days']} ימים")
+        else:
+            parts.append("• זמן החזקה: אין נתון (לא הוזן מועד רכישה)")
+        if closed.get("atr_pct_at_close") is not None:
+            parts.append(
+                f"• תנודתיות המניה (ATR): {closed['atr_pct_at_close']:.2f}% מהמחיר — "
+                f"השתמש בזה כדי לשפוט אם גודל התנועה חריג או שגרתי"
+            )
+        if closed.get("sector"):
+            parts.append(f"• סקטור: {closed['sector']}")
+        if closed.get("portfolio_weight_pct") is not None:
+            parts.append(
+                f"• משקל הפוזיציה בתיק בעת הפתיחה: כ-{closed['portfolio_weight_pct']:.1f}%"
+            )
+        parts += ["", "החזר JSON בלבד לפי המבנה שהוגדר."]
+        return "\n".join(parts)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _fetch_fundamentals(self, symbol: str) -> dict:
-        try:
-            info = yf.Ticker(symbol).info
-            return {
-                "pe_ratio":            info.get("trailingPE"),
-                "forward_pe":          info.get("forwardPE"),
-                "peg_ratio":           info.get("pegRatio"),
-                "market_cap":          info.get("marketCap"),
-                "revenue_growth":      info.get("revenueGrowth"),
-                "earnings_growth":     info.get("earningsGrowth"),
-                "gross_margins":       info.get("grossMargins"),
-                "profit_margins":      info.get("profitMargins"),
-                "analyst_rating":      info.get("recommendationKey"),
-                "target_price":        info.get("targetMeanPrice"),
-                "fifty_two_high":      info.get("fiftyTwoWeekHigh"),
-                "fifty_two_low":       info.get("fiftyTwoWeekLow"),
-                "sector":              info.get("sector"),
-                "short_name":          info.get("shortName"),
-            }
-        except Exception:
-            return {}
+        """Valuation multiples and company facts.
+
+        yfinance's ``.info`` is the only source for multiples but is unreliable
+        — it regularly returns an empty payload or raises, which used to be
+        swallowed silently and rendered as 'אין נתון' across the whole section
+        with no way to tell a genuinely missing figure from a failed fetch.
+        So: retry once, fall back to ``fast_info`` for the fields it carries,
+        and fall back to the curated table for the sector.
+        """
+        info: dict = {}
+        for attempt in (1, 2):
+            try:
+                info = yf.Ticker(symbol).info or {}
+                if info:
+                    break
+                logger.warning(
+                    "Empty fundamentals for %s (attempt %d/2)", symbol, attempt
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fundamentals fetch failed for %s (attempt %d/2): %s",
+                    symbol, attempt, exc,
+                )
+
+        out = {
+            "pe_ratio":            info.get("trailingPE"),
+            "forward_pe":          info.get("forwardPE"),
+            "peg_ratio":           info.get("pegRatio"),
+            "market_cap":          info.get("marketCap"),
+            "revenue_growth":      info.get("revenueGrowth"),
+            "earnings_growth":     info.get("earningsGrowth"),
+            "gross_margins":       info.get("grossMargins"),
+            "profit_margins":      info.get("profitMargins"),
+            "analyst_rating":      info.get("recommendationKey"),
+            "target_price":        info.get("targetMeanPrice"),
+            "fifty_two_high":      info.get("fiftyTwoWeekHigh"),
+            "fifty_two_low":       info.get("fiftyTwoWeekLow"),
+            "sector":              info.get("sector"),
+            "short_name":          info.get("shortName"),
+        }
+
+        # fast_info is a separate, lighter endpoint that often succeeds when
+        # .info does not. It cannot supply multiples, but it does carry market
+        # cap and the 52-week range.
+        if out["market_cap"] is None or out["fifty_two_high"] is None:
+            try:
+                fast = yf.Ticker(symbol).fast_info
+                out["market_cap"] = out["market_cap"] or _fast_get(fast, "market_cap", "marketCap")
+                out["fifty_two_high"] = out["fifty_two_high"] or _fast_get(fast, "year_high", "yearHigh")
+                out["fifty_two_low"] = out["fifty_two_low"] or _fast_get(fast, "year_low", "yearLow")
+            except Exception as exc:
+                logger.debug("fast_info fallback failed for %s: %s", symbol, exc)
+
+        # .info can also carry NaN for a field Yahoo has no value for.
+        out = {key: _finite_or_none(value) for key, value in out.items()}
+
+        if not out["sector"]:
+            out["sector"] = reference_data.lookup_sector(symbol)
+        if not out["short_name"]:
+            out["short_name"] = symbol
+
+        missing = [k for k in ("pe_ratio", "market_cap", "profit_margins") if out[k] is None]
+        if missing:
+            logger.info(
+                "Fundamentals partially unavailable for %s (missing: %s) — "
+                "the analysis will report 'אין נתון' for those",
+                symbol, ", ".join(missing),
+            )
+        return out
 
     def _fetch_news(self, symbol: str, limit: int = 5) -> list:
         """Return a list of recent news headlines (title + publisher)."""
@@ -389,3 +544,38 @@ class StockAnalyst:
             parts += ["", "**הפוזיציה האישית של המשתמש:** אין פוזיציה במניה זו."]
 
         return "\n".join(parts)
+
+
+def _parse_review(text: str) -> dict:
+    """Extract {rating, explanation} from the model's reply.
+
+    The prompt asks for bare JSON, but models occasionally wrap it in a code
+    fence or add a sentence around it. Rather than discarding a perfectly good
+    review over formatting, pull the first JSON object out of the text and fall
+    back to keeping the prose with no rating.
+    """
+    import json
+    import re
+
+    candidate = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.DOTALL)
+    if fenced:
+        candidate = fenced.group(1)
+    else:
+        braces = re.search(r"\{.*\}", candidate, re.DOTALL)
+        if braces:
+            candidate = braces.group(0)
+
+    try:
+        parsed = json.loads(candidate)
+        rating = str(parsed.get("rating", "")).strip().lower()
+        explanation = str(parsed.get("explanation", "")).strip()
+        if rating not in ("green", "orange", "red"):
+            logger.warning("Unexpected rating from the model: %r", rating)
+            rating = None
+        if explanation:
+            return {"rating": rating, "explanation": explanation}
+    except (ValueError, AttributeError) as exc:
+        logger.warning("Could not parse the review as JSON (%s) — keeping the raw text", exc)
+
+    return {"rating": None, "explanation": text.strip() or "לא התקבל ניתוח."}
