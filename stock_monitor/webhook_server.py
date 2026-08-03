@@ -152,7 +152,10 @@ def create_webhook_app(
             logger.error("Custom webhook error: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    @app.get("/health")
+    # HEAD is declared explicitly: FastAPI does not derive it from GET, and
+    # uptime monitors (UptimeRobot and friends) probe with HEAD by default —
+    # without it the keep-alive fails with 405 and the free instance sleeps.
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def health():
         # Also the uptime-ping target, so it stays cheap and public. The build
         # fields make it possible to confirm which revision is deployed.

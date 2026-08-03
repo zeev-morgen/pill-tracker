@@ -90,3 +90,22 @@ def test_health_stays_public_for_keepalive(secured):
 def test_webhooks_stay_public(secured):
     response = secured.post("/webhook/custom", json={"title": "t", "message": "m"})
     assert response.status_code == 200
+
+
+# ── Keep-alive probe compatibility ────────────────────────────────────────────
+
+@pytest.mark.parametrize("method", ["get", "head"])
+def test_health_answers_both_probe_methods(secured, method):
+    """Uptime monitors probe with HEAD by default; GET is the manual check.
+
+    A 405 here silently breaks the keep-alive, letting a free-tier instance
+    sleep and stopping all monitoring.
+    """
+    assert getattr(secured, method)("/health").status_code == 200
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+def test_root_rejects_unauthenticated_probes(secured, method):
+    # Pointing a monitor at "/" instead of "/health" must fail loudly (401),
+    # never silently succeed against the protected dashboard.
+    assert getattr(secured, method)("/").status_code == 401
