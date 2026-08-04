@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List
 
+import pandas as pd
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -397,6 +398,89 @@ async def api_news(max_age_minutes: int = 60):
         raise HTTPException(status_code=502, detail="שגיאה בשליפת החדשות") from exc
 
 
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+@router.get("/api/diagnostics/{ticker}")
+async def api_diagnostics(ticker: str, period: str = "1mo"):
+    """What each Yahoo endpoint actually returns for one ticker, right now.
+
+    Price problems here are environment-specific: the deployed host gets
+    different answers from Yahoo than a laptop does, and neither the logs nor
+    the dashboard show which of the three sources disagrees. This puts the raw
+    bar dates side by side so the question is settled with data instead of
+    guesswork. Read-only, one ticker, on demand — and behind the dashboard
+    password like every other API route.
+    """
+    try:
+        symbol = Holding.create(ticker, 1, 1).ticker
+    except HoldingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def _probe() -> dict:
+        import yfinance as yf
+
+        from .data_feed import get_market_session
+
+        out: Dict[str, object] = {
+            "ticker": symbol,
+            "server_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "market_session": get_market_session(),
+            "yfinance_version": getattr(yf, "__version__", "unknown"),
+        }
+
+        def _tail(frame, source: str) -> None:
+            """Last five bars as (date, close), or why there are none."""
+            try:
+                if frame is None or getattr(frame, "empty", True):
+                    out[source] = "empty"
+                    return
+                if "Close" not in frame.columns:
+                    out[source] = f"no Close column: {list(frame.columns)[:6]}"
+                    return
+                closes = frame["Close"].tail(5)
+                out[source] = [
+                    [str(idx.date() if hasattr(idx, "date") else idx),
+                     None if pd.isna(v) else round(float(v), 2)]
+                    for idx, v in closes.items()
+                ]
+                out[f"{source}_index_tz"] = str(getattr(frame.index, "tz", None))
+            except Exception as exc:
+                out[source] = f"{exc.__class__.__name__}: {exc}"
+
+        try:
+            batch = yf.download([symbol], period=period, auto_adjust=True,
+                                progress=False, group_by="ticker", threads=False)
+            if batch is not None and not batch.empty and hasattr(batch.columns, "levels"):
+                batch = batch[symbol] if symbol in batch.columns.get_level_values(0) else batch
+            _tail(batch, "download")
+        except Exception as exc:
+            out["download"] = f"{exc.__class__.__name__}: {exc}"
+
+        try:
+            _tail(yf.Ticker(symbol).history(period=period, auto_adjust=True), "history")
+        except Exception as exc:
+            out["history"] = f"{exc.__class__.__name__}: {exc}"
+
+        try:
+            fast = yf.Ticker(symbol).fast_info
+            out["fast_info"] = {
+                name: getattr(fast, name, None)
+                for name in ("last_price", "previous_close", "last_volume")
+            }
+        except Exception as exc:
+            out["fast_info"] = f"{exc.__class__.__name__}: {exc}"
+
+        return out
+
+    try:
+        return JSONResponse(await run_in_threadpool(_probe))
+    except Exception as exc:
+        logger.error("Diagnostics failed for %s: %s", symbol, exc, exc_info=True)
+        raise HTTPException(
+            status_code=502, detail=f"אבחון נכשל ({exc.__class__.__name__})"
+        ) from exc
+
+
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
 
 @router.get("/", response_class=HTMLResponse)
@@ -705,6 +789,7 @@ _HTML = """<!DOCTYPE html>
         <button class="btn primary" onclick="openModal()">+ הוספת פוזיציה</button>
         <button class="btn" onclick="analyzePortfolio()">🧠 ניתוח AI של התיק</button>
         <button class="btn" onclick="loadPortfolio()">רענון</button>
+        <button class="btn" onclick="runDiagnostics()" title="מה Yahoo מחזיר בפועל">🔧 אבחון נתונים</button>
         <span id="portfolio-total" class="volume" style="margin-inline-start:12px"></span>
       </div>
       <div id="holdings-wrap"><div class="empty">טוען…</div></div>
@@ -1258,6 +1343,26 @@ async function runAnalysis(title, path, pending) {
 function analyzePortfolio() {
   return runAnalysis('ניתוח AI — התיק כמכלול', '/api/portfolio/analyze',
                      'מנתח את התיק… (עשוי לקחת עד דקה)');
+}
+
+/* Prints what each Yahoo endpoint returns for the first holding. When prices
+   look wrong, this is the difference between diagnosing and guessing. */
+async function runDiagnostics() {
+  const ticker = (currentPositions[0] || {}).ticker;
+  if (!ticker) { alert('אין פוזיציות לאבחון'); return; }
+  const card = document.getElementById('analysis-card');
+  const body = document.getElementById('analysis-body');
+  document.getElementById('analysis-title').textContent = `אבחון נתונים — ${ticker}`;
+  card.style.display = 'block';
+  body.textContent = 'בודק מול Yahoo…';
+  card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  try {
+    const data = await api('/api/diagnostics/' + encodeURIComponent(ticker));
+    body.innerHTML = `<pre dir="ltr" style="text-align:left;overflow-x:auto;margin:0">` +
+      esc(JSON.stringify(data, null, 2)) + `</pre>`;
+  } catch (e) {
+    body.innerHTML = `<span class="down">שגיאה: ${esc(e.message)}</span>`;
+  }
 }
 
 function analyzeTicker(ticker) {
