@@ -30,6 +30,13 @@ def _history(last_close=100.0, rows=60):
     return pd.DataFrame({"High": close + 1, "Low": close - 1, "Close": close}, index=idx)
 
 
+def _unpriceable(rows=60):
+    """Every bar blank — nothing to fall back to."""
+    frame = _history(rows=rows)
+    frame["Close"] = float("nan")
+    return frame
+
+
 @pytest.fixture(autouse=True)
 def stub_fundamentals(monkeypatch):
     monkeypatch.setattr(
@@ -66,19 +73,28 @@ def test_a_nan_price_would_break_json_if_it_got_through():
         json.dumps({"price": float("nan")}, allow_nan=False)
 
 
-def test_nan_close_skips_the_holding_instead_of_failing_the_report(monkeypatch):
+def test_a_trailing_nan_close_falls_back_to_the_last_real_one(monkeypatch):
+    """A blank final bar is normal — the price before it is still a price."""
     _stub_history(monkeypatch, _history(last_close=float("nan")))
-    analyzer = PortfolioRiskAnalyzer(_store("AMZN"))
-    report = analyzer.full_report()
+    report = PortfolioRiskAnalyzer(_store("AMZN")).full_report()
+
+    assert report["skipped_tickers"] == []
+    assert report["positions"][0]["current_price"] == pytest.approx(100.0)
+    json.dumps(report, allow_nan=False)      # the encoder FastAPI actually uses
+
+
+def test_an_all_nan_history_skips_the_holding(monkeypatch):
+    _stub_history(monkeypatch, _unpriceable())
+    report = PortfolioRiskAnalyzer(_store("AMZN")).full_report()
 
     assert report["positions"] == []
     assert report["skipped_tickers"] == ["AMZN"]
-    json.dumps(report, allow_nan=False)      # the encoder FastAPI actually uses
+    json.dumps(report, allow_nan=False)
 
 
 def test_one_bad_ticker_does_not_take_the_others_with_it(monkeypatch):
     good = _history(last_close=120.0)
-    bad = _history(last_close=float("nan"))
+    bad = _unpriceable()
 
     class FakeTicker:
         def __init__(self, symbol):
@@ -95,8 +111,9 @@ def test_one_bad_ticker_does_not_take_the_others_with_it(monkeypatch):
     assert report["total_value"] == pytest.approx(1200.0)
 
 
-@pytest.mark.parametrize("price", [float("nan"), float("inf"), 0.0, -5.0])
+@pytest.mark.parametrize("price", [float("inf"), 0.0, -5.0])
 def test_unusable_prices_are_all_rejected(monkeypatch, price):
+    """NaN is excluded: it now means 'no bar', and falls back to the last one."""
     _stub_history(monkeypatch, _history(last_close=price))
     report = PortfolioRiskAnalyzer(_store("AMZN")).full_report()
     assert report["skipped_tickers"] == ["AMZN"]
@@ -119,7 +136,7 @@ def test_an_unexpected_exception_skips_only_that_holding(monkeypatch):
 
 
 def test_skipped_list_resets_between_runs(monkeypatch):
-    _stub_history(monkeypatch, _history(last_close=float("nan")))
+    _stub_history(monkeypatch, _unpriceable())
     analyzer = PortfolioRiskAnalyzer(_store("AMZN"))
     analyzer.full_report()
     _stub_history(monkeypatch, _history(last_close=120.0))
@@ -168,7 +185,7 @@ def test_the_portfolio_endpoint_survives_a_nan_price(monkeypatch):
     for holding in list(portfolio_store.all()):
         portfolio_store.delete(holding.ticker)
     portfolio_store.upsert(Holding.create("AMZN", 10, 90.0))
-    _stub_history(monkeypatch, _history(last_close=float("nan")))
+    _stub_history(monkeypatch, _unpriceable())
     monkeypatch.setattr(dashboard, "get_data_feed", lambda: None)
 
     client = TestClient(create_webhook_app(NotificationDispatcher(NotificationConfig()), ""))

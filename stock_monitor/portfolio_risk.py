@@ -356,6 +356,19 @@ class PortfolioRiskAnalyzer:
                     self._skip_reasons.append("no price data")
                     continue
 
+                # Trailing rows can carry a NaN close. A batch download indexes
+                # every ticker against the union of all their trading days, so
+                # one that has not printed yet today gets an empty bar — and
+                # dropna(how="all") keeps it, because Volume is 0 rather than
+                # NaN. Take the last close that exists instead of the last row,
+                # which also keeps those blank bars out of the ATR window.
+                history = history[history["Close"].notna()]
+                if history.empty:
+                    logger.warning("no priced bars for %s — skipping", holding.ticker)
+                    self._skipped.append(holding.ticker)
+                    self._skip_reasons.append("no price data")
+                    continue
+
                 price = float(history["Close"].iloc[-1])
                 # A non-finite price poisons every total it feeds, and NaN is
                 # rejected outright by the JSON encoder — so the position is

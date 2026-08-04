@@ -185,3 +185,75 @@ def test_no_skip_reason_when_nothing_was_skipped(monkeypatch, store):
     report = PortfolioRiskAnalyzer(store).full_report()
     assert report["skipped_tickers"] == []
     assert report["skip_reason"] is None
+
+
+# ── Trailing empty bars ───────────────────────────────────────────────────────
+
+def _frame_with_blank_last_bar(price=100.0, rows=60):
+    """What a batch download hands back for a ticker with no bar yet today.
+
+    yf.download indexes every ticker against the union of all their trading
+    days, so a ticker missing the newest date gets a row of NaN prices with a
+    zero volume — which survives dropna(how="all").
+    """
+    frame = _frame(price, rows)
+    last = frame.index[-1]
+    frame.loc[last, ["High", "Low", "Close"]] = np.nan
+    frame["Volume"] = 1
+    frame.loc[last, "Volume"] = 0
+    return frame
+
+
+def test_a_blank_last_bar_uses_the_last_real_close(monkeypatch):
+    store = PortfolioStore()
+    store.upsert(Holding.create("AMZN", 10, 90.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AMZN": _frame_with_blank_last_bar(123.0)}, axis=1),
+    )
+    report = PortfolioRiskAnalyzer(store).full_report()
+
+    assert report["skipped_tickers"] == [], report["skip_reason"]
+    assert report["positions"][0]["current_price"] == pytest.approx(123.0)
+
+
+def test_blank_last_bars_across_the_whole_portfolio(monkeypatch):
+    """The production symptom: every holding reported as 'unusable price'."""
+    store = PortfolioStore()
+    for t in TICKERS:
+        store.upsert(Holding.create(t, 10, 90.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat(
+            {x: _frame_with_blank_last_bar(100.0) for x in TICKERS}, axis=1
+        ),
+    )
+    report = PortfolioRiskAnalyzer(store).full_report()
+
+    assert report["skipped_tickers"] == []
+    assert len(report["positions"]) == len(TICKERS)
+    assert report["total_value"] == pytest.approx(len(TICKERS) * 1000.0)
+
+
+def test_blank_bars_are_kept_out_of_the_atr_window(monkeypatch):
+    """A NaN bar inside the window would otherwise poison the average."""
+    store = PortfolioStore()
+    store.upsert(Holding.create("AMZN", 10, 90.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AMZN": _frame_with_blank_last_bar()}, axis=1),
+    )
+    assert PortfolioRiskAnalyzer(store).full_report()["positions"][0]["atr_pct"] is not None
+
+
+def test_a_frame_of_nothing_but_blank_bars_is_skipped(monkeypatch):
+    store = PortfolioStore()
+    store.upsert(Holding.create("AMZN", 10, 90.0))
+    blank = _frame()
+    blank["Close"] = np.nan
+    blank["Volume"] = 0
+    monkeypatch.setattr(portfolio_risk.yf, "download",
+                        lambda t, **kw: pd.concat({"AMZN": blank}, axis=1))
+    report = PortfolioRiskAnalyzer(store).full_report()
+    assert report["skipped_tickers"] == ["AMZN"]
+    assert report["skip_reason"] == "no price data"
