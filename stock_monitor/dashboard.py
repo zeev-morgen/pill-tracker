@@ -644,6 +644,9 @@ _HTML = """<!DOCTYPE html>
   .news-meta { color: var(--muted); font-size: 0.76rem; margin-top: 4px; }
   .news-fresh { color: var(--yellow); font-weight: 600; }
   .ext-price { font-size: 0.78rem; }
+  /* Under the price rather than beside it: as its own column the as-of date
+     pushed the row actions off the edge. */
+  .price-date { font-size: 0.72rem; margin-top: 2px; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -1063,9 +1066,11 @@ function renderHoldings(data) {
     return;
   }
   const pnlCls = data.total_pnl_value >= 0 ? 'up' : 'down';
+  const asOf = data.latest_bar_date
+    ? ` · <span class="volume">מחירי סגירה מ-${esc(data.latest_bar_date)}</span>` : '';
   document.getElementById('portfolio-total').innerHTML =
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
-    `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>`;
+    `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>` + asOf;
 
   wrap.innerHTML = skippedNote(data) + `<table>
     <thead><tr>
@@ -1077,7 +1082,7 @@ function renderHoldings(data) {
       <td><span class="symbol">${esc(p.ticker)}</span></td>
       <td>${p.quantity}</td>
       <td><span class="price">${money(p.entry_price)}</span></td>
-      <td><span class="price">${money(p.current_price)}</span></td>
+      <td><span class="price">${money(p.current_price)}</span>${priceDateCell(p)}</td>
       <td>${extendedCell(p)}</td>
       <td>${money(p.market_value)}</td>
       <td>${pctCell(p.pnl_pct)} <span class="volume">(${money(p.pnl_value)})</span></td>
@@ -1095,6 +1100,17 @@ function renderHoldings(data) {
         <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')" title="מחיקת הפוזיציה">🗑️</button>
       </td></tr>`).join('')}</tbody>
   </table>`;
+}
+
+/* Which session the close came from. A price with no date attached is taken
+   for today's, which is how a stale quote goes unnoticed. */
+function priceDateCell(p) {
+  if (!p.price_date) return '';
+  const cls = p.price_is_stale ? 'down' : 'volume';
+  const mark = p.price_is_stale ? '⚠️ ' : '';
+  return `<div class="price-date ${cls}" title="${p.price_is_stale
+    ? 'מחיר מסשן קודם — לא עודכן בסשן האחרון' : 'סגירת המסחר האחרונה'}">` +
+    `${mark}${esc(p.price_date)}</div>`;
 }
 
 /* Pre/post-market price. Outside those sessions the regular price already on

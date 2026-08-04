@@ -68,6 +68,18 @@ class Fundamentals:
 UNKNOWN_SECTOR = "Unknown"
 
 
+def _bar_date(index_value) -> Optional[date]:
+    """Session date of a price bar, as the exchange saw it.
+
+    yfinance hands back a tz-aware timestamp for daily bars; converting to UTC
+    first would roll a 00:00 New York bar back into the previous day.
+    """
+    try:
+        return index_value.date()
+    except AttributeError:
+        return None
+
+
 def _finite(value):
     """None for anything JSON cannot carry.
 
@@ -370,6 +382,7 @@ class PortfolioRiskAnalyzer:
                     continue
 
                 price = float(history["Close"].iloc[-1])
+                price_date = _bar_date(history.index[-1])
                 # A non-finite price poisons every total it feeds, and NaN is
                 # rejected outright by the JSON encoder — so the position is
                 # dropped rather than allowed to fail the whole response.
@@ -403,6 +416,7 @@ class PortfolioRiskAnalyzer:
                         "asset_type": asset_type,
                         "asset_type_is_manual": holding.asset_type is not None,
                         "indexes": fundamentals.indexes,
+                        "price_date": price_date,
                         "purchase_date": holding.purchase_date,
                         **self._extended_hours(holding.ticker, session),
                     }
@@ -434,6 +448,11 @@ class PortfolioRiskAnalyzer:
     def full_report(self) -> dict:
         """Positions plus both alert reports and the allocation breakdown."""
         positions = self.collect_positions()
+        # The freshest bar anyone in the portfolio has is the best read on
+        # "now" without needing an exchange calendar; anything behind it is
+        # quoting an older session.
+        bar_dates = [p["price_date"] for p in positions if p.get("price_date")]
+        latest_bar = max(bar_dates) if bar_dates else None
         return {
             "positions": [
                 {
@@ -445,6 +464,16 @@ class PortfolioRiskAnalyzer:
                     "pnl_pct": round(p["pnl_pct"], 2),
                     "pnl_value": round(p["pnl_value"], 2),
                     "atr_pct": round(p["atr_pct"], 2) if p["atr_pct"] is not None else None,
+                    # Which session the quoted close came from, so a stale
+                    # price is visible instead of passing for today's.
+                    "price_date": (
+                        p["price_date"].isoformat() if p.get("price_date") else None
+                    ),
+                    "price_is_stale": (
+                        p.get("price_date") is not None
+                        and latest_bar is not None
+                        and p["price_date"] < latest_bar
+                    ),
                     "sector": p["sector"],
                     "sector_is_manual": p["sector_is_manual"],
                     "asset_type": p["asset_type"],
@@ -474,6 +503,7 @@ class PortfolioRiskAnalyzer:
             # the table with no hint that it was ever there.
             "skipped_tickers": self.skipped_tickers,
             "skip_reason": self.skip_reason,
+            "latest_bar_date": latest_bar.isoformat() if latest_bar else None,
             "volatility": build_volatility_report(positions, self.thresholds),
             "sector": build_sector_report(positions, self.thresholds),
             "allocation": build_allocation(positions),

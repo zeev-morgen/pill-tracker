@@ -257,3 +257,56 @@ def test_a_frame_of_nothing_but_blank_bars_is_skipped(monkeypatch):
     report = PortfolioRiskAnalyzer(store).full_report()
     assert report["skipped_tickers"] == ["AMZN"]
     assert report["skip_reason"] == "no price data"
+
+
+# ── As-of date ────────────────────────────────────────────────────────────────
+
+def _frame_ending(last_day, price=100.0, rows=60):
+    idx = pd.bdate_range(end=last_day, periods=rows)
+    close = np.full(rows, price)
+    return pd.DataFrame({"High": close + 1, "Low": close - 1, "Close": close}, index=idx)
+
+
+def test_the_report_says_which_session_the_price_is_from(monkeypatch):
+    store = PortfolioStore()
+    store.upsert(Holding.create("AMZN", 10, 90.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AMZN": _frame_ending("2026-08-03")}, axis=1),
+    )
+    report = PortfolioRiskAnalyzer(store).full_report()
+
+    assert report["positions"][0]["price_date"] == "2026-08-03"
+    assert report["latest_bar_date"] == "2026-08-03"
+    assert report["positions"][0]["price_is_stale"] is False
+
+
+def test_a_holding_quoting_an_older_session_is_flagged(monkeypatch):
+    """A blank final bar silently rolls the quote back a day — say so."""
+    store = PortfolioStore()
+    for t in ("FRESH", "STALE"):
+        store.upsert(Holding.create(t, 10, 90.0))
+    monkeypatch.setattr(portfolio_risk.yf, "download", lambda t, **kw: pd.concat({
+        "FRESH": _frame_ending("2026-08-03"),
+        "STALE": _frame_ending("2026-07-31"),
+    }, axis=1, sort=True))
+    report = PortfolioRiskAnalyzer(store).full_report()
+    by_ticker = {p["ticker"]: p for p in report["positions"]}
+
+    assert report["latest_bar_date"] == "2026-08-03"
+    assert by_ticker["FRESH"]["price_is_stale"] is False
+    assert by_ticker["STALE"]["price_is_stale"] is True
+    assert by_ticker["STALE"]["price_date"] == "2026-07-31"
+
+
+def test_the_as_of_date_follows_the_bar_actually_used(monkeypatch):
+    """After falling back past a blank bar, the date must move back with it."""
+    store = PortfolioStore()
+    store.upsert(Holding.create("AMZN", 10, 90.0))
+    frame = _frame_ending("2026-08-03")
+    frame.loc[frame.index[-1], "Close"] = np.nan     # no bar for the last day
+    monkeypatch.setattr(portfolio_risk.yf, "download",
+                        lambda t, **kw: pd.concat({"AMZN": frame}, axis=1))
+
+    position = PortfolioRiskAnalyzer(store).full_report()["positions"][0]
+    assert position["price_date"] == "2026-07-31", "Aug 1-2 is a weekend"
