@@ -10,6 +10,7 @@ thin layer that fetches live data and feeds those functions.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date
 from functools import lru_cache
@@ -65,6 +66,18 @@ class Fundamentals:
 
 
 UNKNOWN_SECTOR = "Unknown"
+
+
+def _finite(value):
+    """None for anything JSON cannot carry.
+
+    ``json.dumps(allow_nan=False)`` — which is what FastAPI's JSONResponse
+    uses — raises on NaN and infinity, so one bad number from yfinance would
+    otherwise fail the entire endpoint rather than blank a single field.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value if math.isfinite(value) else None
+    return value
 
 
 # ── Pure analytics ────────────────────────────────────────────────────────────
@@ -262,57 +275,77 @@ class PortfolioRiskAnalyzer:
             return {"session": session}
         return {
             "session": session,
-            "extended_price": data.get("price"),
-            "extended_change_pct": data.get("since_close_pct"),
+            "extended_price": _finite(data.get("price")),
+            "extended_change_pct": _finite(data.get("since_close_pct")),
         }
 
     def collect_positions(self) -> List[dict]:
         """One entry per holding, enriched with price, ATR, sector and P/L.
 
-        Holdings whose price cannot be fetched are skipped rather than failing
-        the whole report.
+        Holdings that cannot be priced are skipped rather than failing the whole
+        report — see ``skipped_tickers`` for what was left out. The entire body
+        is guarded, not just the fetch: an unexpected shape from yfinance (a
+        frame without a Close column, a multi-index) used to raise past the
+        handler and take down the endpoint.
         """
         positions: List[dict] = []
+        self._skipped: List[str] = []
         for holding in self._store.all():
             try:
                 history = yf.Ticker(holding.ticker).history(period="6mo", auto_adjust=True)
-            except Exception as exc:
-                logger.warning("history fetch failed for %s: %s", holding.ticker, exc)
-                continue
-            if history is None or history.empty:
-                logger.warning("no price history for %s — skipping", holding.ticker)
-                continue
+                if history is None or history.empty or "Close" not in history.columns:
+                    logger.warning("no usable price history for %s — skipping", holding.ticker)
+                    self._skipped.append(holding.ticker)
+                    continue
 
-            price = float(history["Close"].iloc[-1])
-            atr = compute_atr(history, self.thresholds.atr_period)
-            fundamentals = fetch_fundamentals(holding.ticker)
-            market_value = price * holding.quantity
-            # A user-set sector or asset type always wins: yfinance regularly
-            # reports nothing, and the manual value is the whole point of the
-            # override.
-            sector = holding.sector or fundamentals.sector
-            asset_type = holding.asset_type or fundamentals.asset_type
-            positions.append(
-                {
-                    "ticker": holding.ticker,
-                    "quantity": holding.quantity,
-                    "entry_price": holding.entry_price,
-                    "current_price": price,
-                    "market_value": market_value,
-                    "pnl_pct": (price - holding.entry_price) / holding.entry_price * 100.0,
-                    "pnl_value": (price - holding.entry_price) * holding.quantity,
-                    "atr": atr,
-                    "atr_pct": (atr / price * 100.0) if atr and price > 0 else None,
-                    "sector": sector,
-                    "sector_is_manual": holding.sector is not None,
-                    "asset_type": asset_type,
-                    "asset_type_is_manual": holding.asset_type is not None,
-                    "indexes": fundamentals.indexes,
-                    "purchase_date": holding.purchase_date,
-                    **self._extended_hours(holding.ticker),
-                }
-            )
+                price = float(history["Close"].iloc[-1])
+                # A non-finite price poisons every total it feeds, and NaN is
+                # rejected outright by the JSON encoder — so the position is
+                # dropped rather than allowed to fail the whole response.
+                if not math.isfinite(price) or price <= 0:
+                    logger.warning("unusable price (%s) for %s — skipping", price, holding.ticker)
+                    self._skipped.append(holding.ticker)
+                    continue
+
+                atr = compute_atr(history, self.thresholds.atr_period)
+                fundamentals = fetch_fundamentals(holding.ticker)
+                market_value = price * holding.quantity
+                # A user-set sector or asset type always wins: yfinance regularly
+                # reports nothing, and the manual value is the whole point of the
+                # override.
+                sector = holding.sector or fundamentals.sector
+                asset_type = holding.asset_type or fundamentals.asset_type
+                positions.append(
+                    {
+                        "ticker": holding.ticker,
+                        "quantity": holding.quantity,
+                        "entry_price": holding.entry_price,
+                        "current_price": price,
+                        "market_value": market_value,
+                        "pnl_pct": (price - holding.entry_price) / holding.entry_price * 100.0,
+                        "pnl_value": (price - holding.entry_price) * holding.quantity,
+                        "atr": atr,
+                        "atr_pct": (atr / price * 100.0) if atr else None,
+                        "sector": sector,
+                        "sector_is_manual": holding.sector is not None,
+                        "asset_type": asset_type,
+                        "asset_type_is_manual": holding.asset_type is not None,
+                        "indexes": fundamentals.indexes,
+                        "purchase_date": holding.purchase_date,
+                        **self._extended_hours(holding.ticker),
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    "skipping %s: %s: %s", holding.ticker, exc.__class__.__name__, exc
+                )
+                self._skipped.append(holding.ticker)
         return positions
+
+    @property
+    def skipped_tickers(self) -> List[str]:
+        """Holdings dropped by the most recent ``collect_positions`` call."""
+        return list(getattr(self, "_skipped", []))
 
     def full_report(self) -> dict:
         """Positions plus both alert reports and the allocation breakdown."""
@@ -353,6 +386,9 @@ class PortfolioRiskAnalyzer:
             ],
             "total_value": round(sum(p["market_value"] for p in positions), 2),
             "total_pnl_value": round(sum(p["pnl_value"] for p in positions), 2),
+            # Held but unpriceable. Without this a position simply vanished from
+            # the table with no hint that it was ever there.
+            "skipped_tickers": self.skipped_tickers,
             "volatility": build_volatility_report(positions, self.thresholds),
             "sector": build_sector_report(positions, self.thresholds),
             "allocation": build_allocation(positions),

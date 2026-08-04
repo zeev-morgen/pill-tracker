@@ -1,6 +1,7 @@
 """yfinance data feed with pre-market / after-hours support."""
 
 import logging
+import math
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -90,16 +91,24 @@ class StockDataFeed:
 
     @staticmethod
     def _fi_get(fast_info, *attrs) -> Optional[float]:
-        """Return the first non-None float from fast_info, skipping on any error.
+        """Return the first usable float from fast_info, skipping on any error.
 
         yfinance property getters can raise (not just AttributeError) when the
         underlying network call fails, so each access is individually guarded.
+
+        NaN counts as missing. yfinance returns float('nan') for a field it
+        could not resolve, and NaN survives every ``is not None`` check, then
+        propagates through the arithmetic into the API response — where
+        ``json.dumps(allow_nan=False)`` rejects it and fails the whole request.
         """
         for attr in attrs:
             try:
                 val = getattr(fast_info, attr)
-                if val is not None:
-                    return float(val)
+                if val is None:
+                    continue
+                val = float(val)
+                if math.isfinite(val):
+                    return val
             except Exception:
                 pass
         return None

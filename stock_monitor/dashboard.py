@@ -346,7 +346,13 @@ async def api_portfolio():
         return JSONResponse(await run_in_threadpool(_risk_analyzer.full_report))
     except Exception as exc:
         logger.error("Portfolio report failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=502, detail="שגיאה בשליפת נתוני התיק") from exc
+        # The exception class goes to the browser too. A bare "שגיאה" left both
+        # the user and the logs-less browser with nothing to act on; the type
+        # name carries no secrets and is often the whole diagnosis.
+        raise HTTPException(
+            status_code=502,
+            detail=f"שגיאה בשליפת נתוני התיק ({exc.__class__.__name__})",
+        ) from exc
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -1031,10 +1037,20 @@ async function deleteHolding(ticker) {
 }
 
 /* ── Rendering ── */
+/* Held but unpriceable. Saying so beats a position quietly disappearing from
+   the table, which reads as data loss. */
+function skippedNote(skipped) {
+  if (!skipped || !skipped.length) return '';
+  return `<div class="banner warn" style="margin:14px 18px">` +
+    `⚠️ לא ניתן לשלוף מחיר עבור ${skipped.map(esc).join(', ')} — ` +
+    `הפוזיציות קיימות אך אינן נכללות בחישובים כרגע.</div>`;
+}
+
 function renderHoldings(data) {
   const wrap = document.getElementById('holdings-wrap');
   if (!data.positions.length) {
-    wrap.innerHTML = '<div class="empty">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</div>';
+    wrap.innerHTML = skippedNote(data.skipped_tickers) ||
+      '<div class="empty">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</div>';
     document.getElementById('portfolio-total').textContent = '';
     return;
   }
@@ -1043,7 +1059,7 @@ function renderHoldings(data) {
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
     `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>`;
 
-  wrap.innerHTML = `<table>
+  wrap.innerHTML = skippedNote(data.skipped_tickers) + `<table>
     <thead><tr>
       <th>סמל</th><th>כמות</th><th>מחיר כניסה</th><th>מחיר נוכחי</th>
       <th>פרי / פוסט</th><th>שווי</th><th>רווח/הפסד</th><th>ימי החזקה</th>
