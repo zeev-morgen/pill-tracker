@@ -257,27 +257,72 @@ class PortfolioRiskAnalyzer:
         module-level singleton built before the app owns a feed)."""
         self._feed = feed
 
-    def _extended_hours(self, ticker: str) -> dict:
+    def _extended_hours(self, ticker: str, session: str) -> dict:
         """Pre/post-market price and move, when the feed can supply them.
+
+        The caller passes the session, which is pure clock arithmetic, so
+        outside pre/after hours this costs nothing. It used to query the feed
+        per holding and then throw the answer away once it saw the session was
+        'regular' or 'closed' — a wasted request per position, on every refresh.
 
         Returns empty rather than raising: extended-hours quotes are a display
         extra, and losing them must not cost the whole portfolio report.
         """
-        if self._feed is None:
-            return {}
+        if self._feed is None or session not in ("pre", "after"):
+            return {"session": session} if session else {}
         try:
             data = self._feed.get_current_data(ticker) or {}
         except Exception as exc:
             logger.debug("extended-hours fetch failed for %s: %s", ticker, exc)
-            return {}
-        session = data.get("session")
-        if session not in ("pre", "after"):
             return {"session": session}
         return {
-            "session": session,
+            "session": data.get("session", session),
             "extended_price": _finite(data.get("price")),
             "extended_change_pct": _finite(data.get("since_close_pct")),
         }
+
+    def _fetch_histories(self, tickers: List[str]) -> Dict[str, "pd.DataFrame"]:
+        """Price history for the whole portfolio in a single request.
+
+        Yahoo rate-limits per IP, and a shared cloud host burns that budget
+        fast: one request per holding on every refresh was enough to get every
+        ticker throttled at once. Tickers the batch does not cover fall back to
+        an individual fetch, so a partial answer still yields most positions.
+        """
+        if not tickers:
+            return {}
+        try:
+            data = yf.download(
+                tickers,
+                period="6mo",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "batch history download failed (%s: %s) — falling back to per-ticker",
+                exc.__class__.__name__, exc,
+            )
+            return {}
+
+        histories: Dict[str, "pd.DataFrame"] = {}
+        if data is None or data.empty:
+            return histories
+        if isinstance(data.columns, pd.MultiIndex):
+            available = set(data.columns.get_level_values(0))
+            for ticker in tickers:
+                if ticker not in available:
+                    continue
+                frame = data[ticker].dropna(how="all")
+                if not frame.empty:
+                    histories[ticker] = frame
+        elif len(tickers) == 1:
+            frame = data.dropna(how="all")
+            if not frame.empty:
+                histories[tickers[0]] = frame
+        return histories
 
     def collect_positions(self) -> List[dict]:
         """One entry per holding, enriched with price, ATR, sector and P/L.
@@ -288,14 +333,27 @@ class PortfolioRiskAnalyzer:
         frame without a Close column, a multi-index) used to raise past the
         handler and take down the endpoint.
         """
+        from .data_feed import get_market_session
+
+        holdings = self._store.all()
         positions: List[dict] = []
         self._skipped: List[str] = []
-        for holding in self._store.all():
+        self._skip_reasons: List[str] = []
+        # One clock read for the whole report rather than one per holding.
+        session = get_market_session()
+        histories = self._fetch_histories([h.ticker for h in holdings])
+
+        for holding in holdings:
             try:
-                history = yf.Ticker(holding.ticker).history(period="6mo", auto_adjust=True)
+                history = histories.get(holding.ticker)
+                if history is None:
+                    history = yf.Ticker(holding.ticker).history(
+                        period="6mo", auto_adjust=True
+                    )
                 if history is None or history.empty or "Close" not in history.columns:
                     logger.warning("no usable price history for %s — skipping", holding.ticker)
                     self._skipped.append(holding.ticker)
+                    self._skip_reasons.append("no price data")
                     continue
 
                 price = float(history["Close"].iloc[-1])
@@ -305,6 +363,7 @@ class PortfolioRiskAnalyzer:
                 if not math.isfinite(price) or price <= 0:
                     logger.warning("unusable price (%s) for %s — skipping", price, holding.ticker)
                     self._skipped.append(holding.ticker)
+                    self._skip_reasons.append("unusable price")
                     continue
 
                 atr = compute_atr(history, self.thresholds.atr_period)
@@ -332,7 +391,7 @@ class PortfolioRiskAnalyzer:
                         "asset_type_is_manual": holding.asset_type is not None,
                         "indexes": fundamentals.indexes,
                         "purchase_date": holding.purchase_date,
-                        **self._extended_hours(holding.ticker),
+                        **self._extended_hours(holding.ticker, session),
                     }
                 )
             except Exception as exc:
@@ -340,12 +399,24 @@ class PortfolioRiskAnalyzer:
                     "skipping %s: %s: %s", holding.ticker, exc.__class__.__name__, exc
                 )
                 self._skipped.append(holding.ticker)
+                self._skip_reasons.append(exc.__class__.__name__)
         return positions
 
     @property
     def skipped_tickers(self) -> List[str]:
         """Holdings dropped by the most recent ``collect_positions`` call."""
         return list(getattr(self, "_skipped", []))
+
+    @property
+    def skip_reason(self) -> Optional[str]:
+        """The most common reason holdings were dropped, for the UI to show.
+
+        When every position disappears the cause is systemic — throttling, a
+        network block — and naming it is the difference between a mystery and
+        something the user can act on.
+        """
+        reasons = getattr(self, "_skip_reasons", [])
+        return max(set(reasons), key=reasons.count) if reasons else None
 
     def full_report(self) -> dict:
         """Positions plus both alert reports and the allocation breakdown."""
@@ -389,6 +460,7 @@ class PortfolioRiskAnalyzer:
             # Held but unpriceable. Without this a position simply vanished from
             # the table with no hint that it was ever there.
             "skipped_tickers": self.skipped_tickers,
+            "skip_reason": self.skip_reason,
             "volatility": build_volatility_report(positions, self.thresholds),
             "sector": build_sector_report(positions, self.thresholds),
             "allocation": build_allocation(positions),

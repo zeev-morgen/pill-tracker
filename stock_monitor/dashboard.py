@@ -1039,17 +1039,25 @@ async function deleteHolding(ticker) {
 /* ── Rendering ── */
 /* Held but unpriceable. Saying so beats a position quietly disappearing from
    the table, which reads as data loss. */
-function skippedNote(skipped) {
+function skippedNote(data) {
+  const skipped = data.skipped_tickers;
   if (!skipped || !skipped.length) return '';
-  return `<div class="banner warn" style="margin:14px 18px">` +
-    `⚠️ לא ניתן לשלוף מחיר עבור ${skipped.map(esc).join(', ')} — ` +
-    `הפוזיציות קיימות אך אינן נכללות בחישובים כרגע.</div>`;
+  const reason = data.skip_reason ? ` (${esc(data.skip_reason)})` : '';
+  // Every holding failing means the data source is refusing us, not that the
+  // tickers are bad — say so, otherwise it reads as a portfolio problem.
+  const all = !data.positions.length;
+  const lead = all
+    ? `⚠️ ספק הנתונים (Yahoo) לא מחזיר מחירים כרגע${reason}. ` +
+      `הפוזיציות שמורות ולא אבדו — נסו שוב בעוד מספר דקות.`
+    : `⚠️ לא ניתן לשלוף מחיר עבור ${skipped.map(esc).join(', ')}${reason} — ` +
+      `הפוזיציות קיימות אך אינן נכללות בחישובים כרגע.`;
+  return `<div class="banner warn" style="margin:14px 18px">${lead}</div>`;
 }
 
 function renderHoldings(data) {
   const wrap = document.getElementById('holdings-wrap');
   if (!data.positions.length) {
-    wrap.innerHTML = skippedNote(data.skipped_tickers) ||
+    wrap.innerHTML = skippedNote(data) ||
       '<div class="empty">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</div>';
     document.getElementById('portfolio-total').textContent = '';
     return;
@@ -1059,7 +1067,7 @@ function renderHoldings(data) {
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
     `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>`;
 
-  wrap.innerHTML = skippedNote(data.skipped_tickers) + `<table>
+  wrap.innerHTML = skippedNote(data) + `<table>
     <thead><tr>
       <th>סמל</th><th>כמות</th><th>מחיר כניסה</th><th>מחיר נוכחי</th>
       <th>פרי / פוסט</th><th>שווי</th><th>רווח/הפסד</th><th>ימי החזקה</th>

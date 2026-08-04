@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from stock_monitor import portfolio_risk
+from stock_monitor import data_feed, portfolio_risk
 from stock_monitor.portfolio_risk import Fundamentals, PortfolioRiskAnalyzer
 from stock_monitor.store import Holding, PortfolioStore
 
@@ -34,6 +34,14 @@ def stub_market(monkeypatch):
     )
 
 
+@pytest.fixture
+def session(monkeypatch):
+    """Drive the market session, which is read from the clock, not the feed."""
+    def _set(name):
+        monkeypatch.setattr(data_feed, "get_market_session", lambda: name)
+    return _set
+
+
 class _Feed:
     def __init__(self, payload):
         self._payload = payload
@@ -52,7 +60,8 @@ def _store(**holding_kwargs):
 
 # ── Extended-hours quotes ─────────────────────────────────────────────────────
 
-def test_pre_market_price_and_move_reach_the_report():
+def test_pre_market_price_and_move_reach_the_report(session):
+    session("pre")
     analyzer = PortfolioRiskAnalyzer(
         _store(), data_feed=_Feed({"session": "pre", "price": 105.0, "since_close_pct": 5.0})
     )
@@ -62,7 +71,8 @@ def test_pre_market_price_and_move_reach_the_report():
     assert position["extended_change_pct"] == pytest.approx(5.0)
 
 
-def test_after_hours_is_reported_the_same_way():
+def test_after_hours_is_reported_the_same_way(session):
+    session("after")
     analyzer = PortfolioRiskAnalyzer(
         _store(), data_feed=_Feed({"session": "after", "price": 96.0, "since_close_pct": -4.0})
     )
@@ -71,8 +81,9 @@ def test_after_hours_is_reported_the_same_way():
     assert position["extended_change_pct"] == pytest.approx(-4.0)
 
 
-def test_during_regular_hours_there_is_no_separate_extended_price():
+def test_during_regular_hours_there_is_no_separate_extended_price(session):
     """The regular price is already on the row — repeating it would mislead."""
+    session("regular")
     analyzer = PortfolioRiskAnalyzer(
         _store(), data_feed=_Feed({"session": "regular", "price": 105.0, "since_close_pct": 5.0})
     )
@@ -82,22 +93,25 @@ def test_during_regular_hours_there_is_no_separate_extended_price():
     assert position["extended_change_pct"] is None
 
 
-def test_without_a_feed_the_report_still_builds():
+def test_without_a_feed_the_report_still_builds(session):
+    session("regular")
     position = PortfolioRiskAnalyzer(_store()).full_report()["positions"][0]
-    assert position["session"] is None
+    assert position["session"] == "regular"
     assert position["extended_price"] is None
     assert position["market_value"] == pytest.approx(1000.0)
 
 
-def test_a_failing_feed_costs_only_the_extended_columns():
+def test_a_failing_feed_costs_only_the_extended_columns(session):
+    session("pre")
     analyzer = PortfolioRiskAnalyzer(_store(), data_feed=_Feed(RuntimeError("feed down")))
     position = analyzer.full_report()["positions"][0]
-    assert position["session"] is None
+    assert position["extended_price"] is None
     assert position["pnl_pct"] == pytest.approx(11.11, abs=0.01)   # report is intact
 
 
-def test_the_feed_can_be_attached_after_construction():
+def test_the_feed_can_be_attached_after_construction(session):
     """The dashboard's analyzer is built before the app owns a feed."""
+    session("pre")
     analyzer = PortfolioRiskAnalyzer(_store())
     analyzer.set_data_feed(_Feed({"session": "pre", "price": 105.0, "since_close_pct": 5.0}))
     assert analyzer.full_report()["positions"][0]["extended_price"] == pytest.approx(105.0)
