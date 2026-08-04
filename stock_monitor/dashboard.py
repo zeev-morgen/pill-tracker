@@ -1151,8 +1151,11 @@ function renderHoldings(data) {
     return;
   }
   const pnlCls = data.total_pnl_value >= 0 ? 'up' : 'down';
-  const asOf = data.latest_bar_date
-    ? ` · <span class="volume">מחירי סגירה מ-${esc(data.latest_bar_date)}</span>` : '';
+  const live = data.positions.filter((p) => p.price_source === 'quote').length;
+  const asOf = live === data.positions.length && live
+    ? ` · <span class="volume">מחירים חיים</span>`
+    : data.latest_bar_date
+      ? ` · <span class="volume">מחירי סגירה מ-${esc(data.latest_bar_date)}</span>` : '';
   document.getElementById('portfolio-total').innerHTML =
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
     `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>` + asOf;
@@ -1190,6 +1193,11 @@ function renderHoldings(data) {
 /* Which session the close came from. A price with no date attached is taken
    for today's, which is how a stale quote goes unnoticed. */
 function priceDateCell(p) {
+  // A live quote belongs to no closed session, so it says so instead of
+  // wearing a date that would read as a stale close.
+  if (p.price_source === 'quote') {
+    return `<div class="price-date up" title="מחיר מנקודת הציטוט החי של Yahoo">מחיר חי</div>`;
+  }
   if (!p.price_date) return '';
   const cls = p.price_is_stale ? 'down' : 'volume';
   const mark = p.price_is_stale ? '⚠️ ' : '';

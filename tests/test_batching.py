@@ -138,28 +138,30 @@ def counting_feed():
     return Feed()
 
 
-@pytest.mark.parametrize("session", ["regular", "closed"])
-def test_no_feed_requests_outside_extended_hours(
-    monkeypatch, store, counting_feed, session
+def test_no_quote_requests_when_the_market_is_shut_and_bars_are_current(
+    monkeypatch, store, counting_feed
 ):
-    """The session is clock arithmetic, so this costs nothing to check first."""
-    monkeypatch.setattr(data_feed, "get_market_session", lambda: session)
+    """The close *is* the price then, so the whole report costs one request."""
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
     monkeypatch.setattr(portfolio_risk.yf, "download", lambda t, **kw: _batch(TICKERS))
 
     report = PortfolioRiskAnalyzer(store, data_feed=counting_feed).full_report()
     assert counting_feed.calls == []
-    assert all(p["session"] == session for p in report["positions"])
+    assert all(p["price_source"] == "bar" for p in report["positions"])
 
 
-@pytest.mark.parametrize("session", ["pre", "after"])
-def test_the_feed_is_queried_during_extended_hours(
+@pytest.mark.parametrize("session", ["pre", "regular", "after"])
+def test_the_quote_is_fetched_while_a_session_is_running(
     monkeypatch, store, counting_feed, session
 ):
+    """A daily close is behind any session in progress, including the regular one."""
     monkeypatch.setattr(data_feed, "get_market_session", lambda: session)
     monkeypatch.setattr(portfolio_risk.yf, "download", lambda t, **kw: _batch(TICKERS))
 
-    PortfolioRiskAnalyzer(store, data_feed=counting_feed).full_report()
+    report = PortfolioRiskAnalyzer(store, data_feed=counting_feed).full_report()
     assert sorted(counting_feed.calls) == sorted(TICKERS)
+    assert all(p["price_source"] == "quote" for p in report["positions"])
+    assert all(p["current_price"] == pytest.approx(105.0) for p in report["positions"])
 
 
 # ── Skip reason ───────────────────────────────────────────────────────────────
@@ -310,3 +312,145 @@ def test_the_as_of_date_follows_the_bar_actually_used(monkeypatch):
 
     position = PortfolioRiskAnalyzer(store).full_report()["positions"][0]
     assert position["price_date"] == "2026-07-31", "Aug 1-2 is a weekend"
+
+
+# ── The chart endpoint lagging behind the quote endpoint ──────────────────────
+#
+# Observed in production for AVGO: both yf.download and Ticker.history returned
+# a 2026-08-03 row with Close=null, while fast_info already carried that
+# session's real close. Falling back to the previous bar quoted Friday's price
+# on a Tuesday.
+
+def _frame_with_unfilled_latest_bar(price=100.0, rows=60):
+    frame = _frame(price, rows)
+    frame.loc[frame.index[-1], "Close"] = np.nan
+    return frame
+
+
+@pytest.fixture
+def live_quote_feed():
+    class Feed:
+        def __init__(self):
+            self.calls = []
+
+        def get_current_data(self, symbol):
+            self.calls.append(symbol)
+            return {"session": "closed", "price": 392.23, "since_close_pct": 1.2}
+
+    return Feed()
+
+
+def test_a_lagging_chart_endpoint_falls_through_to_the_quote(
+    monkeypatch, live_quote_feed
+):
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AVGO": _frame_with_unfilled_latest_bar(389.28)}, axis=1),
+    )
+
+    position = PortfolioRiskAnalyzer(
+        store, data_feed=live_quote_feed
+    ).full_report()["positions"][0]
+
+    assert position["current_price"] == pytest.approx(392.23)
+    assert position["price_source"] == "quote"
+    assert position["price_date"] is None, "a live quote belongs to no closed session"
+    assert live_quote_feed.calls == ["AVGO"]
+
+
+def test_without_a_quote_it_still_falls_back_to_the_last_close(monkeypatch):
+    """No feed configured — the older close beats no price at all."""
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AVGO": _frame_with_unfilled_latest_bar(389.28)}, axis=1),
+    )
+
+    position = PortfolioRiskAnalyzer(store).full_report()["positions"][0]
+    assert position["current_price"] == pytest.approx(389.28)
+    assert position["price_source"] == "bar"
+
+
+def test_a_broken_quote_does_not_lose_the_position(monkeypatch):
+    class BadFeed:
+        def get_current_data(self, symbol):
+            raise RuntimeError("429")
+
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AVGO": _frame_with_unfilled_latest_bar(389.28)}, axis=1),
+    )
+
+    position = PortfolioRiskAnalyzer(store, data_feed=BadFeed()).full_report()["positions"][0]
+    assert position["current_price"] == pytest.approx(389.28)
+    assert position["price_source"] == "bar"
+
+
+def test_a_nan_quote_is_not_preferred_over_a_real_close(monkeypatch):
+    class NanFeed:
+        def get_current_data(self, symbol):
+            return {"session": "closed", "price": float("nan")}
+
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AVGO": _frame_with_unfilled_latest_bar(389.28)}, axis=1),
+    )
+
+    position = PortfolioRiskAnalyzer(store, data_feed=NanFeed()).full_report()["positions"][0]
+    assert position["current_price"] == pytest.approx(389.28)
+    assert position["price_source"] == "bar"
+
+
+def test_the_atr_window_still_excludes_the_unfilled_bar(monkeypatch, live_quote_feed):
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    monkeypatch.setattr(
+        portfolio_risk.yf, "download",
+        lambda t, **kw: pd.concat({"AVGO": _frame_with_unfilled_latest_bar(389.28)}, axis=1),
+    )
+
+    position = PortfolioRiskAnalyzer(
+        store, data_feed=live_quote_feed
+    ).full_report()["positions"][0]
+    assert position["atr_pct"] is not None
+
+
+@pytest.mark.parametrize("volume", [0, np.nan, None])
+def test_a_blank_bar_is_detected_whatever_its_volume_looks_like(
+    monkeypatch, live_quote_feed, volume
+):
+    """Detection must not hinge on how yfinance happens to fill the blank row.
+
+    dropna(how="all") removes the row when every field is NaN and keeps it when
+    Volume is 0, so cleaning it before the check made the fallback fire only
+    sometimes.
+    """
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "closed")
+    frame = _frame(389.28)
+    frame.loc[frame.index[-1], ["High", "Low", "Close"]] = np.nan
+    if volume is not None:
+        frame["Volume"] = 1000
+        frame.loc[frame.index[-1], "Volume"] = volume
+
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    monkeypatch.setattr(portfolio_risk.yf, "download",
+                        lambda t, **kw: pd.concat({"AVGO": frame}, axis=1))
+
+    position = PortfolioRiskAnalyzer(
+        store, data_feed=live_quote_feed
+    ).full_report()["positions"][0]
+    assert position["price_source"] == "quote"
+    assert position["current_price"] == pytest.approx(392.23)

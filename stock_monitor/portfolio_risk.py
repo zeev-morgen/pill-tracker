@@ -269,28 +269,34 @@ class PortfolioRiskAnalyzer:
         module-level singleton built before the app owns a feed)."""
         self._feed = feed
 
-    def _extended_hours(self, ticker: str, session: str) -> dict:
-        """Pre/post-market price and move, when the feed can supply them.
+    def _quote(self, ticker: str) -> dict:
+        """Live quote for one ticker, or empty if it cannot be had.
 
-        The caller passes the session, which is pure clock arithmetic, so
-        outside pre/after hours this costs nothing. It used to query the feed
-        per holding and then throw the answer away once it saw the session was
-        'regular' or 'closed' — a wasted request per position, on every refresh.
+        This is Yahoo's quote endpoint, which is a different service from the
+        daily-bar chart endpoint and is frequently ahead of it: the chart API
+        can publish a session's row hours before it fills in the close, while
+        the quote already has the real number.
 
-        Returns empty rather than raising: extended-hours quotes are a display
-        extra, and losing them must not cost the whole portfolio report.
+        Never raises — a quote is an enrichment, and losing it must not cost
+        the whole portfolio report.
         """
-        if self._feed is None or session not in ("pre", "after"):
-            return {"session": session} if session else {}
+        if self._feed is None:
+            return {}
         try:
-            data = self._feed.get_current_data(ticker) or {}
+            return self._feed.get_current_data(ticker) or {}
         except Exception as exc:
-            logger.debug("extended-hours fetch failed for %s: %s", ticker, exc)
-            return {"session": session}
+            logger.debug("quote fetch failed for %s: %s", ticker, exc)
+            return {}
+
+    @staticmethod
+    def _extended_fields(quote: dict, session: str) -> dict:
+        """Pre/post-market columns, from a quote already fetched."""
+        if session not in ("pre", "after") or not quote:
+            return {"session": session} if session else {}
         return {
-            "session": data.get("session", session),
-            "extended_price": _finite(data.get("price")),
-            "extended_change_pct": _finite(data.get("since_close_pct")),
+            "session": quote.get("session", session),
+            "extended_price": _finite(quote.get("price")),
+            "extended_change_pct": _finite(quote.get("since_close_pct")),
         }
 
     def _fetch_histories(self, tickers: List[str]) -> Dict[str, "pd.DataFrame"]:
@@ -327,13 +333,17 @@ class PortfolioRiskAnalyzer:
             for ticker in tickers:
                 if ticker not in available:
                     continue
-                frame = data[ticker].dropna(how="all")
-                if not frame.empty:
+                frame = data[ticker]
+                # Emptiness is tested on a cleaned copy, but the frame handed
+                # back keeps its raw tail: the caller needs to see whether the
+                # newest bar has no close, and dropna would sometimes remove
+                # that evidence and sometimes not — a blank bar survives it
+                # when Volume comes back as 0 rather than NaN.
+                if not frame.dropna(how="all").empty:
                     histories[ticker] = frame
         elif len(tickers) == 1:
-            frame = data.dropna(how="all")
-            if not frame.empty:
-                histories[tickers[0]] = frame
+            if not data.dropna(how="all").empty:
+                histories[tickers[0]] = data
         return histories
 
     def collect_positions(self) -> List[dict]:
@@ -374,6 +384,9 @@ class PortfolioRiskAnalyzer:
                 # dropna(how="all") keeps it, because Volume is 0 rather than
                 # NaN. Take the last close that exists instead of the last row,
                 # which also keeps those blank bars out of the ATR window.
+                # Whether the newest row Yahoo returned had no close. That is
+                # the signal that the chart endpoint is behind the market.
+                bars_lagging = bool(pd.isna(history["Close"].iloc[-1]))
                 history = history[history["Close"].notna()]
                 if history.empty:
                     logger.warning("no priced bars for %s — skipping", holding.ticker)
@@ -383,6 +396,7 @@ class PortfolioRiskAnalyzer:
 
                 price = float(history["Close"].iloc[-1])
                 price_date = _bar_date(history.index[-1])
+                price_source = "bar"
                 # A non-finite price poisons every total it feeds, and NaN is
                 # rejected outright by the JSON encoder — so the position is
                 # dropped rather than allowed to fail the whole response.
@@ -391,6 +405,23 @@ class PortfolioRiskAnalyzer:
                     self._skipped.append(holding.ticker)
                     self._skip_reasons.append("unusable price")
                     continue
+
+                # Ask the quote endpoint when the bars cannot be the current
+                # price: either they are missing the newest session, or a
+                # session is under way and the last daily close is behind it.
+                # When the bars are current and the market is shut, the close
+                # *is* the price and the request is skipped — which is what
+                # keeps the common case at one request for the whole portfolio.
+                quote = (
+                    self._quote(holding.ticker)
+                    if bars_lagging or session in ("pre", "regular", "after")
+                    else {}
+                )
+                quote_price = _finite(quote.get("price"))
+                if quote_price and quote_price > 0:
+                    price = float(quote_price)
+                    price_source = "quote"
+                    price_date = None      # a live quote belongs to no closed session
 
                 atr = compute_atr(history, self.thresholds.atr_period)
                 fundamentals = fetch_fundamentals(holding.ticker)
@@ -417,8 +448,9 @@ class PortfolioRiskAnalyzer:
                         "asset_type_is_manual": holding.asset_type is not None,
                         "indexes": fundamentals.indexes,
                         "price_date": price_date,
+                        "price_source": price_source,
                         "purchase_date": holding.purchase_date,
-                        **self._extended_hours(holding.ticker, session),
+                        **self._extended_fields(quote, session),
                     }
                 )
             except Exception as exc:
@@ -469,6 +501,7 @@ class PortfolioRiskAnalyzer:
                     "price_date": (
                         p["price_date"].isoformat() if p.get("price_date") else None
                     ),
+                    "price_source": p.get("price_source", "bar"),
                     "price_is_stale": (
                         p.get("price_date") is not None
                         and latest_bar is not None
