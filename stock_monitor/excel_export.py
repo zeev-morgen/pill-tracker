@@ -36,26 +36,35 @@ _SESSION_LABELS = {"pre": "פרי-מרקט", "regular": "מסחר רגיל",
 
 
 def _positions_frame(report: dict) -> pd.DataFrame:
+    """The holdings table as it appears on screen, same columns, same order.
+
+    The point of the export is to be that table in a spreadsheet, so the layout
+    follows the dashboard rather than inventing its own. Two columns the screen
+    shows visually rather than as text are spelled out here — where the price
+    came from, and the pre/post-market move — because a file outlives the
+    session it was exported from.
+    """
     rows = []
     for p in report.get("positions", []):
+        source = "ציטוט חי" if p.get("price_source") == "quote" else "סגירה"
+        if p.get("price_is_stale"):
+            source = "סגירה (מסשן קודם)"
         rows.append({
             "סמל": p.get("ticker"),
             "כמות": p.get("quantity"),
             "מחיר כניסה": p.get("entry_price"),
             "מחיר נוכחי": p.get("current_price"),
-            # Without this the sheet cannot tell a live quote from a close that
-            # happens to be several sessions old.
-            "מקור המחיר": "ציטוט חי" if p.get("price_source") == "quote" else "סגירה",
             "נכון לתאריך": _as_date(p.get("price_date")),
-            "מחיר ישן?": "כן" if p.get("price_is_stale") else "",
-            "שווי שוק": p.get("market_value"),
+            "מקור המחיר": source,
+            "פרי / פוסט": p.get("extended_price"),
+            "שינוי פרי / פוסט (%)": p.get("extended_change_pct"),
+            "שווי": p.get("market_value"),
             "רווח/הפסד ($)": p.get("pnl_value"),
             "רווח/הפסד (%)": p.get("pnl_pct"),
+            "ימי החזקה": p.get("holding_days"),
             "ATR (%)": p.get("atr_pct"),
             "סקטור": p.get("sector"),
-            "סוג נכס": "קרן סל" if p.get("asset_type") == "etf" else "מניה",
             "תאריך קנייה": _as_date(p.get("purchase_date")),
-            "ימי החזקה": p.get("holding_days"),
         })
     return pd.DataFrame(rows)
 
@@ -85,47 +94,6 @@ def _journal_frame(entries: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _summary_frame(report: dict, journal: dict) -> pd.DataFrame:
-    volatility = report.get("volatility") or {}
-    sector = report.get("sector") or {}
-    allocation = (report.get("allocation") or {}).get("by_asset_type") or {}
-    summary = journal.get("summary") or {}
-
-    pairs = [
-        ("נוצר בתאריך", datetime.now().strftime("%Y-%m-%d %H:%M")),
-        ("מספר פוזיציות", len(report.get("positions") or [])),
-        ("שווי תיק כולל", report.get("total_value")),
-        ("רווח/הפסד לא ממומש", report.get("total_pnl_value")),
-        ("", ""),
-        ("חשיפה לתנודתיות גבוהה (%)", volatility.get("exposure_pct")),
-        ("סף התראה לתנודתיות (%)", volatility.get("threshold_pct")),
-        ("סף ריכוזיות סקטוריאלית (%)", sector.get("threshold_pct")),
-        ("במדדים / קרנות סל (%)", allocation.get("etf_pct")),
-        ("במניות בודדות (%)", allocation.get("stock_pct")),
-        ("", ""),
-        ("עסקאות סגורות", summary.get("count")),
-        ("רווח/הפסד ממומש", summary.get("total_pnl")),
-        ("אחוז עסקאות רווחיות", summary.get("win_rate_pct")),
-        ("זמן החזקה ממוצע (ימים)", summary.get("avg_holding_days")),
-    ]
-    skipped = report.get("skipped_tickers") or []
-    if skipped:
-        # Otherwise the totals silently exclude them and the file looks complete.
-        pairs += [("", ""), ("מניות שלא ניתן היה לתמחר", ", ".join(skipped))]
-
-    return pd.DataFrame(pairs, columns=["נתון", "ערך"])
-
-
-def _sector_frame(report: dict) -> pd.DataFrame:
-    rows = [
-        {"סקטור": s.get("sector"),
-         "שווי": s.get("market_value"),
-         "משקל בתיק (%)": s.get("weight_pct")}
-        for s in (report.get("sector") or {}).get("sectors", [])
-    ]
-    return pd.DataFrame(rows)
-
-
 def _as_date(value) -> Optional[date]:
     """ISO strings become real dates so Excel can sort and filter them."""
     if not value:
@@ -146,8 +114,9 @@ _FORMATS = {
     "מחיר כניסה": _MONEY,
     "מחיר יציאה": _MONEY,
     "מחיר נוכחי": _MONEY,
-    "שווי שוק": _MONEY,
     "שווי": _MONEY,
+    "פרי / פוסט": _MONEY,
+    "שינוי פרי / פוסט (%)": _PERCENT,
     "רווח/הפסד ($)": _MONEY,
     "רווח/הפסד (%)": _PERCENT,
     "ATR (%)": _PERCENT,
@@ -204,28 +173,70 @@ def _style(worksheet, frame: pd.DataFrame) -> None:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
 
 
-def build_workbook(report: dict, journal: dict) -> bytes:
-    """Render the portfolio and journal as a .xlsx file.
+def _append_totals(worksheet, frame: pd.DataFrame, report: dict) -> None:
+    """A totals row under the table, plus a note for anything left out.
 
-    Takes the same dictionaries the API serves, so the numbers in the sheet are
-    by construction the numbers on the screen.
+    Mirrors the line above the table on screen ("שווי תיק … רווח/הפסד כולל").
+    The totals are real SUM formulas, not baked numbers, so they still add up
+    if rows are filtered or edited in Excel.
+    """
+    from openpyxl.styles import Border, Font, Side
+
+    if frame.empty:
+        return
+
+    last = worksheet.max_row
+    total_row = last + 1
+    columns = list(frame.columns)
+
+    label_cell = worksheet.cell(row=total_row, column=1, value='סה"כ')
+    label_cell.font = Font(bold=True)
+    top = Border(top=Side(style="double"))
+    for index in range(1, len(columns) + 1):
+        worksheet.cell(row=total_row, column=index).border = top
+
+    for column in ("שווי", "רווח/הפסד ($)"):
+        if column not in columns:
+            continue
+        index = columns.index(column) + 1
+        letter = worksheet.cell(row=1, column=index).column_letter
+        cell = worksheet.cell(row=total_row, column=index)
+        cell.value = f"=SUM({letter}2:{letter}{last})"
+        cell.number_format = _MONEY
+        cell.font = Font(bold=True)
+
+    note_row = total_row + 2
+    worksheet.cell(row=note_row, column=1,
+                   value=f"נוצר: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    skipped = report.get("skipped_tickers") or []
+    if skipped:
+        # Without this the totals quietly exclude them and the file reads as
+        # a complete picture of the portfolio when it is not.
+        cell = worksheet.cell(
+            row=note_row + 1, column=1,
+            value="לא נכללו (לא ניתן היה לשלוף מחיר): " + ", ".join(skipped),
+        )
+        cell.font = Font(bold=True, color="B00020")
+
+
+def build_workbook(report: dict, journal: dict) -> bytes:
+    """Render the holdings table, and the trade journal, as a .xlsx file.
+
+    Takes the same dictionaries the API serves, so the sheet is by construction
+    the table on the screen.
     """
     sheets = {
-        "סיכום": _summary_frame(report, journal),
-        "פוזיציות": _positions_frame(report),
+        "התיק שלי": _positions_frame(report),
         "יומן מסחר": _journal_frame(journal.get("entries") or []),
-        "סקטורים": _sector_frame(report),
     }
 
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for name, frame in sheets.items():
-            # An empty sheet still gets written, with its headers: a missing tab
-            # reads as a broken export rather than an empty journal.
-            if frame.empty and name in ("פוזיציות", "יומן מסחר", "סקטורים"):
-                frame = pd.DataFrame(columns=frame.columns)
             frame.to_excel(writer, sheet_name=name, index=False)
             _style(writer.sheets[name], frame)
+            if name == "התיק שלי":
+                _append_totals(writer.sheets[name], frame, report)
 
     return buffer.getvalue()
 

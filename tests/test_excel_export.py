@@ -57,8 +57,17 @@ def workbook():
 
 # ── Structure ─────────────────────────────────────────────────────────────────
 
-def test_every_sheet_is_present(workbook):
-    assert workbook.sheetnames == ["סיכום", "פוזיציות", "יומן מסחר", "סקטורים"]
+def test_the_workbook_is_the_holdings_table_and_the_journal(workbook):
+    assert workbook.sheetnames == ["התיק שלי", "יומן מסחר"]
+
+
+def test_the_columns_mirror_the_dashboard_table(workbook):
+    """The export exists to be that table, so the layout follows the screen."""
+    assert [c.value for c in workbook["התיק שלי"][1]] == [
+        "סמל", "כמות", "מחיר כניסה", "מחיר נוכחי", "נכון לתאריך", "מקור המחיר",
+        "פרי / פוסט", "שינוי פרי / פוסט (%)", "שווי", "רווח/הפסד ($)",
+        "רווח/הפסד (%)", "ימי החזקה", "ATR (%)", "סקטור", "תאריך קנייה",
+    ]
 
 
 def test_sheets_are_right_to_left(workbook):
@@ -66,7 +75,7 @@ def test_sheets_are_right_to_left(workbook):
 
 
 def test_the_header_row_is_frozen_and_filterable(workbook):
-    sheet = workbook["פוזיציות"]
+    sheet = workbook["התיק שלי"]
     assert sheet.freeze_panes == "A2"
     assert sheet.auto_filter.ref is not None
 
@@ -82,7 +91,7 @@ def _row(sheet, ticker):
 
 
 def test_positions_carry_their_numbers(workbook):
-    row = _row(workbook["פוזיציות"], "AVGO")
+    row = _row(workbook["התיק שלי"], "AVGO")
     assert row["כמות"] == pytest.approx(9.76)
     assert row["מחיר נוכחי"] == pytest.approx(392.23)
     assert row["רווח/הפסד ($)"] == pytest.approx(119.36)
@@ -91,35 +100,48 @@ def test_positions_carry_their_numbers(workbook):
 
 def test_numbers_are_numbers_not_text(workbook):
     """The file should be something you can total and pivot, not just read."""
-    row = _row(workbook["פוזיציות"], "AVGO")
-    for column in ("כמות", "מחיר כניסה", "מחיר נוכחי", "שווי שוק",
+    row = _row(workbook["התיק שלי"], "AVGO")
+    for column in ("כמות", "מחיר כניסה", "מחיר נוכחי", "שווי",
                    "רווח/הפסד ($)", "רווח/הפסד (%)", "ATR (%)"):
         assert isinstance(row[column], (int, float)), f"{column} came through as text"
 
 
 def test_a_loss_stays_negative(workbook):
-    assert _row(workbook["פוזיציות"], "SEDG")["רווח/הפסד ($)"] == pytest.approx(-350.4)
+    assert _row(workbook["התיק שלי"], "SEDG")["רווח/הפסד ($)"] == pytest.approx(-350.4)
 
 
 def test_dates_are_real_dates(workbook):
     """So Excel can sort and filter them rather than treating them as strings."""
-    row = _row(workbook["פוזיציות"], "AVGO")
+    row = _row(workbook["התיק שלי"], "AVGO")
     assert row["תאריך קנייה"].date() == date(2026, 6, 20)
 
 
 def test_the_price_source_is_recorded(workbook):
-    """A live quote and an old close must not look identical in the sheet."""
-    sheet = workbook["פוזיציות"]
+    """A live quote, a close, and an old close must not look identical here.
+
+    The screen distinguishes them with colour and a label; a spreadsheet
+    outlives the session, so it needs the distinction in words.
+    """
+    sheet = workbook["התיק שלי"]
     assert _row(sheet, "AVGO")["מקור המחיר"] == "ציטוט חי"
-    assert _row(sheet, "SEDG")["מקור המחיר"] == "סגירה"
-    assert _row(sheet, "SEDG")["מחיר ישן?"] == "כן"
-    # An empty cell reads back as None, not "".
-    assert not _row(sheet, "AVGO")["מחיר ישן?"]
+    assert _row(sheet, "SEDG")["מקור המחיר"] == "סגירה (מסשן קודם)"
 
 
-def test_asset_type_is_translated(workbook):
-    assert _row(workbook["פוזיציות"], "SEDG")["סוג נכס"] == "קרן סל"
-    assert _row(workbook["פוזיציות"], "AVGO")["סוג נכס"] == "מניה"
+def test_a_current_close_is_not_flagged_as_old():
+    fresh = {"positions": [dict(REPORT["positions"][1], price_is_stale=False)]}
+    book = load_workbook(BytesIO(excel_export.build_workbook(
+        fresh, {"entries": [], "summary": {}})))
+    assert _row(book["התיק שלי"], "SEDG")["מקור המחיר"] == "סגירה"
+
+
+def test_the_pre_post_market_columns_are_carried(workbook):
+    report = {"positions": [dict(REPORT["positions"][0],
+                                 extended_price=394.1, extended_change_pct=0.48)]}
+    book = load_workbook(BytesIO(excel_export.build_workbook(
+        report, {"entries": [], "summary": {}})))
+    row = _row(book["התיק שלי"], "AVGO")
+    assert row["פרי / פוסט"] == pytest.approx(394.1)
+    assert row["שינוי פרי / פוסט (%)"] == pytest.approx(0.48)
 
 
 def test_the_journal_sheet_carries_the_ai_verdict(workbook):
@@ -130,24 +152,34 @@ def test_the_journal_sheet_carries_the_ai_verdict(workbook):
     assert row["מכירה חלקית"] == "40%"
 
 
-def test_the_summary_reports_skipped_tickers(workbook):
+def test_skipped_tickers_are_noted_under_the_table(workbook):
     """Otherwise the totals quietly exclude them and the file looks complete."""
-    values = [str(row[1]) for row in workbook["סיכום"].iter_rows(values_only=True)]
-    assert "ARYT" in " ".join(values)
+    text = " ".join(
+        str(c.value) for row in workbook["התיק שלי"].iter_rows() for c in row
+        if c.value is not None
+    )
+    assert "ARYT" in text
 
 
-def test_the_summary_carries_the_headline_totals(workbook):
-    pairs = {row[0]: row[1] for row in workbook["סיכום"].iter_rows(values_only=True)}
-    assert pairs["שווי תיק כולל"] == pytest.approx(5005.76)
-    assert pairs["רווח/הפסד ממומש"] == pytest.approx(136.0)
+def test_a_totals_row_closes_the_table(workbook):
+    """Mirrors the portfolio total shown above the table on screen."""
+    sheet = workbook["התיק שלי"]
+    headers = [c.value for c in sheet[1]]
+    labels = [sheet.cell(row=r, column=1).value for r in range(2, sheet.max_row + 1)]
+    total_row = labels.index('סה"כ') + 2
+
+    for column in ("שווי", "רווח/הפסד ($)"):
+        cell = sheet.cell(row=total_row, column=headers.index(column) + 1)
+        # A live formula, so filtering or editing rows keeps the total honest.
+        assert str(cell.value).startswith("=SUM(")
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 def test_money_columns_have_a_money_format(workbook):
-    sheet = workbook["פוזיציות"]
+    sheet = workbook["התיק שלי"]
     headers = [c.value for c in sheet[1]]
-    column = headers.index("שווי שוק") + 1
+    column = headers.index("שווי") + 1
     assert sheet.cell(row=2, column=column).number_format == '#,##0.00'
 
 
@@ -157,8 +189,8 @@ def test_an_empty_portfolio_still_produces_a_valid_file():
     empty = {"positions": [], "total_value": 0, "total_pnl_value": 0}
     book = load_workbook(BytesIO(excel_export.build_workbook(
         empty, {"entries": [], "summary": {}})))
-    assert "פוזיציות" in book.sheetnames
-    assert book["פוזיציות"].max_row >= 1     # headers survive
+    assert "התיק שלי" in book.sheetnames
+    assert book["התיק שלי"].max_row >= 1     # headers survive
 
 
 def test_missing_optional_fields_do_not_break_the_build():
@@ -172,7 +204,7 @@ def test_an_unparsable_date_becomes_blank_rather_than_raising():
     report = {"positions": [dict(REPORT["positions"][0], purchase_date="not a date")]}
     book = load_workbook(BytesIO(excel_export.build_workbook(
         report, {"entries": [], "summary": {}})))
-    assert _row(book["פוזיציות"], "AVGO")["תאריך קנייה"] is None
+    assert _row(book["התיק שלי"], "AVGO")["תאריך קנייה"] is None
 
 
 def test_the_filename_carries_the_date():
@@ -228,3 +260,26 @@ def test_the_export_is_not_public():
     from stock_monitor.webhook_server import _PUBLIC_PATHS
 
     assert not any("/api/portfolio/export".startswith(p) for p in _PUBLIC_PATHS)
+
+
+def test_the_totals_formula_spans_every_data_row():
+    """A range that stops short would under-report the portfolio silently."""
+    import re
+
+    report = {"positions": [
+        dict(REPORT["positions"][0], ticker=t, market_value=100.0, pnl_value=10.0)
+        for t in ("AAA", "BBB", "CCC", "DDD")
+    ]}
+    book = load_workbook(BytesIO(excel_export.build_workbook(
+        report, {"entries": [], "summary": {}})))
+    sheet = book["התיק שלי"]
+    headers = [c.value for c in sheet[1]]
+    column = headers.index("שווי") + 1
+    labels = [sheet.cell(row=r, column=1).value for r in range(2, sheet.max_row + 1)]
+    total_row = labels.index('סה"כ') + 2
+
+    formula = sheet.cell(row=total_row, column=column).value
+    first, last = re.search(r"=SUM\([A-Z]+(\d+):[A-Z]+(\d+)\)", formula).groups()
+    assert int(first) == 2, "the range must start at the first data row"
+    assert int(last) == total_row - 1, "the range must reach the last data row"
+    assert int(last) - int(first) + 1 == 4
