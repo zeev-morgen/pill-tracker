@@ -45,6 +45,7 @@ from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
 from .store import alert_store, portfolio_store, watchlist_store
 from .telegram_bot import TelegramCommandBot
+from .version import build_label
 from .webhook_server import create_webhook_app
 
 #: The pre-market news scan runs 30 minutes before the 09:30 ET opening bell.
@@ -148,6 +149,17 @@ class StockMonitorApp:
     # ── Core monitoring loop ──────────────────────────────────────────────────
 
     async def monitor_cycle(self) -> None:
+        """Scheduler entry point. The work itself runs off the event loop.
+
+        The poll is network-bound from end to end — yfinance quotes in,
+        Telegram sends out, a database read for the watchlist — and awaiting it
+        here froze the web server for the poll's full duration. When Yahoo is
+        slow that is tens of seconds, during which /health cannot answer;
+        Render gives the probe five seconds and then restarts the instance.
+        """
+        await asyncio.to_thread(self._run_cycle)
+
+    def _run_cycle(self) -> None:
         session   = get_market_session()
         stock_map = {sc.symbol: sc for sc in self.watched_stocks()}
         prune_price_cache(stock_map)
@@ -263,6 +275,10 @@ class StockMonitorApp:
 def run_app(config_path: str = "config/config.yaml") -> None:
     config = load_config(config_path)
     setup_logging(config.logging.level, config.logging.file)
+    # Warm the build identity before serving. It is lru_cached but the first
+    # call may shell out to git, and the first caller must not be the host's
+    # health probe — that request has a five-second budget.
+    logging.getLogger(__name__).info("Build: %s", build_label())
     # Connect to PostgreSQL when DATABASE_URL is set; otherwise the stores stay
     # in memory and the monitor runs exactly as before.
     db.init_db()

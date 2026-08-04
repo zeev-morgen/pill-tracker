@@ -124,10 +124,14 @@ class NewsMonitor:
         return collected
 
     async def daily_scan(self) -> None:
-        """Scheduler entry point — signature matches the other daily jobs."""
+        """Scheduler entry point — signature matches the other daily jobs.
+
+        asyncio.to_thread rather than get_event_loop().run_in_executor: the
+        latter is deprecated and raises outright when no loop is current.
+        """
         import asyncio
 
-        await asyncio.get_event_loop().run_in_executor(None, self.scan)
+        await asyncio.to_thread(self.scan)
 
     # -- reading ------------------------------------------------------------
 

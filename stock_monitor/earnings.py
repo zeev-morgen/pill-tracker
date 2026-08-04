@@ -1,5 +1,6 @@
 """Earnings date monitor — alerts N days before a tracked symbol reports results."""
 
+import asyncio
 import logging
 from datetime import date, datetime
 from typing import List, Optional, Set
@@ -29,7 +30,15 @@ class EarningsMonitor:
     # ── Public ────────────────────────────────────────────────────────────────
 
     async def daily_check(self) -> None:
-        """Scheduled once per weekday morning. Fires alerts where due."""
+        """Scheduled once per weekday morning. Fires alerts where due.
+
+        Runs in a worker thread: every symbol costs a blocking yfinance
+        calendar lookup, and holding the event loop for all of them starves
+        the web server — including the health probe the host restarts us over.
+        """
+        await asyncio.to_thread(self._check_all)
+
+    def _check_all(self) -> None:
         logger.info("EarningsMonitor: daily check (%d symbols)", len(self._symbols))
         today = datetime.now(NYSE_TZ).date()
         for symbol in self._symbols:
