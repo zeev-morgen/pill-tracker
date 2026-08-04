@@ -399,7 +399,7 @@ async def dashboard():
 
 
 _HTML = """<!DOCTYPE html>
-<html lang="en">
+<html lang="he" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -422,7 +422,7 @@ _HTML = """<!DOCTYPE html>
     padding: 3px 10px; border-radius: 20px; font-size: 0.75rem;
     font-weight: 600; background: #1f6feb33; color: var(--blue); border: 1px solid #1f6feb;
   }
-  #server-time { margin-left: auto; color: var(--muted); font-size: 0.8rem; }
+  #server-time { margin-inline-start: auto; color: var(--muted); font-size: 0.8rem; }
   #refresh-indicator { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
   /* 1320, not 1200: the portfolio table carries eleven columns plus the row
      actions and needed the extra width to fit without a horizontal scroll. */
@@ -439,13 +439,34 @@ _HTML = """<!DOCTYPE html>
   /* max-content, not 100%: the row-action buttons cannot wrap, so a table
      pinned to the container width has them clipped instead of scrolled. */
   #holdings-wrap table { width: max-content; min-width: 100%; }
-  #holdings-wrap td, #holdings-wrap th { padding-left: 12px; padding-right: 12px; }
+  #holdings-wrap td, #holdings-wrap th { padding-inline: 12px; }
   /* Icons rather than labels: with eleven columns the words pushed the actions
      off-screen. Each button carries a title, so hovering still explains it. */
   .row-actions { white-space: nowrap; }
-  .row-actions .btn { padding: 5px 8px; margin-left: 2px; font-size: 0.9rem; }
+  .row-actions .btn { padding: 5px 8px; margin-inline-start: 2px; font-size: 0.9rem; }
+  /* The page is RTL, but most of what it shows is not: tickers, prices and
+     percentages are Latin/numeric. `plaintext` picks each element's direction
+     from its own first strong character, so "45 ימים" reads RTL while
+     "-$134.00" and "AMZN" read LTR. Without it a leading currency sign or
+     minus is treated as neutral and lands on the wrong end of the number.
+     Table *cells* are excluded: they hold several elements whose order must
+     follow the page, so the first row-action button stays rightmost. Header
+     cells are single strings with no such ordering, and need it — "ATR%"
+     otherwise renders as "%ATR". */
+  th, .chip, .entry-stats b, .summary b, .news-meta, .split-legend span,
+  #portfolio-total {
+    unicode-bidi: plaintext;
+  }
+  /* Always LTR, never auto-detected: a timestamp ending in "UTC" has its only
+     strong character at the end, which flips the whole string. */
+  #server-time, #build-label, .alert-ts { direction: ltr; unicode-bidi: isolate; }
+  /* Ticker and amount fields are typed left-to-right whatever the page does. */
+  input[type="number"], input[type="date"], #f-ticker, #w-symbol {
+    direction: ltr; text-align: left;
+  }
+
   table { width: 100%; border-collapse: collapse; }
-  th { padding: 10px 18px; text-align: left; font-size: 0.75rem; color: var(--muted);
+  th { padding: 10px 18px; text-align: start; font-size: 0.75rem; color: var(--muted);
     font-weight: 500; border-bottom: 1px solid var(--border); }
   td { padding: 12px 18px; font-size: 0.9rem; border-bottom: 1px solid #21262d; }
   tr:last-child td { border-bottom: none; }
@@ -495,7 +516,7 @@ _HTML = """<!DOCTYPE html>
   button.btn {
     background: #21262d; color: var(--text); border: 1px solid var(--border);
     padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem;
-    font-family: inherit; margin-left: 4px;
+    font-family: inherit; margin-inline-start: 4px;
   }
   button.btn:hover { background: #30363d; }
   button.btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
@@ -539,14 +560,11 @@ _HTML = """<!DOCTYPE html>
   .index-detail { color: var(--muted); font-size: 0.78rem; margin-top: 10px; }
   .split-legend { display: flex; gap: 18px; font-size: 0.82rem; flex-wrap: wrap; }
   .split-legend b { font-variant-numeric: tabular-nums; }
-  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-left: 6px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-inline-end: 6px; }
   .modal-actions { display: flex; gap: 8px; margin-top: 18px; }
   .form-error { color: var(--red); font-size: 0.78rem; margin-top: 8px; min-height: 15px; }
   .empty { padding: 32px; text-align: center; color: var(--muted); font-size: 0.9rem; }
-  .analysis-text {
-    padding: 18px; white-space: pre-wrap; line-height: 1.7; font-size: 0.9rem;
-    direction: rtl; text-align: right;
-  }
+  .analysis-text { padding: 18px; white-space: pre-wrap; line-height: 1.7; font-size: 0.9rem; }
   #build-label { color: var(--muted); font-size: 0.72rem; }
 
   /* ── Watchlist chips ──────────────────────────────────── */
@@ -604,16 +622,13 @@ _HTML = """<!DOCTYPE html>
     font-size: 0.75rem; color: var(--muted); text-transform: uppercase;
     letter-spacing: .05em; margin-bottom: 8px; font-weight: 600;
   }
-  .entry-section .body {
-    white-space: pre-wrap; line-height: 1.7; font-size: 0.88rem;
-    direction: rtl; text-align: right;
-  }
+  .entry-section .body { white-space: pre-wrap; line-height: 1.7; font-size: 0.88rem; }
   textarea.note {
     width: 100%; min-height: 70px; padding: 9px 11px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--bg); color: var(--text);
-    font-size: 0.88rem; font-family: inherit; direction: rtl; resize: vertical;
+    font-size: 0.88rem; font-family: inherit; resize: vertical;
   }
-  .save-hint { font-size: 0.75rem; color: var(--green); margin-right: 8px; }
+  .save-hint { font-size: 0.75rem; color: var(--green); margin-inline-start: 8px; }
 
   /* ── News ─────────────────────────────────────────────── */
   .news-item { padding: 13px 18px; border-bottom: 1px solid #21262d; }
@@ -681,7 +696,7 @@ _HTML = """<!DOCTYPE html>
         <button class="btn primary" onclick="openModal()">+ הוספת פוזיציה</button>
         <button class="btn" onclick="analyzePortfolio()">🧠 ניתוח AI של התיק</button>
         <button class="btn" onclick="loadPortfolio()">רענון</button>
-        <span id="portfolio-total" class="volume" style="margin-right:12px"></span>
+        <span id="portfolio-total" class="volume" style="margin-inline-start:12px"></span>
       </div>
       <div id="holdings-wrap"><div class="empty">טוען…</div></div>
     </div>
@@ -725,7 +740,7 @@ _HTML = """<!DOCTYPE html>
       <div class="card-title">חדשות על מניות בתיק</div>
       <div class="card-actions">
         <button class="btn" onclick="loadNews(true)">סריקה מחדש</button>
-        <span id="news-scanned" class="volume" style="margin-right:12px"></span>
+        <span id="news-scanned" class="volume" style="margin-inline-start:12px"></span>
       </div>
       <div id="news-wrap"><div class="empty">טוען…</div></div>
     </div>
@@ -827,7 +842,7 @@ function pctCell(val) {
   if (val == null) return '<span class="flat">—</span>';
   const cls  = val > 0 ? 'up' : val < 0 ? 'down' : 'flat';
   const sign = val >= 0 ? '+' : '';
-  return `<span class="${cls}">${sign}${val.toFixed(2)}%</span>`;
+  return `<bdi class="${cls}">${sign}${val.toFixed(2)}%</bdi>`;
 }
 
 function renderStocks(stocks) {
@@ -910,15 +925,15 @@ let sectorChart = null, indexChart = null, currentPositions = [];
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 /* Losses read as -$134.00, never $-134.00. */
-const money = (n) => n == null ? '—' :
-  (n < 0 ? '-$' : '$') +
-  Math.abs(Number(n)).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const money = (n) => n == null ? '—' : '<bdi>' + (n < 0 ? '-$' : '$') +
+  Math.abs(Number(n)).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) +
+  '</bdi>';
 
 /* The page is laid out LTR, so a Hebrew word after a number comes out reversed
    unless the run is explicitly marked. */
 const days = (n) => n == null ? '—'
   : n === 0 ? 'היום'
-  : `<bdi dir="rtl">${n} ימים</bdi>`;
+  : `${n} ימים`;
 
 async function api(path, options = {}) {
   const res = await fetch(path, {headers: {'Content-Type': 'application/json'}, ...options});
@@ -1288,18 +1303,18 @@ function renderEntry(e) {
   const lightCls = e.rating ? 'light-' + e.rating : 'light-none';
   const lightText = e.rating ? RATING_LABEL[e.rating] : 'טרם נותח';
   const partial = e.is_partial
-    ? `<span class="badge" dir="rtl">מכירה חלקית · ${(e.fraction_sold * 100).toFixed(0)}%</span>` : '';
+    ? `<span class="badge">מכירה חלקית · ${(e.fraction_sold * 100).toFixed(0)}%</span>` : '';
 
   const analysis = e.ai_analysis
     ? `<div class="body">${esc(e.ai_analysis)}</div>`
-    : `<div class="volume" dir="rtl">טרם נותח. הניתוח נשמר במסד הנתונים ומורץ פעם אחת בלבד.</div>`;
+    : `<div class="volume">טרם נותח. הניתוח נשמר במסד הנתונים ומורץ פעם אחת בלבד.</div>`;
 
   return `<div class="entry">
     <div class="entry-head">
       <span class="light ${lightCls}" title="${lightText}"></span>
       <span class="symbol">${esc(e.ticker)}</span>
       ${partial}
-      <span class="grow volume" dir="rtl">נמכר ב-${esc(e.sold_date)}</span>
+      <span class="grow volume">נמכר ב-${esc(e.sold_date)}</span>
       <button class="btn" onclick="analyzeEntry(${e.id})">
         ${e.ai_analysis ? '🧠 ניתוח מחדש' : '🧠 נתח עסקה'}
       </button>
@@ -1307,7 +1322,10 @@ function renderEntry(e) {
 
     <div class="entry-stats">
       <div><span>כמות</span><b>${e.quantity}</b></div>
-      <div><span>כניסה → יציאה</span><b>${money(e.entry_price)} → ${money(e.exit_price)}</b></div>
+      <!-- No arrow in the Hebrew label: arrows are bidi-mirrored, so the glyph
+           flips against the reading flow. The values below are an isolated LTR
+           run, where the arrow is unambiguous. -->
+      <div><span>כניסה / יציאה</span><b>${money(e.entry_price)} → ${money(e.exit_price)}</b></div>
       <div><span>תשואה</span><b class="${pnlCls}">${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%</b></div>
       <div><span>רווח/הפסד</span><b class="${pnlCls}">${money(e.pnl_value)}</b></div>
       <div><span>זמן החזקה</span><b>${days(e.holding_days)}</b></div>
@@ -1385,8 +1403,8 @@ function renderNews(data) {
   wrap.innerHTML = data.items.map((n) => {
     const age = n.age_hours == null ? ''
       : n.age_hours < 3
-        ? `<bdi class="news-fresh" dir="rtl">לפני ${n.age_hours.toFixed(1)} שעות</bdi>`
-        : `<bdi dir="rtl">לפני ${n.age_hours.toFixed(1)} שעות</bdi>`;
+        ? `<span class="news-fresh">לפני ${n.age_hours.toFixed(1)} שעות</span>`
+        : `לפני ${n.age_hours.toFixed(1)} שעות`;
     const title = n.link
       ? `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>`
       : esc(n.title);
