@@ -13,8 +13,9 @@ from typing import Dict, List
 import pandas as pd
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from . import excel_export
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import (
     ClosedPosition,
@@ -429,6 +430,49 @@ async def api_news(max_age_minutes: int = 60):
         raise HTTPException(status_code=502, detail="שגיאה בשליפת החדשות") from exc
 
 
+# ── Excel export ──────────────────────────────────────────────────────────────
+
+@router.get("/api/portfolio/export")
+async def api_export_portfolio():
+    """The portfolio and the trade journal as a downloadable .xlsx.
+
+    Built from the same report the dashboard renders, so the sheet cannot drift
+    from the screen. Runs in a worker thread: the report does blocking network
+    work and the workbook is assembled in memory.
+    """
+    def _build() -> bytes:
+        get_data_feed()
+        report = _risk_analyzer.full_report()
+        entries = [e.as_dict() for e in closed_position_store.all()]
+        wins = [e for e in entries if e["pnl_pct"] > 0]
+        with_days = [e["holding_days"] for e in entries if e["holding_days"] is not None]
+        journal = {
+            "entries": entries,
+            "summary": {
+                "count": len(entries),
+                "total_pnl": round(sum(e["pnl_value"] for e in entries), 2),
+                "win_rate_pct": round(len(wins) / len(entries) * 100.0, 1) if entries else 0.0,
+                "avg_holding_days": round(sum(with_days) / len(with_days)) if with_days else None,
+            },
+        }
+        return excel_export.build_workbook(report, journal)
+
+    try:
+        content = await run_in_threadpool(_build)
+    except Exception as exc:
+        logger.error("Excel export failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=502, detail=f"יצירת קובץ האקסל נכשלה ({exc.__class__.__name__})"
+        ) from exc
+
+    name = excel_export.filename()
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
 # ── Diagnostics ───────────────────────────────────────────────────────────────
 
 @router.get("/api/diagnostics/{ticker}")
@@ -828,7 +872,7 @@ _HTML = """<!DOCTYPE html>
         <button class="btn primary" onclick="openModal()">+ הוספת פוזיציה</button>
         <button class="btn" onclick="analyzePortfolio()">🧠 ניתוח AI של התיק</button>
         <button class="btn" onclick="loadPortfolio()">רענון</button>
-        <button class="btn" onclick="runDiagnostics()" title="מה Yahoo מחזיר בפועל">🔧 אבחון נתונים</button>
+        <button class="btn" onclick="exportExcel(this)" title="הורדת התיק ויומן המסחר כקובץ Excel">⬇️ הורדת אקסל</button>
         <span id="portfolio-total" class="volume" style="margin-inline-start:12px"></span>
       </div>
       <div id="holdings-wrap"><div class="empty">טוען…</div></div>
@@ -1413,23 +1457,35 @@ function analyzePortfolio() {
                      'מנתח את התיק… (עשוי לקחת עד דקה)');
 }
 
-/* Prints what each Yahoo endpoint returns for the first holding. When prices
-   look wrong, this is the difference between diagnosing and guessing. */
-async function runDiagnostics() {
-  const ticker = (currentPositions[0] || {}).ticker;
-  if (!ticker) { alert('אין פוזיציות לאבחון'); return; }
-  const card = document.getElementById('analysis-card');
-  const body = document.getElementById('analysis-body');
-  document.getElementById('analysis-title').textContent = `אבחון נתונים — ${ticker}`;
-  card.style.display = 'block';
-  body.textContent = 'בודק מול Yahoo…';
-  card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+/* Downloads the workbook. Built as a blob rather than a plain link so a failed
+   request surfaces its error instead of navigating away to a broken page —
+   and so the download inherits the page's auth headers. */
+async function exportExcel(button) {
+  // The button is passed in rather than read off the global `event`, which is
+  // deprecated and undefined outside a direct handler call.
+  const label = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = 'מכין…'; }
   try {
-    const data = await api('/api/diagnostics/' + encodeURIComponent(ticker));
-    body.innerHTML = `<pre dir="ltr" style="text-align:left;overflow-x:auto;margin:0">` +
-      esc(JSON.stringify(data, null, 2)) + `</pre>`;
+    const res = await fetch('/api/portfolio/export');
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail || detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = (res.headers.get('Content-Disposition') || '')
+      .match(/filename="?([^"]+)"?/)?.[1] || 'portfolio.xlsx';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   } catch (e) {
-    body.innerHTML = `<span class="down">שגיאה: ${esc(e.message)}</span>`;
+    alert('הורדת האקסל נכשלה: ' + e.message);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = label; }
   }
 }
 
