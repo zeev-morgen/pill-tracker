@@ -156,6 +156,37 @@ async def api_upsert_holding(payload: dict = Body(...)):
     return JSONResponse(holding.as_dict(), status_code=201)
 
 
+@router.post("/api/holdings/{ticker}/add")
+async def api_add_to_holding(ticker: str, payload: dict = Body(...)):
+    """Buy more of a position you already hold.
+
+    Separate from the upsert on purpose: that one replaces, which is right for
+    correcting a mistake and wrong for topping up. Here the caller sends only
+    what they bought and the weighted average is computed for them.
+    """
+    holding = portfolio_store.get(ticker)
+    if holding is None:
+        raise HTTPException(status_code=404, detail="הפוזיציה לא נמצאה")
+
+    try:
+        updated = holding.add_shares(
+            quantity=payload.get("quantity"),
+            price=payload.get("price"),
+            purchase_date=payload.get("purchase_date"),
+        )
+    except HoldingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    portfolio_store.upsert(updated)
+    return JSONResponse(
+        {
+            "holding": updated.as_dict(),
+            "previous": {"quantity": holding.quantity, "entry_price": holding.entry_price},
+        },
+        status_code=201,
+    )
+
+
 @router.delete("/api/holdings/{ticker}")
 async def api_delete_holding(ticker: str):
     if not portfolio_store.delete(ticker):
@@ -731,6 +762,14 @@ _HTML = """<!DOCTYPE html>
   /* Under the price rather than beside it: as its own column the as-of date
      pushed the row actions off the edge. */
   .price-date { font-size: 0.72rem; margin-top: 2px; white-space: nowrap; }
+  /* The averaged result, shown before committing: the arithmetic is the whole
+     point of the dialog, so it should be visible rather than taken on trust. */
+  .preview {
+    margin-top: 14px; padding: 10px 12px; border-radius: 6px;
+    background: #1f6feb15; border: 1px solid #1f6feb44;
+    font-size: 0.84rem; line-height: 1.6; min-height: 40px;
+  }
+  .preview b { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -889,6 +928,26 @@ _HTML = """<!DOCTYPE html>
     <div class="modal-actions">
       <button class="btn primary" onclick="saveHolding()">שמירה</button>
       <button class="btn" onclick="closeModal()">ביטול</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Add-to-position modal ═══ -->
+<div class="modal-overlay" id="add-modal">
+  <div class="modal">
+    <h3 id="add-title">הוספה לפוזיציה</h3>
+    <div class="volume" id="add-current" style="font-size:.8rem;margin-bottom:6px"></div>
+    <label for="a-qty">כמה מניות קנית</label>
+    <input id="a-qty" type="number" min="0.0001" step="any" placeholder="לדוגמה: 3">
+    <label for="a-price">באיזה מחיר (למניה)</label>
+    <input id="a-price" type="number" min="0.0001" step="any" placeholder="לדוגמה: 392.00">
+    <label for="a-date">תאריך הקנייה <span class="muted-hint">(רק אם לא נרשם קודם)</span></label>
+    <input id="a-date" type="date">
+    <div class="preview" id="add-preview">—</div>
+    <div class="form-error" id="a-error"></div>
+    <div class="modal-actions">
+      <button class="btn primary" onclick="confirmAdd()">הוספה</button>
+      <button class="btn" onclick="closeAdd()">ביטול</button>
     </div>
   </div>
 </div>
@@ -1183,6 +1242,7 @@ function renderHoldings(data) {
       </td>
       <td class="row-actions">
         <button class="btn" onclick="analyzeTicker('${esc(p.ticker)}')" title="ניתוח AI של המניה">🧠</button>
+        <button class="btn" onclick="openAdd('${esc(p.ticker)}')" title="קניית מניות נוספות">➕</button>
         <button class="btn" onclick="openSell('${esc(p.ticker)}')" title="רישום מכירה">💵</button>
         <button class="btn" onclick="editHolding('${esc(p.ticker)}')" title="עריכת הפוזיציה">✏️</button>
         <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')" title="מחיקת הפוזיציה">🗑️</button>
@@ -1376,6 +1436,77 @@ async function runDiagnostics() {
 function analyzeTicker(ticker) {
   return runAnalysis(`ניתוח AI — ${ticker}`, '/api/analyze/' + encodeURIComponent(ticker),
                      `מנתח את ${ticker}… (עשוי לקחת עד דקה)`);
+}
+
+/* ═══════════════════ Adding to a position ═══════════════════ */
+
+let addTarget = null;
+
+function openAdd(ticker) {
+  const position = currentPositions.find((p) => p.ticker === ticker);
+  if (!position) return;
+  addTarget = position;
+  document.getElementById('add-title').textContent = 'הוספה לפוזיציה — ' + ticker;
+  document.getElementById('add-current').innerHTML =
+    `מוחזק כעת: <b>${position.quantity}</b> מניות במחיר ממוצע <b>${money(position.entry_price)}</b>`;
+  document.getElementById('a-qty').value = '';
+  document.getElementById('a-price').value = position.current_price ?? '';
+  // The date field only appears when the position has no recorded open date;
+  // otherwise the original stands, because holding time runs from the first buy.
+  const dateField = document.getElementById('a-date');
+  const dateLabel = document.querySelector('#add-modal label[for="a-date"]');
+  const showDate = !position.purchase_date;
+  dateField.value = '';
+  dateField.style.display = showDate ? 'block' : 'none';
+  dateLabel.style.display = showDate ? 'block' : 'none';
+  document.getElementById('a-error').textContent = '';
+  updateAddPreview();
+  document.getElementById('add-modal').classList.add('open');
+}
+
+function closeAdd() { document.getElementById('add-modal').classList.remove('open'); }
+
+/* Shows the weighted average before it is committed — this dialog exists so
+   the user does not have to do this sum, so it should show its work. */
+function updateAddPreview() {
+  const box = document.getElementById('add-preview');
+  if (!addTarget) { box.textContent = '—'; return; }
+  const qty = parseFloat(document.getElementById('a-qty').value);
+  const price = parseFloat(document.getElementById('a-price').value);
+  if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(price) || price <= 0) {
+    box.innerHTML = '<span class="volume">הזינו כמות ומחיר כדי לראות את הממוצע החדש</span>';
+    return;
+  }
+  const total = addTarget.quantity + qty;
+  const avg = (addTarget.quantity * addTarget.entry_price + qty * price) / total;
+  const dir = avg > addTarget.entry_price ? 'down' : 'up';   // a higher basis is worse
+  box.innerHTML =
+    `כמות אחרי ההוספה: <b>${parseFloat(total.toFixed(6))}</b><br>` +
+    `מחיר ממוצע חדש: <b class="${dir}">${money(avg)}</b> ` +
+    `<span class="volume">(היה ${money(addTarget.entry_price)})</span><br>` +
+    `<span class="volume">עלות ההוספה: ${money(qty * price)}</span>`;
+}
+
+['a-qty', 'a-price'].forEach((id) =>
+  document.getElementById(id).addEventListener('input', updateAddPreview));
+
+async function confirmAdd() {
+  if (!addTarget) return;
+  const quantity = parseFloat(document.getElementById('a-qty').value);
+  const price = parseFloat(document.getElementById('a-price').value);
+  const purchase_date = document.getElementById('a-date').value || null;
+  const errEl = document.getElementById('a-error');
+  errEl.textContent = '';
+  if (!Number.isFinite(quantity) || quantity <= 0) { errEl.textContent = 'כמות חייבת להיות מספר חיובי'; return; }
+  if (!Number.isFinite(price) || price <= 0) { errEl.textContent = 'מחיר חייב להיות מספר חיובי'; return; }
+  try {
+    await api('/api/holdings/' + encodeURIComponent(addTarget.ticker) + '/add', {
+      method: 'POST',
+      body: JSON.stringify({quantity, price, purchase_date}),
+    });
+    closeAdd();
+    loadPortfolio();
+  } catch (e) { errEl.textContent = e.message; }
 }
 
 /* ═══════════════════ Selling a position ═══════════════════ */
@@ -1636,6 +1767,9 @@ document.getElementById('modal').addEventListener('click', (e) => {
 });
 document.getElementById('sell-modal').addEventListener('click', (e) => {
   if (e.target.id === 'sell-modal') closeSell();
+});
+document.getElementById('add-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'add-modal') closeAdd();
 });
 
 refresh();

@@ -160,6 +160,48 @@ class Holding:
             purchase_date=purchase_date,
         )
 
+    def add_shares(self, quantity, price, purchase_date=None) -> "Holding":
+        """Average an additional purchase into this position.
+
+        Saving a ticker that already exists *replaces* it, so topping up by
+        hand meant computing the weighted average yourself and typing the new
+        total — and typing the added quantity instead of the total silently
+        deleted the shares already held. This does the arithmetic instead.
+
+        The original purchase date is kept: holding duration is measured from
+        when the position was opened, not from the latest top-up. A date is
+        only taken from the caller when none was ever recorded.
+        """
+        try:
+            quantity = float(quantity)
+            price = float(price)
+        except (TypeError, ValueError) as exc:
+            raise HoldingError("כמות ומחיר חייבים להיות מספרים") from exc
+        if quantity <= 0:
+            raise HoldingError("כמות חייבת להיות גדולה מאפס")
+        if price <= 0:
+            raise HoldingError("מחיר חייב להיות גדול מאפס")
+
+        total = self.quantity + quantity
+        average = (self.quantity * self.entry_price + quantity * price) / total
+
+        kept_date = self.purchase_date
+        if kept_date is None and purchase_date:
+            kept_date = _parse_date(purchase_date)
+            if kept_date is not None and kept_date > date.today():
+                raise HoldingError("מועד הרכישה לא יכול להיות בעתיד")
+
+        return Holding(
+            ticker=self.ticker,
+            # Rounded only to shed binary-float noise; six places is finer than
+            # any real quantity or share price.
+            quantity=round(total, 6),
+            entry_price=round(average, 6),
+            sector=self.sector,
+            asset_type=self.asset_type,
+            purchase_date=kept_date,
+        )
+
     def as_dict(self) -> dict:
         return {
             "ticker": self.ticker,
