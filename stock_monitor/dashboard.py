@@ -552,7 +552,13 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
             if isinstance(out.get("intraday_5m"), list) and out["intraday_5m"]:
                 newest = out["intraday_5m"][-1][0]
                 out["intraday_newest_bar"] = newest
-                out["intraday_covers_today"] = str(datetime.now(timezone.utc).date()) in newest
+                # Compared in exchange time: between 00:00 and 04:00 UTC the
+                # UTC date is already tomorrow while New York is still today.
+                from .data_feed import NYSE_TZ
+
+                out["intraday_covers_today"] = (
+                    str(datetime.now(NYSE_TZ).date()) in newest
+                )
         except Exception as exc:
             out["intraday_5m"] = f"{exc.__class__.__name__}: {exc}"
 
@@ -1317,12 +1323,14 @@ function renderHoldings(data) {
 /* Which session the close came from. A price with no date attached is taken
    for today's, which is how a stale quote goes unnoticed. */
 function priceDateCell(p) {
-  // A live quote belongs to no closed session, so it says so instead of
-  // wearing a date that would read as a stale close.
-  if (p.price_source === 'quote') {
-    return `<div class="price-date up" title="מחיר מנקודת הציטוט החי של Yahoo">מחיר חי</div>`;
+  // The date wins over the source label. A quote whose last print is from an
+  // earlier session carries that date; only a genuinely live one says so, or
+  // an unchanging number reads as a live price and the tab looks frozen.
+  if (!p.price_date) {
+    return p.price_source === 'quote'
+      ? `<div class="price-date up" title="מחיר מנקודת הציטוט החי של Yahoo">מחיר חי</div>`
+      : '';
   }
-  if (!p.price_date) return '';
   const cls = p.price_is_stale ? 'down' : 'volume';
   const mark = p.price_is_stale ? '⚠️ ' : '';
   return `<div class="price-date ${cls}" title="${p.price_is_stale

@@ -6,6 +6,8 @@ portfolio throttled at once — so the call count is the thing under test here,
 not just the values that come back.
 """
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -647,3 +649,54 @@ def test_an_unknown_session_still_evaluates():
     engine = AlertEngine(config, Feed())
     alert = AlertConfig(type="volume_spike", multiplier=2.5, time_adjusted=False)
     assert engine._check_volume_spike("MU", alert, 32_000_000) is not None
+
+
+# ── A quote is only "live" if its bar is from today ───────────────────────────
+#
+# Thinly traded names have no pre-market print for hours after 04:00, so the
+# newest intraday bar can be the previous session's after-hours close. Observed
+# for AVGO at 04:51 ET: the last bar was 19:55 the evening before. Presenting
+# that as a live quote gave an unchanging number with no date on it — which is
+# what a frozen portfolio looks like.
+
+def _intraday_ending(last_stamp, price=421.0):
+    stamps = pd.DatetimeIndex([
+        pd.Timestamp("2026-08-05 15:55", tz="America/New_York"),
+        pd.Timestamp(last_stamp, tz="America/New_York"),
+    ])
+    return pd.DataFrame({"Close": [418.28, price]}, index=stamps)
+
+
+def _with_intraday(monkeypatch, frame, tickers=("AVGO",)):
+    def stub(t, **kwargs):
+        if kwargs.get("interval") == "5m":
+            return pd.concat({x: frame for x in list(t)}, axis=1)
+        return pd.concat({x: _frame(400.0) for x in list(t)}, axis=1)
+
+    monkeypatch.setattr(portfolio_risk.yf, "download", stub)
+
+
+def test_a_quote_from_a_previous_session_keeps_its_date(monkeypatch):
+    """Yesterday's after-hours print is a real price, but not a live one."""
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "pre")
+    monkeypatch.setattr(portfolio_risk, "_market_today", lambda: date(2026, 8, 6))
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    _with_intraday(monkeypatch, _intraday_ending("2026-08-05 19:55"))
+
+    position = PortfolioRiskAnalyzer(store).full_report()["positions"][0]
+    assert position["current_price"] == pytest.approx(421.0)
+    assert position["price_date"] == "2026-08-05", "must not pass as live"
+
+
+def test_a_quote_printed_today_is_live(monkeypatch):
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "pre")
+    monkeypatch.setattr(portfolio_risk, "_market_today", lambda: date(2026, 8, 6))
+    store = PortfolioStore()
+    store.upsert(Holding.create("AVGO", 10, 300.0))
+    _with_intraday(monkeypatch, _intraday_ending("2026-08-06 08:05", price=425.0))
+
+    position = PortfolioRiskAnalyzer(store).full_report()["positions"][0]
+    assert position["current_price"] == pytest.approx(425.0)
+    assert position["price_date"] is None, "a bar from today is a live quote"
+    assert position["price_source"] == "quote"

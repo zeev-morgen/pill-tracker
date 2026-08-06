@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -66,6 +66,13 @@ class Fundamentals:
 
 
 UNKNOWN_SECTOR = "Unknown"
+
+
+def _market_today() -> date:
+    """Today in exchange time — the server clock may be on another date."""
+    from .data_feed import NYSE_TZ
+
+    return datetime.now(NYSE_TZ).date()
 
 
 def _bar_date(index_value) -> Optional[date]:
@@ -301,6 +308,11 @@ class PortfolioRiskAnalyzer:
                     "price": price,
                     "regular_close": closes[-1] if closes else None,
                     "session": session,
+                    # When the last print actually happened. Thinly traded
+                    # names have no pre-market bar for hours after 04:00, so
+                    # the newest bar can be yesterday's after-hours — a real
+                    # price, but not a live one.
+                    "as_of": _bar_date(priced.index[-1]),
                 }
             except Exception as exc:
                 logger.debug("intraday parse failed for %s: %s", ticker, exc)
@@ -485,7 +497,12 @@ class PortfolioRiskAnalyzer:
                 if quote_price and quote_price > 0:
                     price = float(quote_price)
                     price_source = "quote"
-                    price_date = None      # a live quote belongs to no closed session
+                    # A quote counts as live only if its bar is from today.
+                    # Otherwise it is the last print from an earlier session and
+                    # keeps that date, or the dashboard shows an unchanging
+                    # number labelled "live" and it reads as a frozen portfolio.
+                    as_of = quote.get("as_of")
+                    price_date = None if as_of in (None, _market_today()) else as_of
 
                 atr = compute_atr(history, self.thresholds.atr_period)
                 fundamentals = fetch_fundamentals(holding.ticker)
