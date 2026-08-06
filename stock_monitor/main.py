@@ -164,9 +164,15 @@ class StockMonitorApp:
         stock_map = {sc.symbol: sc for sc in self.watched_stocks()}
         prune_price_cache(stock_map)
 
+        # One request for the whole watchlist. Quoting each symbol separately
+        # cost 26 requests a minute for thirteen symbols — 1,560 an hour, which
+        # is what Yahoo started rate-limiting, and a throttled account then
+        # fails to return the pre-market bars the dashboard is waiting for.
+        quotes = self.data_feed.get_current_data_batch(list(stock_map))
+
         for symbol, stock_cfg in stock_map.items():
             try:
-                data = self.data_feed.get_current_data(symbol)
+                data = quotes.get(symbol) or self.data_feed.get_current_data(symbol)
                 if data is None:
                     self._log.warning("No data for %s — skipping", symbol)
                     continue

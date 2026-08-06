@@ -1280,11 +1280,13 @@ function renderHoldings(data) {
     return;
   }
   const pnlCls = data.total_pnl_value >= 0 ? 'up' : 'down';
-  const live = data.positions.filter((p) => p.price_source === 'quote').length;
+  // Read off price_date, the same field the rows use — the header claimed
+  // "live prices" from price_source while every row underneath showed a date.
+  const live = data.positions.filter((p) => !p.price_date).length;
   const asOf = live === data.positions.length && live
     ? ` · <span class="volume">מחירים חיים</span>`
     : data.latest_bar_date
-      ? ` · <span class="volume">מחירי סגירה מ-${esc(data.latest_bar_date)}</span>` : '';
+      ? ` · <span class="volume">מחירים מ-${esc(data.latest_bar_date)}</span>` : '';
   document.getElementById('portfolio-total').innerHTML =
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
     `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>` + asOf;

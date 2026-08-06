@@ -211,6 +211,149 @@ class StockDataFeed:
             logger.error("Error fetching data for %s: %s", symbol, exc, exc_info=True)
             return None
 
+    def get_current_data_batch(self, symbols) -> Dict[str, Dict]:
+        """Quotes for every watched symbol in a single request.
+
+        The polling loop called get_current_data once per symbol, and each of
+        those made a fast_info call plus a history call — 26 requests a minute
+        for thirteen symbols, 1,560 an hour. That is what Yahoo was rate
+        limiting, and a throttled account then fails to return the very
+        pre-market bars the dashboard is waiting for.
+
+        Symbols the batch cannot cover are simply absent from the result; the
+        caller falls back to the per-symbol path for those.
+        """
+        symbols = [str(s).upper() for s in symbols]
+        if not symbols:
+            return {}
+        session = get_market_session()
+        try:
+            data = yf.download(
+                symbols, period="5d", interval="5m", prepost=True,
+                auto_adjust=True, progress=False, group_by="ticker", threads=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "batch quote download failed (%s: %s) — falling back to per-symbol",
+                exc.__class__.__name__, exc,
+            )
+            return {}
+
+        if data is None or data.empty:
+            return {}
+
+        out: Dict[str, Dict] = {}
+        for symbol in symbols:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    if symbol not in data.columns.get_level_values(0):
+                        continue
+                    frame = data[symbol]
+                elif len(symbols) == 1:
+                    frame = data
+                else:
+                    continue
+                quote = self._from_intraday(frame, symbol, session)
+                if quote:
+                    out[symbol] = quote
+            except Exception as exc:
+                logger.debug("batch quote parse failed for %s: %s", symbol, exc)
+        return out
+
+    def _from_intraday(
+        self, frame: "pd.DataFrame", symbol: str, session: str
+    ) -> Optional[Dict]:
+        """Build the get_current_data payload from a 5-minute pre/post series.
+
+        Everything the caller needs is in these bars, so no separate quote
+        request is made. Volume is the running total of *today's regular
+        session* specifically — which is what the spike alert compares against
+        a daily average, and is not what the quote endpoint's day_volume means
+        outside the session.
+        """
+        if frame is None or frame.empty or "Close" not in frame.columns:
+            return None
+        priced = frame[frame["Close"].notna()]
+        if priced.empty:
+            return None
+
+        price = float(priced["Close"].iloc[-1])
+        if not math.isfinite(price) or price <= 0:
+            return None
+
+        closes = self._regular_session_closes(priced)
+        # After the close, the session that just ended is today's, so the
+        # day's change is measured against the one before it. Before the open,
+        # the newest close *is* the reference for today's move.
+        if session == "pre":
+            regular_close = closes[-1] if closes else None
+            prev_close = regular_close
+        else:
+            regular_close = closes[-1] if closes else None
+            prev_close = closes[-2] if len(closes) >= 2 else regular_close
+
+        local = self._local_index(priced)
+        today = datetime.now(NYSE_TZ).date()
+        todays = priced[local.date == today] if local is not None else priced.iloc[0:0]
+        minutes = None
+        if local is not None:
+            minutes = local.hour * 60 + local.minute
+        regular_today = (
+            priced[(local.date == today) & (minutes >= 570) & (minutes < 960)]
+            if local is not None else priced.iloc[0:0]
+        )
+
+        volume = 0
+        if "Volume" in regular_today.columns and not regular_today.empty:
+            total = regular_today["Volume"].sum()
+            volume = int(total) if math.isfinite(float(total)) else 0
+
+        day_high = day_low = open_price = None
+        if not todays.empty:
+            if "High" in todays.columns:
+                day_high = _finite(float(todays["High"].max()))
+            if "Low" in todays.columns:
+                day_low = _finite(float(todays["Low"].min()))
+        if not regular_today.empty and "Open" in regular_today.columns:
+            open_price = _finite(float(regular_today["Open"].iloc[0]))
+
+        change_pct = (
+            (price - prev_close) / prev_close * 100.0 if _usable(prev_close) else 0.0
+        )
+        return {
+            "symbol": symbol,
+            "price": _finite(price),
+            "prev_close": _finite(prev_close),
+            "open_price": open_price,
+            "regular_close": _finite(regular_close),
+            "change_pct": _finite(change_pct),
+            "from_open_pct": _finite(
+                (price - open_price) / open_price * 100.0
+                if _usable(open_price) else None
+            ),
+            "since_close_pct": _finite(
+                (price - regular_close) / regular_close * 100.0
+                if _usable(regular_close) and session != "regular" else None
+            ),
+            "volume": volume,
+            "day_high": day_high,
+            "day_low": day_low,
+            "session": session,
+            "timestamp": datetime.now(NYSE_TZ),
+            "bar_time": priced.index[-1],
+        }
+
+    @staticmethod
+    def _local_index(frame: "pd.DataFrame"):
+        """The frame's index in exchange time, or None if it has no timezone."""
+        try:
+            index = frame.index
+            if index.tz is None:
+                index = index.tz_localize("UTC")
+            return index.tz_convert(NYSE_TZ)
+        except Exception:
+            return None
+
     def _get_extended_prices(self, symbol: str) -> Optional[Dict]:
         """Accurate prices during pre/after-hours, from one intraday request.
 
@@ -259,12 +402,8 @@ class StockDataFeed:
         the intraday series rather than from daily bars is what removes the
         second request — and the blank-daily-bar problem with it.
         """
-        try:
-            index = history.index
-            if index.tz is None:
-                index = index.tz_localize("UTC")
-            local = index.tz_convert(NYSE_TZ)
-        except Exception:
+        local = StockDataFeed._local_index(history)
+        if local is None:
             return []
 
         minutes = local.hour * 60 + local.minute
