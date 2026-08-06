@@ -291,8 +291,10 @@ class PortfolioRiskAnalyzer:
 
         if not tickers:
             return {}
+        from .data_feed import INTRADAY_PERIOD
+
         frames = self._fetch_histories(
-            tickers, period="5d", interval="5m", prepost=True
+            tickers, period=INTRADAY_PERIOD, interval="5m", prepost=True
         )
         quotes: Dict[str, dict] = {}
         for ticker, frame in frames.items():

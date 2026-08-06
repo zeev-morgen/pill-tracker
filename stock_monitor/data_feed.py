@@ -45,6 +45,13 @@ _REG_SESSION_MINUTES = _REG_CLOSE_MINUTES - _REG_OPEN_MINUTES  # 390
 # the pace ratio to a meaningless number (≈ first 20 min of the 390-min session).
 MIN_SESSION_FRACTION = 0.05
 
+#: Range for intraday pre/post requests. Deliberately short: at 5d Yahoo stops
+#: returning the current partial day's bars, so a pre-market session shows
+#: nothing until it has closed. That is a regression this constant exists to
+#: prevent from being reintroduced — widen it only with evidence that today's
+#: bars still arrive.
+INTRADAY_PERIOD = "2d"
+
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
@@ -229,7 +236,7 @@ class StockDataFeed:
         session = get_market_session()
         try:
             data = yf.download(
-                symbols, period="5d", interval="5m", prepost=True,
+                symbols, period=INTRADAY_PERIOD, interval="5m", prepost=True,
                 auto_adjust=True, progress=False, group_by="ticker", threads=False,
             )
         except Exception as exc:
@@ -368,7 +375,7 @@ class StockDataFeed:
         """
         try:
             history = self._ticker(symbol).history(
-                period="5d", interval="5m", prepost=True
+                period=INTRADAY_PERIOD, interval="5m", prepost=True
             )
             if history is None or history.empty or "Close" not in history.columns:
                 return None

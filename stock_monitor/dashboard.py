@@ -513,7 +513,7 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
                     out[source] = f"no Close column: {list(frame.columns)[:6]}"
                     return
                 closes = frame["Close"].tail(5)
-                stamp = (lambda i: str(i)) if source == "intraday_5m" else (
+                stamp = (lambda i: str(i)) if source.startswith("intraday") else (
                     lambda i: str(i.date() if hasattr(i, "date") else i))
                 out[source] = [
                     [stamp(idx),
@@ -538,29 +538,35 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
         except Exception as exc:
             out["history"] = f"{exc.__class__.__name__}: {exc}"
 
-        # The intraday series is what the portfolio now prices from during a
-        # session, so its freshness is the question when prices look stuck.
-        try:
-            intraday = yf.download([symbol], period="5d", interval="5m",
-                                   prepost=True, auto_adjust=True,
-                                   progress=False, group_by="ticker", threads=False)
-            if (intraday is not None and not intraday.empty
-                    and hasattr(intraday.columns, "levels")
-                    and symbol in intraday.columns.get_level_values(0)):
-                intraday = intraday[symbol]
-            _tail(intraday, "intraday_5m")
-            if isinstance(out.get("intraday_5m"), list) and out["intraday_5m"]:
-                newest = out["intraday_5m"][-1][0]
-                out["intraday_newest_bar"] = newest
-                # Compared in exchange time: between 00:00 and 04:00 UTC the
-                # UTC date is already tomorrow while New York is still today.
-                from .data_feed import NYSE_TZ
+        # The intraday series is what the portfolio prices from during a
+        # session. Several ranges are probed side by side because the range
+        # itself turned out to decide whether Yahoo returns the current
+        # partial day at all — asking for 5d silently dropped today's bars,
+        # and the earlier version of this probe used 5d too, so it confirmed
+        # the bug instead of exposing it.
+        from .data_feed import INTRADAY_PERIOD, NYSE_TZ
 
-                out["intraday_covers_today"] = (
-                    str(datetime.now(NYSE_TZ).date()) in newest
+        today = str(datetime.now(NYSE_TZ).date())
+        for span in ("1d", "2d", "5d"):
+            key = f"intraday_{span}"
+            try:
+                frame = yf.download([symbol], period=span, interval="5m",
+                                    prepost=True, auto_adjust=True,
+                                    progress=False, group_by="ticker", threads=False)
+                if (frame is not None and not frame.empty
+                        and hasattr(frame.columns, "levels")
+                        and symbol in frame.columns.get_level_values(0)):
+                    frame = frame[symbol]
+                _tail(frame, key)
+                bars = out.get(key)
+                out[f"{key}_newest"] = bars[-1][0] if isinstance(bars, list) and bars else None
+                out[f"{key}_has_today"] = bool(
+                    isinstance(bars, list) and bars and today in bars[-1][0]
                 )
-        except Exception as exc:
-            out["intraday_5m"] = f"{exc.__class__.__name__}: {exc}"
+            except Exception as exc:
+                out[key] = f"{exc.__class__.__name__}: {exc}"
+
+        out["period_in_use"] = INTRADAY_PERIOD
 
         try:
             fast = yf.Ticker(symbol).fast_info

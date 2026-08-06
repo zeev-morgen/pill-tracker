@@ -132,3 +132,27 @@ def test_the_probe_is_not_public():
     from stock_monitor.webhook_server import _PUBLIC_PATHS
 
     assert not any("/api/diagnostics".startswith(p) for p in _PUBLIC_PATHS)
+
+
+def test_the_daily_probes_survive_the_intraday_loop(client, yf_stub):
+    """The intraday loop once shadowed the route's `period` parameter.
+
+    Assigning to it inside the nested probe made it local to the whole
+    function, so the daily probes above raised UnboundLocalError and reported
+    a string where the caller expected bars.
+    """
+    body = client.get("/api/diagnostics/AMZN").json()
+
+    assert isinstance(body["download"], list), body["download"]
+    assert isinstance(body["history"], list), body["history"]
+    for span in ("1d", "2d", "5d"):
+        assert f"intraday_{span}" in body
+        assert f"intraday_{span}_has_today" in body
+    assert body["period_in_use"] == "2d"
+
+
+def test_the_probe_uses_the_range_the_app_uses(client, yf_stub):
+    """A probe on a different range confirms the bug instead of exposing it."""
+    from stock_monitor.data_feed import INTRADAY_PERIOD
+
+    assert client.get("/api/diagnostics/AMZN").json()["period_in_use"] == INTRADAY_PERIOD
