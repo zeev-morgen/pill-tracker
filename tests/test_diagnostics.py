@@ -60,8 +60,17 @@ def yf_stub(monkeypatch):
             from types import SimpleNamespace
             return SimpleNamespace(**result)
 
+    state["raw_chart"] = {"status": 200, "bars_today": 12, "premarket_bars_today": 12}
+
+    def fake_raw_chart(symbol):
+        result = state["raw_chart"]
+        if isinstance(result, Exception):
+            raise result
+        return dict(result, ticker=symbol)
+
     monkeypatch.setattr(yf, "download", fake_download)
     monkeypatch.setattr(yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(dashboard, "raw_chart_probe", fake_raw_chart)
     return state
 
 
@@ -156,3 +165,158 @@ def test_the_probe_uses_the_range_the_app_uses(client, yf_stub):
     from stock_monitor.data_feed import INTRADAY_PERIOD
 
     assert client.get("/api/diagnostics/AMZN").json()["period_in_use"] == INTRADAY_PERIOD
+
+
+# ── The two discriminators ────────────────────────────────────────────────────
+
+def test_a_control_ticker_is_probed_alongside(client, yf_stub):
+    """One ticker missing today's bars can be the ticker. SPY missing them can't."""
+    body = client.get("/api/diagnostics/AMZN").json()
+
+    assert body["control_ticker"] == dashboard.CONTROL_TICKER
+    assert isinstance(body["control_intraday"], list), body["control_intraday"]
+    assert body["control_intraday_has_today"] is False  # stub bars are from 2026-08-03
+    assert body["control_intraday_newest"]
+
+
+def test_the_control_does_not_probe_itself(client, yf_stub):
+    """Asking about SPY has to compare against something other than SPY."""
+    body = client.get(f"/api/diagnostics/{dashboard.CONTROL_TICKER}").json()
+
+    assert body["control_ticker"] != dashboard.CONTROL_TICKER
+    assert body["control_ticker"] == dashboard._CONTROL_FALLBACK
+
+
+def test_the_control_probe_uses_the_range_the_app_uses(client, yf_stub, monkeypatch):
+    """Comparing on a different range would make the control meaningless."""
+    import yfinance as yf
+    from stock_monitor.data_feed import INTRADAY_PERIOD
+
+    seen = []
+    original = yf.download
+
+    def spy(tickers, **kwargs):
+        seen.append((tickers, kwargs.get("period"), kwargs.get("interval")))
+        return original(tickers, **kwargs)
+
+    monkeypatch.setattr(yf, "download", spy)
+    client.get("/api/diagnostics/AMZN")
+
+    control = [row for row in seen if row[0] == [dashboard.CONTROL_TICKER]]
+    assert control, seen
+    assert control[0][1] == INTRADAY_PERIOD
+    assert control[0][2] == "5m"
+
+
+def test_the_raw_chart_response_is_included(client, yf_stub):
+    """Yahoo answered directly, with yfinance out of the path."""
+    body = client.get("/api/diagnostics/AMZN").json()
+
+    assert body["raw_chart"]["status"] == 200
+    assert body["raw_chart"]["premarket_bars_today"] == 12
+    assert body["raw_chart"]["ticker"] == "AMZN"
+
+
+def test_a_failing_raw_chart_does_not_sink_the_probe(client, yf_stub):
+    yf_stub["raw_chart"] = RuntimeError("401 Unauthorized")
+    body = client.get("/api/diagnostics/AMZN").json()
+
+    assert "RuntimeError" in body["raw_chart"]
+    assert isinstance(body["download"], list), "the rest still reported"
+
+
+# ── raw_chart_probe itself ────────────────────────────────────────────────────
+
+@pytest.fixture
+def chart_response(monkeypatch):
+    """Stands in for Yahoo's chart endpoint. Yields a mutable payload."""
+    from curl_cffi import requests as http
+
+    from stock_monitor.data_feed import NYSE_TZ
+
+    now = pd.Timestamp.now(tz=NYSE_TZ)
+    premarket = now.normalize() + pd.Timedelta(hours=7)  # 07:00 ET today
+    state = {
+        "status": 200,
+        "payload": {"chart": {"result": [{
+            "meta": {"regularMarketPrice": 418.28, "range": "2d",
+                     "currentTradingPeriod": {"pre": {"start": 1}}},
+            "timestamp": [int(premarket.timestamp()) + i * 300 for i in range(6)],
+        }], "error": None}},
+    }
+
+    state["headers"] = {"age": "0", "x-cache": "Miss from cloudfront"}
+
+    class FakeResponse:
+        status_code = property(lambda self: state["status"])
+        headers = property(lambda self: state["headers"])
+
+        def json(self):
+            return state["payload"]
+
+    monkeypatch.setattr(http, "get", lambda *a, **k: FakeResponse())
+    return state
+
+
+def test_it_counts_todays_premarket_bars(chart_response):
+    out = dashboard.raw_chart_probe("AVGO")
+
+    assert out["transport"] == "curl_cffi"
+    assert out["status"] == 200
+    assert out["bars"] == 6
+    assert out["bars_today"] == 6
+    assert out["premarket_bars_today"] == 6, "all six are before 09:30 ET"
+    assert out["regular_market_price"] == 418.28
+    assert "AVGO" in out["url"]
+
+
+def test_bars_from_the_regular_session_are_not_counted_as_premarket(chart_response):
+    from stock_monitor.data_feed import NYSE_TZ
+
+    open_bell = pd.Timestamp.now(tz=NYSE_TZ).normalize() + pd.Timedelta(hours=10)
+    result = chart_response["payload"]["chart"]["result"][0]
+    result["timestamp"] = [int(open_bell.timestamp()) + i * 300 for i in range(4)]
+
+    out = dashboard.raw_chart_probe("AVGO")
+    assert out["bars_today"] == 4
+    assert out["premarket_bars_today"] == 0
+
+
+def test_yesterdays_bars_only_report_zero_for_today(chart_response):
+    from stock_monitor.data_feed import NYSE_TZ
+
+    yesterday = pd.Timestamp.now(tz=NYSE_TZ).normalize() - pd.Timedelta(hours=6)
+    result = chart_response["payload"]["chart"]["result"][0]
+    result["timestamp"] = [int(yesterday.timestamp()) + i * 300 for i in range(3)]
+
+    out = dashboard.raw_chart_probe("AVGO")
+    assert out["bars"] == 3
+    assert out["bars_today"] == 0
+    assert out["premarket_bars_today"] == 0
+    assert out["newest"], "the newest bar is still named, so its date is visible"
+
+
+def test_cache_headers_are_reported(chart_response):
+    """A stale CDN copy explains a day-behind feed; `age` is how it shows."""
+    chart_response["headers"] = {"age": "43200", "x-cache": "Hit from cloudfront",
+                                 "irrelevant": "ignored"}
+
+    out = dashboard.raw_chart_probe("AVGO")
+    assert out["cache"]["age"] == "43200"
+    assert out["cache"]["x-cache"] == "Hit from cloudfront"
+    assert "irrelevant" not in out["cache"]
+
+
+def test_missing_cache_headers_are_omitted_not_nulled(chart_response):
+    chart_response["headers"] = {}
+    assert dashboard.raw_chart_probe("AVGO")["cache"] == {}
+
+
+def test_an_error_payload_is_reported_not_raised(chart_response):
+    chart_response["status"] = 429
+    chart_response["payload"] = {"chart": {"result": None,
+                                           "error": {"code": "Too Many Requests"}}}
+
+    out = dashboard.raw_chart_probe("AVGO")
+    assert out["status"] == 429
+    assert "Too Many Requests" in out["error"]

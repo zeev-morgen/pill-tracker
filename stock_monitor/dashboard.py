@@ -475,6 +475,81 @@ async def api_export_portfolio():
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────
 
+#: Liquid, always-traded control symbol. If the pre-market series is missing for
+#: this too, the cause is the host or Yahoo — not the ticker being asked about.
+CONTROL_TICKER = "SPY"
+_CONTROL_FALLBACK = "QQQ"
+
+_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+
+def raw_chart_probe(symbol: str) -> dict:
+    """Hit Yahoo's chart endpoint directly, bypassing yfinance.
+
+    yfinance sits between us and Yahoo: it picks the transport, parses the
+    response and can drop bars on its own. When the intraday series comes back
+    without today's pre-market, this says which side of that boundary the data
+    goes missing on — a 200 whose payload already lacks today's timestamps is
+    Yahoo withholding, while a payload that has them is yfinance losing them.
+    """
+    url = _CHART_URL.format(symbol=symbol)
+    params = {"range": "2d", "interval": "5m", "includePrePost": "true"}
+    out: Dict[str, object] = {"url": url}
+
+    # curl_cffi is what yfinance itself uses; plain requests is refused by
+    # Yahoo often enough that a failure there would say nothing.
+    try:
+        from curl_cffi import requests as http
+
+        out["transport"] = "curl_cffi"
+        response = http.get(url, params=params, timeout=15, impersonate="chrome")
+    except ImportError:
+        import requests as http  # type: ignore[no-redef]
+
+        out["transport"] = "requests"
+        response = http.get(url, params=params, timeout=15)
+
+    out["status"] = getattr(response, "status_code", None)
+
+    # Yahoo answers through a CDN. A cached response that is hours old explains
+    # a feed that lags by a trading day far better than any theory about
+    # extended-hours data being withheld, and `age` says so outright.
+    headers = getattr(response, "headers", None) or {}
+    out["cache"] = {
+        name: headers.get(name)
+        for name in ("age", "date", "x-cache", "cf-cache-status", "cache-control")
+        if headers.get(name) is not None
+    }
+
+    payload = response.json()
+
+    result = (payload.get("chart") or {}).get("result") or []
+    if not result:
+        out["error"] = str((payload.get("chart") or {}).get("error"))
+        return out
+
+    block = result[0]
+    meta = block.get("meta") or {}
+    out["meta_session"] = ((meta.get("currentTradingPeriod") or {}).get("pre") or {}).get("start")
+    out["regular_market_price"] = meta.get("regularMarketPrice")
+    out["meta_range"] = meta.get("range")
+
+    from .data_feed import NYSE_TZ
+
+    stamps = block.get("timestamp") or []
+    today = datetime.now(NYSE_TZ).date()
+    dates = [datetime.fromtimestamp(t, NYSE_TZ) for t in stamps]
+    out["bars"] = len(dates)
+    out["newest"] = dates[-1].isoformat(timespec="minutes") if dates else None
+    out["bars_today"] = sum(1 for d in dates if d.date() == today)
+    # Bars before 09:30 ET today are, by definition, pre-market ones.
+    out["premarket_bars_today"] = sum(
+        1 for d in dates
+        if d.date() == today and (d.hour, d.minute) < (9, 30)
+    )
+    return out
+
+
 @router.get("/api/diagnostics/{ticker}")
 async def api_diagnostics(ticker: str, period: str = "1mo"):
     """What each Yahoo endpoint actually returns for one ticker, right now.
@@ -567,6 +642,36 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
                 out[key] = f"{exc.__class__.__name__}: {exc}"
 
         out["period_in_use"] = INTRADAY_PERIOD
+
+        # Same intraday question, asked of a control symbol. One ticker missing
+        # today's bars can be the ticker; SPY missing them cannot.
+        control = _CONTROL_FALLBACK if symbol == CONTROL_TICKER else CONTROL_TICKER
+        out["control_ticker"] = control
+        try:
+            frame = yf.download([control], period=INTRADAY_PERIOD, interval="5m",
+                                prepost=True, auto_adjust=True,
+                                progress=False, group_by="ticker", threads=False)
+            if (frame is not None and not frame.empty
+                    and hasattr(frame.columns, "levels")
+                    and control in frame.columns.get_level_values(0)):
+                frame = frame[control]
+            _tail(frame, "control_intraday")
+            bars = out.get("control_intraday")
+            out["control_intraday_newest"] = (
+                bars[-1][0] if isinstance(bars, list) and bars else None
+            )
+            out["control_intraday_has_today"] = bool(
+                isinstance(bars, list) and bars and today in bars[-1][0]
+            )
+        except Exception as exc:
+            out["control_intraday"] = f"{exc.__class__.__name__}: {exc}"
+
+        # And the same question asked of Yahoo directly, with yfinance out of
+        # the path entirely.
+        try:
+            out["raw_chart"] = raw_chart_probe(symbol)
+        except Exception as exc:
+            out["raw_chart"] = f"{exc.__class__.__name__}: {exc}"
 
         try:
             fast = yf.Ticker(symbol).fast_info
