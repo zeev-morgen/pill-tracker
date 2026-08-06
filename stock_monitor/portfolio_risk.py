@@ -269,6 +269,43 @@ class PortfolioRiskAnalyzer:
         module-level singleton built before the app owns a feed)."""
         self._feed = feed
 
+    def _intraday_quotes(self, tickers: List[str], session: str) -> Dict[str, dict]:
+        """Current price and last regular close for every ticker, in one request.
+
+        The 5-minute series already spans pre, regular and post bars, so a
+        single batch answers what previously took a quote plus a history call
+        per holding. That was 26 requests for thirteen positions on every
+        refresh — above the rate limit that got the whole portfolio throttled.
+
+        Returns {ticker: {price, regular_close}} for whatever it could resolve;
+        callers fall back per ticker for the rest.
+        """
+        from .data_feed import StockDataFeed
+
+        if not tickers:
+            return {}
+        frames = self._fetch_histories(
+            tickers, period="5d", interval="5m", prepost=True
+        )
+        quotes: Dict[str, dict] = {}
+        for ticker, frame in frames.items():
+            try:
+                priced = frame[frame["Close"].notna()]
+                if priced.empty:
+                    continue
+                price = float(priced["Close"].iloc[-1])
+                if not math.isfinite(price) or price <= 0:
+                    continue
+                closes = StockDataFeed._regular_session_closes(priced)
+                quotes[ticker] = {
+                    "price": price,
+                    "regular_close": closes[-1] if closes else None,
+                    "session": session,
+                }
+            except Exception as exc:
+                logger.debug("intraday parse failed for %s: %s", ticker, exc)
+        return quotes
+
     def _quote(self, ticker: str) -> dict:
         """Live quote for one ticker, or empty if it cannot be had.
 
@@ -293,13 +330,24 @@ class PortfolioRiskAnalyzer:
         """Pre/post-market columns, from a quote already fetched."""
         if session not in ("pre", "after") or not quote:
             return {"session": session} if session else {}
+        change = quote.get("since_close_pct")
+        if change is None:
+            # The batched quote carries the regular close rather than a
+            # precomputed move, so derive it here.
+            close = _finite(quote.get("regular_close"))
+            price = _finite(quote.get("price"))
+            if close and price:
+                change = (price - close) / close * 100.0
         return {
             "session": quote.get("session", session),
             "extended_price": _finite(quote.get("price")),
-            "extended_change_pct": _finite(quote.get("since_close_pct")),
+            "extended_change_pct": _finite(change),
         }
 
-    def _fetch_histories(self, tickers: List[str]) -> Dict[str, "pd.DataFrame"]:
+    def _fetch_histories(
+        self, tickers: List[str], period: str = "6mo",
+        interval: str = "1d", prepost: bool = False,
+    ) -> Dict[str, "pd.DataFrame"]:
         """Price history for the whole portfolio in a single request.
 
         Yahoo rate-limits per IP, and a shared cloud host burns that budget
@@ -312,7 +360,9 @@ class PortfolioRiskAnalyzer:
         try:
             data = yf.download(
                 tickers,
-                period="6mo",
+                period=period,
+                interval=interval,
+                prepost=prepost,
                 auto_adjust=True,
                 progress=False,
                 group_by="ticker",
@@ -363,7 +413,21 @@ class PortfolioRiskAnalyzer:
         self._skip_reasons: List[str] = []
         # One clock read for the whole report rather than one per holding.
         session = get_market_session()
-        histories = self._fetch_histories([h.ticker for h in holdings])
+        tickers = [h.ticker for h in holdings]
+        histories = self._fetch_histories(tickers)
+        # A daily close cannot be the current price while a session is running,
+        # so the intraday batch is fetched then — and also when the daily bars
+        # are behind, which is what the chart endpoint does most mornings.
+        bars_behind = any(
+            frame is not None and not frame.empty and "Close" in frame.columns
+            and pd.isna(frame["Close"].iloc[-1])
+            for frame in histories.values()
+        )
+        intraday = (
+            self._intraday_quotes(tickers, session)
+            if session in ("pre", "regular", "after") or bars_behind
+            else {}
+        )
 
         for holding in holdings:
             try:
@@ -412,7 +476,7 @@ class PortfolioRiskAnalyzer:
                 # When the bars are current and the market is shut, the close
                 # *is* the price and the request is skipped — which is what
                 # keeps the common case at one request for the whole portfolio.
-                quote = (
+                quote = intraday.get(holding.ticker) or (
                     self._quote(holding.ticker)
                     if bars_lagging or session in ("pre", "regular", "after")
                     else {}

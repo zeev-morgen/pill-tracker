@@ -11,6 +11,22 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+
+def _finite(value):
+    """None for anything JSON cannot carry — NaN and infinity."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def _usable(value) -> bool:
+    """True for a number that can safely be divided by.
+
+    NaN is truthy and compares unequal to zero, so `if value and value != 0`
+    let it straight through.
+    """
+    return isinstance(value, (int, float)) and math.isfinite(value) and value != 0
+
 NYSE_TZ = pytz.timezone("America/New_York")
 
 # Market session boundaries (hour, minute) in ET
@@ -158,29 +174,32 @@ class StockDataFeed:
 
             change_pct = (
                 (price - prev_close) / prev_close * 100.0
-                if prev_close and prev_close != 0
+                if _usable(prev_close)
                 else 0.0
             )
             from_open_pct = (
                 (price - open_price) / open_price * 100.0
-                if open_price and open_price != 0
+                if _usable(open_price)
                 else None
             )
             since_close_pct = (
                 (price - regular_close) / regular_close * 100.0
-                if regular_close and regular_close != 0 and session != "regular"
+                if _usable(regular_close) and session != "regular"
                 else None
             )
 
+            # Every number is filtered on the way out. A single NaN reaching
+            # the price cache made /api/status fail to serialize, taking down
+            # the whole live-monitoring tab.
             return {
                 "symbol":          symbol,
-                "price":           price,
-                "prev_close":      prev_close,
-                "open_price":      open_price,
-                "regular_close":   regular_close,
-                "change_pct":      change_pct,
-                "from_open_pct":   from_open_pct,
-                "since_close_pct": since_close_pct,
+                "price":           _finite(price),
+                "prev_close":      _finite(prev_close),
+                "open_price":      _finite(open_price),
+                "regular_close":   _finite(regular_close),
+                "change_pct":      _finite(change_pct),
+                "from_open_pct":   _finite(from_open_pct),
+                "since_close_pct": _finite(since_close_pct),
                 "volume":          int(volume) if volume is not None else 0,
                 "day_high":        day_high,
                 "day_low":         day_low,
@@ -193,43 +212,70 @@ class StockDataFeed:
             return None
 
     def _get_extended_prices(self, symbol: str) -> Optional[Dict]:
-        """Return accurate prices during pre/after-hours from intraday history.
+        """Accurate prices during pre/after-hours, from one intraday request.
 
-        Returns dict with keys: current_price, regular_close, prev_close (optional).
+        Everything is derived from a single 5-minute series that already spans
+        pre, regular and post bars, so the daily-bar request this used to make
+        alongside it is gone. That request was both an extra round trip per
+        symbol and a source of NaN: Yahoo publishes a row for the current day
+        before filling in its close, and the previous guard let that NaN
+        through into since_close_pct and on into the API response.
+
+        Returns current_price, regular_close and prev_close.
         """
         try:
-            # 5-min bars including extended hours → last bar = current AH price
-            hist_pre = self._ticker(symbol).history(
-                period="2d", interval="5m", prepost=True
+            history = self._ticker(symbol).history(
+                period="5d", interval="5m", prepost=True
             )
-            # Daily bars (no extended hours) → iloc[-1] = today's close, [-2] = yesterday
-            hist_daily = self._ticker(symbol).history(
-                period="5d", interval="1d", prepost=False
-            )
-
-            if hist_pre.empty:
+            if history is None or history.empty or "Close" not in history.columns:
                 return None
 
-            current_price = float(hist_pre["Close"].iloc[-1])
+            # Bars with no close are gaps, not prices.
+            history = history[history["Close"].notna()]
+            if history.empty:
+                return None
 
-            regular_close: Optional[float] = None
-            prev_close:    Optional[float] = None
+            current_price = float(history["Close"].iloc[-1])
+            if not math.isfinite(current_price):
+                return None
 
-            if not hist_daily.empty:
-                # Today's regular session close is always the last bar in daily history
-                regular_close = float(hist_daily["Close"].iloc[-1])
-                if len(hist_daily) >= 2:
-                    prev_close = float(hist_daily["Close"].iloc[-2])
-
+            regular = self._regular_session_closes(history)
             return {
                 "current_price": current_price,
-                "regular_close": regular_close,
-                "prev_close":    prev_close,
+                "regular_close": regular[-1] if regular else None,
+                "prev_close": regular[-2] if len(regular) >= 2 else None,
             }
 
         except Exception as exc:
             logger.warning("Extended-hours history failed for %s: %s", symbol, exc)
             return None
+
+    @staticmethod
+    def _regular_session_closes(history: "pd.DataFrame") -> list:
+        """Closing price of each regular session in an intraday series.
+
+        The last bar of a regular session is the one starting at 15:55, so the
+        close is the final bar of each day at or before that. Reading it from
+        the intraday series rather than from daily bars is what removes the
+        second request — and the blank-daily-bar problem with it.
+        """
+        try:
+            index = history.index
+            if index.tz is None:
+                index = index.tz_localize("UTC")
+            local = index.tz_convert(NYSE_TZ)
+        except Exception:
+            return []
+
+        minutes = local.hour * 60 + local.minute
+        regular = history[(minutes >= 9 * 60 + 30) & (minutes < 16 * 60)]
+        if regular.empty:
+            return []
+        # One close per session, oldest first.
+        by_day = regular.groupby(local[
+            (minutes >= 9 * 60 + 30) & (minutes < 16 * 60)
+        ].date)["Close"].last()
+        return [float(v) for v in by_day.tolist() if math.isfinite(float(v))]
 
     def get_regular_close_price(self, symbol: str) -> Optional[float]:
         """Return today's regular-session closing price (last bar at/before 4 PM ET).
