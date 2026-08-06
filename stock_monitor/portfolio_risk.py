@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -73,6 +73,46 @@ def _market_today() -> date:
     from .data_feed import NYSE_TZ
 
     return datetime.now(NYSE_TZ).date()
+
+
+def _expected_session() -> date:
+    """The most recent session the feed ought to be able to price.
+
+    Before the opening bell there is no bar for today yet, so the newest one
+    available is the previous weekday's close; from the bell onwards today's
+    own session is fair to expect.
+    """
+    from .data_feed import NYSE_TZ
+
+    now = datetime.now(NYSE_TZ)
+    day = now.date()
+    if day.weekday() < 5 and (now.hour, now.minute) >= (9, 30):
+        return day
+    while True:
+        day -= timedelta(days=1)
+        if day.weekday() < 5:
+            return day
+
+
+def _sessions_behind(latest_bar: Optional[date]) -> int:
+    """How many weekday sessions the newest bar is short of the expected one.
+
+    Weekdays, not calendar days, so a Monday reading does not report the
+    weekend as an outage. Exchange holidays are not modelled: the day after one
+    can overcount by a session. That is tolerable because the number is only
+    ever used to say "the feed is behind, and here is the date it stopped at" —
+    the date is shown alongside, so an overcount is visible rather than
+    misleading.
+    """
+    if latest_bar is None:
+        return 0
+    expected = _expected_session()
+    behind, cursor = 0, expected
+    while cursor > latest_bar:
+        if cursor.weekday() < 5:
+            behind += 1
+        cursor -= timedelta(days=1)
+    return behind
 
 
 def _bar_date(index_value) -> Optional[date]:
@@ -579,6 +619,13 @@ class PortfolioRiskAnalyzer:
         bar_dates = [p["price_date"] for p in positions if p.get("price_date")]
         latest_bar = max(bar_dates) if bar_dates else None
         return {
+            # Whether the feed as a whole is behind. price_is_stale below is
+            # relative — it measures each holding against the freshest bar in
+            # the portfolio, so when every ticker is a day late nothing is
+            # flagged and the table shows yesterday's prices unremarked. This
+            # measures against the market clock instead, which is the only way
+            # an across-the-board outage becomes visible.
+            "feed_lag_days": _sessions_behind(latest_bar),
             "positions": [
                 {
                     "ticker": p["ticker"],

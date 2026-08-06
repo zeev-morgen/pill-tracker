@@ -34,7 +34,10 @@ def yf_stub(monkeypatch):
     import yfinance as yf
 
     state = {"download": _frame(), "history": _frame(),
-             "fast": {"last_price": 104.0, "previous_close": 103.0, "last_volume": 1000}}
+             "fast": {"last_price": 104.0, "previous_close": 103.0, "last_volume": 1000},
+             "info": {"marketState": "PRE", "regularMarketPrice": 104.0,
+                      "regularMarketTime": 1786003200, "preMarketPrice": 106.5,
+                      "quoteSourceName": "Nasdaq Real Time Price"}}
 
     def fake_download(tickers, **kwargs):
         result = state["download"]
@@ -48,6 +51,13 @@ def yf_stub(monkeypatch):
 
         def history(self, **kwargs):
             result = state["history"]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        @property
+        def info(self):
+            result = state["info"]
             if isinstance(result, Exception):
                 raise result
             return result
@@ -109,6 +119,39 @@ def test_a_timezone_aware_index_is_reported(client, yf_stub):
     yf_stub["download"] = _frame(tz="America/New_York")
     body = client.get("/api/diagnostics/AMZN").json()
     assert "New_York" in body["download_index_tz"]
+
+
+def test_the_quote_summary_endpoint_is_probed(client, yf_stub):
+    """A different backend from the chart one, and the only source of preMarketPrice."""
+    summary = client.get("/api/diagnostics/AMZN").json()["quote_summary"]
+
+    assert summary["marketState"] == "PRE"
+    assert summary["preMarketPrice"] == 106.5
+    assert summary["quoteSourceName"] == "Nasdaq Real Time Price"
+
+
+def test_the_quote_timestamp_is_rendered_in_market_time(client, yf_stub):
+    """An epoch integer can't be eyeballed against 'is this today?'."""
+    summary = client.get("/api/diagnostics/AMZN").json()["quote_summary"]
+
+    assert summary["regularMarketTime_et"].startswith("2026-08-06 04:00")
+
+
+def test_a_quote_summary_without_a_timestamp_is_still_reported(client, yf_stub):
+    yf_stub["info"] = {"marketState": "CLOSED"}
+    summary = client.get("/api/diagnostics/AMZN").json()["quote_summary"]
+
+    assert summary["marketState"] == "CLOSED"
+    assert summary["preMarketPrice"] is None
+    assert "regularMarketTime_et" not in summary
+
+
+def test_a_failing_quote_summary_does_not_sink_the_probe(client, yf_stub):
+    yf_stub["info"] = RuntimeError("401 Unauthorized")
+    body = client.get("/api/diagnostics/AMZN").json()
+
+    assert "RuntimeError" in body["quote_summary"]
+    assert body["fast_info"]["last_price"] == 104.0, "the rest still reported"
 
 
 @pytest.mark.parametrize("source", ["download", "history", "fast"])

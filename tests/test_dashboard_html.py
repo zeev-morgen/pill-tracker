@@ -93,3 +93,29 @@ def test_every_tab_has_a_panel():
 def test_all_six_tabs_are_present():
     tabs = re.findall(r'data-panel="(\w+)"', _HTML)
     assert tabs == ["live", "portfolio", "journal", "news", "atr", "sector"]
+
+
+# ── The stale-feed banner ─────────────────────────────────────────────────────
+
+def test_the_stale_feed_banner_is_rendered_not_just_defined():
+    """A helper nobody calls is how the last silent-failure mode looked."""
+    assert "function staleFeedNote(" in _HTML
+    assert "staleFeedNote(data)" in _HTML.replace("function staleFeedNote(data)", "")
+
+
+def test_the_banner_reads_the_portfolio_level_lag_field():
+    body = _HTML.split("function staleFeedNote(", 1)[1].split("\n}", 1)[0]
+    assert "feed_lag_days" in body
+    assert "latest_bar_date" in body, "the date it stopped at has to be named"
+
+
+def test_a_current_feed_renders_no_banner():
+    body = _HTML.split("function staleFeedNote(", 1)[1].split("\n}", 1)[0]
+    assert "if (!lag) return ''" in body
+
+
+def test_the_as_of_label_turns_red_when_the_feed_is_behind():
+    """Grey subtext is what let a day-old portfolio pass for a live one."""
+    header = _HTML.split("const asOf =", 1)[1].split(";", 1)[0]
+    assert "feed_lag_days" in header
+    assert "down" in header

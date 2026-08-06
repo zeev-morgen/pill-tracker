@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 
 # Bump when a change should be visibly identifiable even without git metadata.
-FEATURES_VERSION = "3.11"
+FEATURES_VERSION = "3.12"
 
 
 @lru_cache(maxsize=1)

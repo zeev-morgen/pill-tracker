@@ -680,6 +680,29 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
             except Exception as exc:
                 out[key] = f"{exc.__class__.__name__}: {exc}"
 
+        # The quote-summary endpoint. Worth asking separately because it is not
+        # the chart backend and not reached the same way: different host path,
+        # cookie+crumb auth, and it carries preMarketPrice/marketState as
+        # fields rather than as bars. fast_info and the intraday series both
+        # come from the chart endpoint, so their agreeing that today is missing
+        # says nothing about this one.
+        try:
+            info = yf.Ticker(symbol).info or {}
+            out["quote_summary"] = {
+                name: info.get(name)
+                for name in ("marketState", "regularMarketPrice", "regularMarketTime",
+                             "preMarketPrice", "preMarketTime", "preMarketChangePercent",
+                             "postMarketPrice", "postMarketTime", "regularMarketVolume",
+                             "exchangeTimezoneName", "quoteSourceName")
+            }
+            stamp = info.get("regularMarketTime")
+            if isinstance(stamp, (int, float)):
+                out["quote_summary"]["regularMarketTime_et"] = str(
+                    datetime.fromtimestamp(stamp, NYSE_TZ)
+                )
+        except Exception as exc:
+            out["quote_summary"] = f"{exc.__class__.__name__}: {exc}"
+
         try:
             fast = yf.Ticker(symbol).fast_info
             out["fast_info"] = {
@@ -1374,6 +1397,21 @@ async function deleteHolding(ticker) {
 /* ── Rendering ── */
 /* Held but unpriceable. Saying so beats a position quietly disappearing from
    the table, which reads as data loss. */
+/* The feed is behind the market clock, across every holding.
+   price_is_stale can't catch this: it ranks each holding against the freshest
+   bar in the portfolio, so a feed that is uniformly a day late looks perfectly
+   consistent and the table quietly shows old prices as if they were current. */
+function staleFeedNote(data) {
+  const lag = data.feed_lag_days;
+  if (!lag) return '';
+  const when = data.latest_bar_date ? ` המחיר האחרון שהתקבל הוא מ-${esc(data.latest_bar_date)}.` : '';
+  const much = lag === 1 ? 'מסחר אחד' : `${lag} ימי מסחר`;
+  return `<div class="banner warn" style="margin:14px 18px">` +
+    `⚠️ <b>המחירים אינם מעודכנים.</b> ספק הנתונים (Yahoo) מפגר ביום ${much} ` +
+    `ואינו מחזיר מחירים עבור הסשן הנוכחי.${when} ` +
+    `הנתונים בטבלה נכונים לתאריך הזה — לא לעכשיו. השווי והרווח/הפסד מחושבים לפיהם.</div>`;
+}
+
 function skippedNote(data) {
   const skipped = data.skipped_tickers;
   if (!skipped || !skipped.length) return '';
@@ -1404,12 +1442,15 @@ function renderHoldings(data) {
   const asOf = live === data.positions.length && live
     ? ` · <span class="volume">מחירים חיים</span>`
     : data.latest_bar_date
-      ? ` · <span class="volume">מחירים מ-${esc(data.latest_bar_date)}</span>` : '';
+      // Grey reads as a footnote. When the feed is behind the market this is
+      // the headline, so it takes the colour the losses take.
+      ? ` · <span class="${data.feed_lag_days ? 'down' : 'volume'}">` +
+        `מחירים מ-${esc(data.latest_bar_date)}</span>` : '';
   document.getElementById('portfolio-total').innerHTML =
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
     `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>` + asOf;
 
-  wrap.innerHTML = skippedNote(data) + `<table>
+  wrap.innerHTML = staleFeedNote(data) + skippedNote(data) + `<table>
     <thead><tr>
       <th>סמל</th><th>כמות</th><th>מחיר כניסה</th><th>מחיר נוכחי</th>
       <th>פרי / פוסט</th><th>שווי</th><th>רווח/הפסד</th><th>ימי החזקה</th>
