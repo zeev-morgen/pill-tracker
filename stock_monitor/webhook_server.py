@@ -79,6 +79,23 @@ def create_webhook_app(
     # Enabled only when DASHBOARD_USER and DASHBOARD_PASSWORD are both set, so
     # local runs are unaffected. Required for any public deployment.
     @app.middleware("http")
+    async def no_stale_responses(request: Request, call_next):
+        """Forbid caching of the dashboard and its API.
+
+        Every one of these responses is live market data or the page that
+        renders it, and none of them carried a Cache-Control header — so a
+        browser or an intermediate proxy was free to serve an old copy
+        indefinitely. That looks exactly like a portfolio that has stopped
+        updating, and like a deploy that never landed.
+        """
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+    @app.middleware("http")
     async def require_basic_auth(request: Request, call_next):
         user, password = _auth_configured()
         if not user or not password:

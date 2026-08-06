@@ -599,3 +599,51 @@ def test_a_ticker_missing_from_the_intraday_batch_falls_back_alone(
     PortfolioRiskAnalyzer(store, data_feed=counting_feed).full_report()
 
     assert sorted(counting_feed.calls) == sorted(TICKERS[3:])
+
+
+# ── Volume spikes are an intraday measure ─────────────────────────────────────
+
+def test_a_volume_spike_only_fires_during_the_regular_session():
+    """The quote's volume field is not today's outside the session.
+
+    Before the open it still carries yesterday's final total, so a genuine
+    spike one day was re-detected as a fresh spike the next morning — and
+    again after the close, once per cooldown, until 20:00.
+    """
+    from stock_monitor.alert_engine import AlertEngine
+    from stock_monitor.config import AlertConfig, AppConfig, StockConfig
+
+    config = AppConfig(stocks=[StockConfig(symbol="MU", alerts=[
+        AlertConfig(type="volume_spike", multiplier=2.5, cooldown_minutes=60)])])
+
+    class Feed:
+        def get_average_daily_volume(self, symbol):
+            return 10_000_000
+
+    engine = AlertEngine(config, Feed())
+    alert = config.stocks[0].alerts[0]
+    yesterdays_spike = 32_000_000        # 3.2x the average
+
+    fired = {}
+    for session in ("regular", "pre", "after", "closed"):
+        engine._cooldowns.clear()
+        fired[session] = engine._check_volume_spike(
+            "MU", alert, yesterdays_spike, session) is not None
+
+    assert fired == {"regular": True, "pre": False, "after": False, "closed": False}
+
+
+def test_an_unknown_session_still_evaluates():
+    """Callers that pass no session keep the old behaviour rather than going mute."""
+    from stock_monitor.alert_engine import AlertEngine
+    from stock_monitor.config import AlertConfig, AppConfig, StockConfig
+
+    config = AppConfig(stocks=[StockConfig(symbol="MU", alerts=[])])
+
+    class Feed:
+        def get_average_daily_volume(self, symbol):
+            return 10_000_000
+
+    engine = AlertEngine(config, Feed())
+    alert = AlertConfig(type="volume_spike", multiplier=2.5, time_adjusted=False)
+    assert engine._check_volume_spike("MU", alert, 32_000_000) is not None

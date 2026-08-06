@@ -109,3 +109,24 @@ def test_root_rejects_unauthenticated_probes(secured, method):
     # Pointing a monitor at "/" instead of "/health" must fail loudly (401),
     # never silently succeed against the protected dashboard.
     assert getattr(secured, method)("/").status_code == 401
+
+
+# ── Caching ───────────────────────────────────────────────────────────────────
+
+def test_live_responses_are_not_cacheable():
+    """None of these carried a Cache-Control header.
+
+    A browser or an intermediate proxy was free to serve an old copy of the
+    price API indefinitely, which looks exactly like a portfolio that has
+    stopped updating — and like a deploy that never landed.
+    """
+    from fastapi.testclient import TestClient
+
+    from stock_monitor.config import NotificationConfig
+    from stock_monitor.notifier import NotificationDispatcher
+    from stock_monitor.webhook_server import create_webhook_app
+
+    client = TestClient(create_webhook_app(NotificationDispatcher(NotificationConfig()), ""))
+    for path in ("/", "/api/watchlist", "/api/journal"):
+        response = client.get(path)
+        assert "no-store" in response.headers.get("cache-control", ""), path

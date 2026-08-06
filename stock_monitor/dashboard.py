@@ -513,8 +513,10 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
                     out[source] = f"no Close column: {list(frame.columns)[:6]}"
                     return
                 closes = frame["Close"].tail(5)
+                stamp = (lambda i: str(i)) if source == "intraday_5m" else (
+                    lambda i: str(i.date() if hasattr(i, "date") else i))
                 out[source] = [
-                    [str(idx.date() if hasattr(idx, "date") else idx),
+                    [stamp(idx),
                      None if pd.isna(v) else round(float(v), 2)]
                     for idx, v in closes.items()
                 ]
@@ -535,6 +537,24 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
             _tail(yf.Ticker(symbol).history(period=period, auto_adjust=True), "history")
         except Exception as exc:
             out["history"] = f"{exc.__class__.__name__}: {exc}"
+
+        # The intraday series is what the portfolio now prices from during a
+        # session, so its freshness is the question when prices look stuck.
+        try:
+            intraday = yf.download([symbol], period="5d", interval="5m",
+                                   prepost=True, auto_adjust=True,
+                                   progress=False, group_by="ticker", threads=False)
+            if (intraday is not None and not intraday.empty
+                    and hasattr(intraday.columns, "levels")
+                    and symbol in intraday.columns.get_level_values(0)):
+                intraday = intraday[symbol]
+            _tail(intraday, "intraday_5m")
+            if isinstance(out.get("intraday_5m"), list) and out["intraday_5m"]:
+                newest = out["intraday_5m"][-1][0]
+                out["intraday_newest_bar"] = newest
+                out["intraday_covers_today"] = str(datetime.now(timezone.utc).date()) in newest
+        except Exception as exc:
+            out["intraday_5m"] = f"{exc.__class__.__name__}: {exc}"
 
         try:
             fast = yf.Ticker(symbol).fast_info

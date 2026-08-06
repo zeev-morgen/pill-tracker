@@ -123,7 +123,9 @@ class AlertEngine:
         if alert.type == "price_change_pct":
             return self._check_price_change_pct(symbol, alert, data["price"])
         if alert.type == "volume_spike":
-            return self._check_volume_spike(symbol, alert, data["volume"])
+            return self._check_volume_spike(
+                symbol, alert, data["volume"], data.get("session")
+            )
         if alert.type == "price_threshold":
             return self._check_price_threshold(symbol, alert, data["price"])
         logger.warning("Unknown alert type: %s", alert.type)
@@ -172,8 +174,19 @@ class AlertEngine:
         )
 
     def _check_volume_spike(
-        self, symbol: str, alert: AlertConfig, volume: int
+        self, symbol: str, alert: AlertConfig, volume: int,
+        session: Optional[str] = None,
     ) -> Optional[AlertEvent]:
+        """Cumulative session volume against the 10-day average.
+
+        Only meaningful while the regular session is running. The volume field
+        is the day's running total, and outside the session it is not today's:
+        before the open the quote still carries *yesterday's* final volume, so
+        a genuine spike one day was re-detected as a fresh spike the next
+        morning — and again after the close, every cooldown, until 20:00.
+        """
+        if session is not None and session != "regular":
+            return None
         if volume <= 0:
             return None
 
@@ -181,25 +194,17 @@ class AlertEngine:
         if not avg or avg <= 0:
             return None
 
-        # Choose what to compare today's cumulative volume against.
+        # Scale the 10-day average to the elapsed portion of the trading day,
+        # so a spike can fire intraday — e.g. a full day's volume already
+        # traded in the first 3 hours. Clamp the fraction so the noisy first
+        # minutes don't inflate the ratio.
         if alert.time_adjusted:
-            frac = session_elapsed_fraction()
-            if 0.0 < frac < 1.0:
-                # Mid-session: scale the 10-day average to the elapsed portion of
-                # the trading day, so a spike can fire intraday — e.g. a full
-                # day's volume already traded in the first 3 hours. Clamp the
-                # fraction so the noisy first minutes don't inflate the ratio.
-                frac = max(frac, MIN_SESSION_FRACTION)
-                expected = avg * frac
-                benchmark = (
-                    f"the pace expected by {frac * 100:.0f}% into the day "
-                    f"({int(expected):,} of the {int(avg):,} 10-day avg)"
-                )
-            else:
-                # Pre-market or after the close: no meaningful intraday pace, so
-                # fall back to the plain full-day comparison.
-                expected = avg
-                benchmark = f"the 10-day avg ({int(avg):,})"
+            frac = max(session_elapsed_fraction(), MIN_SESSION_FRACTION)
+            expected = avg * frac
+            benchmark = (
+                f"the pace expected by {frac * 100:.0f}% into the day "
+                f"({int(expected):,} of the {int(avg):,} 10-day avg)"
+            )
         else:
             expected = avg
             benchmark = f"the 10-day avg ({int(avg):,})"
