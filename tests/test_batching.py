@@ -562,12 +562,28 @@ def test_the_extended_move_is_derived_from_the_batch(
 ):
     """The batch carries the regular close, not a precomputed percentage."""
     monkeypatch.setattr(data_feed, "get_market_session", lambda: "pre")
+    # _intraday() puts its newest bar on 2026-08-04, so that has to be "today"
+    # for the quote to count as a live extended-hours print.
+    monkeypatch.setattr(portfolio_risk, "_market_today", lambda: date(2026, 8, 4))
     report = PortfolioRiskAnalyzer(store).full_report()
 
     position = report["positions"][0]
     assert position["extended_price"] == pytest.approx(105.0)
     # 105.0 against the 100.0 regular close in _intraday()
     assert position["extended_change_pct"] == pytest.approx(5.0)
+
+
+def test_no_extended_columns_when_nothing_printed_today(
+    monkeypatch, store, counting_download
+):
+    """A "Pre" badge over yesterday's number claims a quote that does not exist."""
+    monkeypatch.setattr(data_feed, "get_market_session", lambda: "pre")
+    monkeypatch.setattr(portfolio_risk, "_market_today", lambda: date(2026, 8, 6))
+    position = PortfolioRiskAnalyzer(store).full_report()["positions"][0]
+
+    assert position["session"] == "pre"
+    assert position["extended_price"] is None
+    assert position["extended_change_pct"] is None
 
 
 def test_a_failed_intraday_batch_falls_back_to_the_per_ticker_quote(

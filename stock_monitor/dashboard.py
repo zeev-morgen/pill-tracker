@@ -1344,10 +1344,16 @@ function priceDateCell(p) {
    the row is the whole story, so the cell stays empty rather than repeating it. */
 function extendedCell(p) {
   if (p.session !== 'pre' && p.session !== 'after') return '<span class="flat">—</span>';
+  // No badge without a price from today: most names do not print for hours
+  // after 04:00, and a "Pre" tag on yesterday's number claims a live quote
+  // that does not exist — which is what made the tab look frozen.
+  if (p.extended_price == null) {
+    return `<span class="volume">טרם נסחר</span>`;
+  }
   const label = p.session === 'pre' ? 'Pre' : 'After';
-  const price = p.extended_price == null ? '' : ' ' + money(p.extended_price);
   return `<span class="session-tag session-${p.session}">${label}</span>` +
-         `<span class="ext-price">${price} ${pctCell(p.extended_change_pct)}</span>`;
+         `<span class="ext-price"> ${money(p.extended_price)} ` +
+         `${pctCell(p.extended_change_pct)}</span>`;
 }
 
 

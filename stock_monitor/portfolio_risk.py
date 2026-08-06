@@ -339,9 +339,19 @@ class PortfolioRiskAnalyzer:
 
     @staticmethod
     def _extended_fields(quote: dict, session: str) -> dict:
-        """Pre/post-market columns, from a quote already fetched."""
+        """Pre/post-market columns, from a quote already fetched.
+
+        Only filled when the quote's bar is from today. Most names have no
+        pre-market print for hours after 04:00, and showing the previous
+        evening's after-hours price under a "Pre" badge claims a live
+        extended-hours quote that does not exist.
+        """
         if session not in ("pre", "after") or not quote:
             return {"session": session} if session else {}
+        as_of = quote.get("as_of")
+        if as_of is not None and as_of != _market_today():
+            return {"session": session, "extended_price": None,
+                    "extended_change_pct": None}
         change = quote.get("since_close_pct")
         if change is None:
             # The batched quote carries the regular close rather than a
