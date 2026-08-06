@@ -376,3 +376,64 @@ def test_an_error_payload_is_reported_not_raised(chart_response):
     out = dashboard.raw_chart_probe("AVGO")
     assert out["status"] == 429
     assert "Too Many Requests" in out["error"]
+
+
+# ── The Tiingo section ────────────────────────────────────────────────────────
+
+def test_an_unconfigured_tiingo_says_so_by_name(client, yf_stub, monkeypatch):
+    """'No live price' looks identical to a bad key from the portfolio."""
+    from stock_monitor import tiingo
+
+    monkeypatch.delenv(tiingo.ENV_KEY, raising=False)
+    assert "TIINGO_API_KEY" in client.get("/api/diagnostics/AMZN").json()["tiingo"]
+
+
+def test_a_working_tiingo_reports_its_quote(client, yf_stub, monkeypatch):
+    from datetime import date
+
+    from stock_monitor import tiingo
+    from stock_monitor.data_feed import NYSE_TZ
+
+    today = pd.Timestamp.now(tz=NYSE_TZ).date()
+    monkeypatch.setenv(tiingo.ENV_KEY, "test-key")
+    monkeypatch.setattr(tiingo, "get_quotes", lambda t: {
+        "AMZN": {"price": 421.75, "regular_close": 418.28, "as_of": today}})
+
+    section = client.get("/api/diagnostics/AMZN").json()["tiingo"]
+    assert section["price"] == 421.75
+    assert section["has_today"] is True
+
+
+def test_a_tiingo_quote_from_an_earlier_session_is_flagged(client, yf_stub, monkeypatch):
+    from datetime import date
+
+    from stock_monitor import tiingo
+
+    monkeypatch.setenv(tiingo.ENV_KEY, "test-key")
+    monkeypatch.setattr(tiingo, "get_quotes", lambda t: {
+        "AMZN": {"price": 418.28, "regular_close": None, "as_of": date(2020, 1, 1)}})
+
+    assert client.get("/api/diagnostics/AMZN").json()["tiingo"]["has_today"] is False
+
+
+def test_a_configured_tiingo_with_no_answer_is_distinguishable(client, yf_stub, monkeypatch):
+    """A rejected key returns nothing — that must not read as 'not set up'."""
+    from stock_monitor import tiingo
+
+    monkeypatch.setenv(tiingo.ENV_KEY, "test-key")
+    monkeypatch.setattr(tiingo, "get_quotes", lambda t: {})
+
+    section = client.get("/api/diagnostics/AMZN").json()["tiingo"]
+    assert "configured" in section and "no quote" in section
+
+
+def test_a_failing_tiingo_does_not_sink_the_probe(client, yf_stub, monkeypatch):
+    from stock_monitor import tiingo
+
+    monkeypatch.setenv(tiingo.ENV_KEY, "test-key")
+    monkeypatch.setattr(tiingo, "get_quotes",
+                        lambda t: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    body = client.get("/api/diagnostics/AMZN").json()
+    assert "RuntimeError" in body["tiingo"]
+    assert isinstance(body["history"], list), "the rest still reported"

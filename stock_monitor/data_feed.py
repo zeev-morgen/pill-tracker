@@ -234,6 +234,20 @@ class StockDataFeed:
         if not symbols:
             return {}
         session = get_market_session()
+
+        # Tiingo first where it is configured. Yahoo answers this request with
+        # a 200 carrying the *previous* session's bars, so there is no error to
+        # fall back on — the choice has to be made on whether the data is
+        # today's, which get_monitor_quotes only returns when it is. Symbols it
+        # cannot price fall through to Yahoo below.
+        from . import tiingo
+
+        live = tiingo.get_monitor_quotes(symbols)
+        remaining = [s for s in symbols if s not in live]
+        if not remaining:
+            return live
+        symbols = remaining
+
         try:
             data = yf.download(
                 symbols, period=INTRADAY_PERIOD, interval="5m", prepost=True,
@@ -244,12 +258,14 @@ class StockDataFeed:
                 "batch quote download failed (%s: %s) — falling back to per-symbol",
                 exc.__class__.__name__, exc,
             )
-            return {}
+            # Whatever Tiingo already priced stands; only the symbols it did
+            # not cover are lost, and those are what the per-symbol path retries.
+            return live
 
         if data is None or data.empty:
-            return {}
+            return live
 
-        out: Dict[str, Dict] = {}
+        out: Dict[str, Dict] = dict(live)
         for symbol in symbols:
             try:
                 if isinstance(data.columns, pd.MultiIndex):

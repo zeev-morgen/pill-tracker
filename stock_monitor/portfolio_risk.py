@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import yfinance as yf
 
-from . import reference_data
+from . import reference_data, tiingo
 from .store import PortfolioStore
 
 logger = logging.getLogger(__name__)
@@ -360,6 +360,39 @@ class PortfolioRiskAnalyzer:
                 logger.debug("intraday parse failed for %s: %s", ticker, exc)
         return quotes
 
+    def _live_quotes(self, tickers: List[str], session: str) -> Dict[str, dict]:
+        """Current prices for the portfolio, from whichever source has them.
+
+        Tiingo first when it is configured, because Yahoo is the source that
+        failed: it serves this host the previous session's bars with a 200, so
+        preferring it and falling back on an *error* would never fall back at
+        all — there is no error to catch. The switch is therefore on the data,
+        not on the exception: a Tiingo quote is used when it is priced from
+        today, and Yahoo fills in every ticker Tiingo did not cover.
+
+        Both sides return the same shape, so the caller cannot tell them apart
+        and does not need to.
+        """
+        if not tickers:
+            return {}
+        if not tiingo.is_configured():
+            return self._intraday_quotes(tickers, session)
+
+        fresh = {
+            ticker: quote
+            for ticker, quote in tiingo.get_quotes(tickers).items()
+            if quote.get("as_of") == _market_today()
+        }
+        missing = [t for t in tickers if t not in fresh]
+        if not missing:
+            return fresh
+        # Yahoo is still worth asking for the remainder: a thinly traded name
+        # with no print today is a gap Tiingo cannot fill either, and Yahoo's
+        # bars at least date themselves honestly.
+        merged = self._intraday_quotes(missing, session)
+        merged.update(fresh)
+        return merged
+
     def _quote(self, ticker: str) -> dict:
         """Live quote for one ticker, or empty if it cannot be had.
 
@@ -488,7 +521,7 @@ class PortfolioRiskAnalyzer:
             for frame in histories.values()
         )
         intraday = (
-            self._intraday_quotes(tickers, session)
+            self._live_quotes(tickers, session)
             if session in ("pre", "regular", "after") or bars_behind
             else {}
         )

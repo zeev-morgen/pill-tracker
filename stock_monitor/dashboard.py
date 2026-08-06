@@ -680,6 +680,25 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
             except Exception as exc:
                 out[key] = f"{exc.__class__.__name__}: {exc}"
 
+        # The replacement source. A wrong key or an exhausted quota fails the
+        # same way a working one does at the portfolio level — no live price,
+        # fall back to Yahoo — so it needs somewhere to say which it is.
+        from . import tiingo
+
+        if not tiingo.is_configured():
+            out["tiingo"] = "not configured (set TIINGO_API_KEY)"
+        else:
+            try:
+                quote = tiingo.get_quotes([symbol]).get(symbol)
+                out["tiingo"] = (
+                    {"price": quote["price"], "as_of": str(quote["as_of"]),
+                     "regular_close": quote["regular_close"],
+                     "has_today": quote["as_of"] == datetime.now(NYSE_TZ).date()}
+                    if quote else "configured, but no quote returned for this ticker"
+                )
+            except Exception as exc:
+                out["tiingo"] = f"{exc.__class__.__name__}: {exc}"
+
         # The quote-summary endpoint. Worth asking separately because it is not
         # the chart backend and not reached the same way: different host path,
         # cookie+crumb auth, and it carries preMarketPrice/marketState as
