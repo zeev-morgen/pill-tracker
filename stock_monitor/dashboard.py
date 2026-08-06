@@ -480,10 +480,15 @@ async def api_export_portfolio():
 CONTROL_TICKER = "SPY"
 _CONTROL_FALLBACK = "QQQ"
 
-_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+#: Yahoo answers the same API from two edges. They are not always in the same
+#: state, so both get asked — if one carries today's bars and the other does
+#: not, the fix is a hostname.
+CHART_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+
+_CHART_URL = "https://{host}/v8/finance/chart/{symbol}"
 
 
-def raw_chart_probe(symbol: str) -> dict:
+def raw_chart_probe(symbol: str, host: str = CHART_HOSTS[0]) -> dict:
     """Hit Yahoo's chart endpoint directly, bypassing yfinance.
 
     yfinance sits between us and Yahoo: it picks the transport, parses the
@@ -492,7 +497,7 @@ def raw_chart_probe(symbol: str) -> dict:
     goes missing on — a 200 whose payload already lacks today's timestamps is
     Yahoo withholding, while a payload that has them is yfinance losing them.
     """
-    url = _CHART_URL.format(symbol=symbol)
+    url = _CHART_URL.format(host=host, symbol=symbol)
     params = {"range": "2d", "interval": "5m", "includePrePost": "true"}
     out: Dict[str, object] = {"url": url}
 
@@ -667,11 +672,13 @@ async def api_diagnostics(ticker: str, period: str = "1mo"):
             out["control_intraday"] = f"{exc.__class__.__name__}: {exc}"
 
         # And the same question asked of Yahoo directly, with yfinance out of
-        # the path entirely.
-        try:
-            out["raw_chart"] = raw_chart_probe(symbol)
-        except Exception as exc:
-            out["raw_chart"] = f"{exc.__class__.__name__}: {exc}"
+        # the path entirely — once per edge, since they can disagree.
+        for host in CHART_HOSTS:
+            key = f"raw_chart_{host.split('.')[0]}"
+            try:
+                out[key] = raw_chart_probe(symbol, host)
+            except Exception as exc:
+                out[key] = f"{exc.__class__.__name__}: {exc}"
 
         try:
             fast = yf.Ticker(symbol).fast_info

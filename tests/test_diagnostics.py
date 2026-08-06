@@ -62,11 +62,11 @@ def yf_stub(monkeypatch):
 
     state["raw_chart"] = {"status": 200, "bars_today": 12, "premarket_bars_today": 12}
 
-    def fake_raw_chart(symbol):
+    def fake_raw_chart(symbol, host=dashboard.CHART_HOSTS[0]):
         result = state["raw_chart"]
         if isinstance(result, Exception):
             raise result
-        return dict(result, ticker=symbol)
+        return dict(result, ticker=symbol, host=host)
 
     monkeypatch.setattr(yf, "download", fake_download)
     monkeypatch.setattr(yf, "Ticker", FakeTicker)
@@ -212,16 +212,24 @@ def test_the_raw_chart_response_is_included(client, yf_stub):
     """Yahoo answered directly, with yfinance out of the path."""
     body = client.get("/api/diagnostics/AMZN").json()
 
-    assert body["raw_chart"]["status"] == 200
-    assert body["raw_chart"]["premarket_bars_today"] == 12
-    assert body["raw_chart"]["ticker"] == "AMZN"
+    assert body["raw_chart_query1"]["status"] == 200
+    assert body["raw_chart_query1"]["premarket_bars_today"] == 12
+    assert body["raw_chart_query1"]["ticker"] == "AMZN"
+
+
+def test_both_yahoo_edges_are_probed(client, yf_stub):
+    """One edge carrying today's bars while the other doesn't makes the fix a hostname."""
+    body = client.get("/api/diagnostics/AMZN").json()
+
+    hosts = {body[f"raw_chart_{h.split('.')[0]}"]["host"] for h in dashboard.CHART_HOSTS}
+    assert hosts == set(dashboard.CHART_HOSTS)
 
 
 def test_a_failing_raw_chart_does_not_sink_the_probe(client, yf_stub):
     yf_stub["raw_chart"] = RuntimeError("401 Unauthorized")
     body = client.get("/api/diagnostics/AMZN").json()
 
-    assert "RuntimeError" in body["raw_chart"]
+    assert "RuntimeError" in body["raw_chart_query1"]
     assert isinstance(body["download"], list), "the rest still reported"
 
 
@@ -268,6 +276,11 @@ def test_it_counts_todays_premarket_bars(chart_response):
     assert out["premarket_bars_today"] == 6, "all six are before 09:30 ET"
     assert out["regular_market_price"] == 418.28
     assert "AVGO" in out["url"]
+
+
+def test_the_host_is_part_of_the_url(chart_response):
+    for host in dashboard.CHART_HOSTS:
+        assert host in dashboard.raw_chart_probe("AVGO", host)["url"]
 
 
 def test_bars_from_the_regular_session_are_not_counted_as_premarket(chart_response):
