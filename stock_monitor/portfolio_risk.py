@@ -311,9 +311,7 @@ def _resolve_currency(ticker: str, info: dict) -> str:
     allocation slice it feeds.
     """
     code = fx.normalize_currency(info.get("currency"))
-    if code:
-        return code
-    return fx.AGOROT if ticker.upper().endswith(".TA") else ""
+    return code or fx.currency_for_ticker(ticker)
 
 
 class PortfolioRiskAnalyzer:

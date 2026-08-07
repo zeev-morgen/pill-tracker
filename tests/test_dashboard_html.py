@@ -168,3 +168,27 @@ def test_the_unit_hint_is_refreshed_when_the_modal_opens():
     """Editing pre-fills the ticker without firing an input event."""
     modal = _HTML.split("function openModal(", 1)[1].split("\nfunction closeModal", 1)[0]
     assert "updateCurrencyHint()" in modal
+
+
+# ── The live-monitor tab ──────────────────────────────────────────────────────
+
+def test_the_live_tab_has_no_hardcoded_dollar_signs():
+    """A '$' before a Tel Aviv price misreports it by roughly four hundred."""
+    rows = _HTML.split("function renderStocks(", 1)[1].split("\n}", 1)[0]
+    assert "'$'+" not in rows
+    assert "$${s.price" not in rows
+
+
+def test_live_prices_are_rendered_with_the_symbols_currency():
+    rows = _HTML.split("function renderStocks(", 1)[1].split("\n}", 1)[0]
+    for field in ("s.price", "s.day_high", "s.day_low"):
+        assert f"nativeMoney({field}, s.currency)" in rows, field
+
+
+def test_a_tel_aviv_row_is_not_labelled_with_a_new_york_session():
+    """Teva was tagged Pre-Market at 12:45 ET, hours after TASE had closed."""
+    cell = _HTML.split("function sessionCell(", 1)[1].split("\n}", 1)[0]
+    assert "'ILA'" in cell and "'ILS'" in cell
+    rows = _HTML.split("function renderStocks(", 1)[1].split("\n}", 1)[0]
+    assert "sessionCell(s)" in rows
+    assert "sessionLabel(s.session)" not in rows, "the raw session label bypasses the check"

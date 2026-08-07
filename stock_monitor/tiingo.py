@@ -234,6 +234,7 @@ def get_monitor_quotes(symbols: List[str]) -> Dict[str, dict]:
             "day_high": _finite(row.get("high")),
             "day_low": _finite(row.get("low")),
             "session": session,
+            "currency": "",   # Tiingo's IEX feed is US listings, quoted in USD
             "timestamp": datetime.now(NYSE_TZ),
             "bar_time": parse_timestamp(row.get("timestamp")),
             "source": "tiingo",

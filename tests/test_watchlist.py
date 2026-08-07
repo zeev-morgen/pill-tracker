@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -142,3 +143,94 @@ def test_pruning_drops_quotes_for_symbols_no_longer_watched():
     dashboard.prune_price_cache(["AMZN"])
     assert list(dashboard._price_cache) == ["AMZN"]
     dashboard._price_cache.clear()
+
+
+# ── Rejecting symbols that do not exist ───────────────────────────────────────
+
+def test_an_unknown_symbol_is_rejected_with_a_reason(client, monkeypatch):
+    """A misspelled ticker used to be stored and then silently never appear,
+    which is indistinguishable from the feature being broken."""
+    from stock_monitor import dashboard
+
+    monkeypatch.setattr(dashboard, "symbol_is_known", lambda symbol: False)
+    response = client.post("/api/watchlist", json={"symbol": "ESTL.TA"})
+
+    assert response.status_code == 422
+    assert "ESTL.TA" in response.json()["detail"]
+    assert "ESTL.TA" not in watchlist_store.all(), "a rejected symbol must not be stored"
+
+
+def test_the_rejection_mentions_the_tase_suffix(client, monkeypatch):
+    from stock_monitor import dashboard
+
+    monkeypatch.setattr(dashboard, "symbol_is_known", lambda symbol: False)
+    detail = client.post("/api/watchlist", json={"symbol": "NOPE"}).json()["detail"]
+
+    assert ".TA" in detail
+
+
+def test_a_known_symbol_is_added_and_marked_verified(client, monkeypatch):
+    from stock_monitor import dashboard
+
+    monkeypatch.setattr(dashboard, "symbol_is_known", lambda symbol: True)
+    body = client.post("/api/watchlist", json={"symbol": "TEVA.TA"}).json()
+
+    assert body["added"] == "TEVA.TA"
+    assert body["verified"] is True
+
+
+def test_an_unreachable_source_does_not_block_a_valid_symbol(client, monkeypatch):
+    """Yahoo throttling says nothing about whether the ticker is real."""
+    from stock_monitor import dashboard
+
+    monkeypatch.setattr(dashboard, "symbol_is_known", lambda symbol: None)
+    response = client.post("/api/watchlist", json={"symbol": "AVGO"})
+
+    assert response.status_code == 201
+    assert response.json()["verified"] is False, "added on trust, and says so"
+    assert "AVGO" in watchlist_store.all()
+
+
+def test_a_malformed_symbol_is_rejected_before_the_network(client, monkeypatch):
+    """No point asking Yahoo about a string that cannot be a ticker."""
+    from stock_monitor import dashboard
+
+    monkeypatch.setattr(
+        dashboard, "symbol_is_known",
+        lambda symbol: pytest.fail("must not reach the data source"),
+    )
+    assert client.post("/api/watchlist", json={"symbol": "bad symbol!"}).status_code == 422
+
+
+def test_verification_distinguishes_empty_from_broken(monkeypatch, real_symbol_check):
+    """False means 'no such symbol'; None means 'could not find out'."""
+    import yfinance as yf
+
+    symbol_is_known = real_symbol_check
+
+    class Empty:
+        def history(self, **kwargs):
+            return pd.DataFrame()
+
+    class Boom:
+        def history(self, **kwargs):
+            raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr(yf, "Ticker", lambda s: Empty())
+    assert symbol_is_known("ESTL.TA") is False
+
+    monkeypatch.setattr(yf, "Ticker", lambda s: Boom())
+    assert symbol_is_known("AVGO") is None
+
+
+def test_a_frame_of_only_blank_closes_counts_as_unknown(monkeypatch, real_symbol_check):
+    import numpy as np
+    import yfinance as yf
+
+    symbol_is_known = real_symbol_check
+
+    blank = pd.DataFrame({"Close": [np.nan, np.nan]})
+    monkeypatch.setattr(yf, "Ticker", lambda s: type("T", (), {
+        "history": lambda self, **kw: blank})())
+
+    assert symbol_is_known("ESTL.TA") is False

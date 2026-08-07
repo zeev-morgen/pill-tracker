@@ -258,3 +258,42 @@ def test_a_journal_row_written_before_this_feature_reads_as_dollars(rate):
     row = legacy.as_dict()
     assert row["currency"] == ""
     assert row["pnl_value_usd"] == pytest.approx(136.0)
+
+
+# ── The live-monitor tab ──────────────────────────────────────────────────────
+
+def test_the_live_quote_carries_its_currency():
+    """The screenshot bug: Teva at 10,500 agorot rendered as $10,500."""
+    from stock_monitor.data_feed import quote_currency
+
+    assert quote_currency("TEVA.TA") == "ILA"
+    assert quote_currency("AVGO") == ""
+
+
+def test_the_suffix_rule_ignores_case():
+    from stock_monitor.data_feed import quote_currency
+
+    assert quote_currency("teva.ta") == "ILA"
+
+
+def test_the_price_cache_keeps_the_currency():
+    """It is dropped there and the live tab has nothing left to format with."""
+    from stock_monitor import dashboard
+
+    dashboard.update_price_cache({
+        "symbol": "TEVA.TA", "price": 10500.0, "change_pct": 1.06,
+        "volume": 0, "session": "pre", "currency": "ILA",
+    })
+    assert dashboard._price_cache["TEVA.TA"]["currency"] == "ILA"
+    dashboard._price_cache.pop("TEVA.TA", None)
+
+
+def test_a_us_quote_still_has_no_currency():
+    from stock_monitor import dashboard
+
+    dashboard.update_price_cache({
+        "symbol": "AVGO", "price": 418.28, "change_pct": 0.1,
+        "volume": 100, "session": "pre",
+    })
+    assert dashboard._price_cache["AVGO"]["currency"] == ""
+    dashboard._price_cache.pop("AVGO", None)

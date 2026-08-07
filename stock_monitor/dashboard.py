@@ -8,7 +8,7 @@ risk tabs, and allocation pie charts.
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 from fastapi import APIRouter, Body, HTTPException
@@ -108,6 +108,11 @@ def update_price_cache(data: dict) -> None:
         "day_high":        data.get("day_high"),
         "day_low":         data.get("day_low"),
         "session":         data["session"],
+        # Without this the live tab prints every price with a $. A Tel Aviv
+        # quote is in agorot, so Teva at 10,500 rendered as $10,500 — off by a
+        # factor of roughly four hundred, and the only clue was that the number
+        # looked absurd.
+        "currency":        data.get("currency", ""),
         "updated":         datetime.now().strftime("%H:%M:%S"),
     }
 
@@ -416,13 +421,55 @@ async def api_watchlist():
     return JSONResponse({"symbols": watchlist_store.all()})
 
 
+def symbol_is_known(symbol: str) -> Optional[bool]:
+    """Whether the data source recognises a symbol. None means "cannot tell".
+
+    A misspelled ticker used to be accepted without complaint and then simply
+    never appear on the live tab, which is indistinguishable from the feature
+    being broken. Checking on the way in turns that into a message.
+
+    The three-way answer matters. An *empty* result means the symbol does not
+    exist — reject it. An *exception* means the source was unreachable or
+    throttling, which says nothing about the symbol, so the caller must not
+    treat it as a rejection or a bad afternoon at Yahoo would block adding
+    perfectly valid tickers.
+    """
+    try:
+        import yfinance as yf
+
+        frame = yf.Ticker(symbol).history(period="5d")
+    except Exception as exc:
+        logger.warning("could not verify %s (%s)", symbol, exc.__class__.__name__)
+        return None
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return False
+    return bool(frame["Close"].notna().any())
+
+
 @router.post("/api/watchlist")
 async def api_add_watchlist(payload: dict = Body(...)):
     try:
-        symbol = watchlist_store.add(payload.get("symbol", ""))
+        symbol = watchlist_store.normalize(payload.get("symbol", ""))
     except HoldingError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return JSONResponse({"symbols": watchlist_store.all(), "added": symbol}, status_code=201)
+
+    known = await run_in_threadpool(symbol_is_known, symbol)
+    if known is False:
+        raise HTTPException(
+            status_code=422,
+            detail=f"לא נמצאו נתונים עבור {symbol} — בדקו את הכתיב. "
+                   f"מניות בבורסה בתל אביב מסתיימות ב-‎.TA (לדוגמה TEVA.TA)",
+        )
+
+    symbol = watchlist_store.add(symbol)
+    return JSONResponse(
+        {"symbols": watchlist_store.all(), "added": symbol,
+         # None from the check means the source was unreachable, so the symbol
+         # was taken on trust; the UI says so rather than implying it was
+         # verified.
+         "verified": known is True},
+        status_code=201,
+    )
 
 
 @router.delete("/api/watchlist/{symbol}")
@@ -1237,6 +1284,20 @@ function sessionLabel(s) {
   return {pre:'Pre-Market', regular:'Regular', after:'After-Hours', closed:'Closed'}[s] || s;
 }
 
+/* The session field is the *New York* session. For a Tel Aviv listing that
+   says nothing true — the screenshot that prompted this showed Teva tagged
+   "Pre-Market" at 12:45 ET, by which time TASE had been shut for hours. Rather
+   than assert Tel Aviv hours this code has no way to verify, the row is
+   labelled with its exchange and the "עודכן" column carries freshness. */
+function sessionCell(s) {
+  const code = String(s.currency || '').toUpperCase();
+  if (code === 'ILA' || code === 'ILS') {
+    return `<span class="session-tag session-closed" ` +
+           `title="שעות המסחר בת״א שונות מניו יורק — הסשן האמריקאי לא חל כאן">ת״א</span>`;
+  }
+  return `<span class="session-tag ${sessionClass(s.session)}">${sessionLabel(s.session)}</span>`;
+}
+
 function pctCell(val) {
   if (val == null) return '<span class="flat">—</span>';
   const cls  = val > 0 ? 'up' : val < 0 ? 'down' : 'flat';
@@ -1255,16 +1316,18 @@ function renderStocks(stocks) {
     </tr></thead>
     <tbody>${stocks.map(s => {
       const scVal = s.since_close_pct != null ? s.since_close_pct : s.from_open_pct;
-      const hi = s.day_high ? '$'+s.day_high.toFixed(2) : '—';
-      const lo = s.day_low  ? '$'+s.day_low.toFixed(2)  : '—';
+      // Every figure in the row is a price, so every one takes the symbol's
+      // own currency. A hardcoded $ here is what made Teva read as $10,500.
+      const hi = s.day_high != null ? nativeMoney(s.day_high, s.currency) : '—';
+      const lo = s.day_low  != null ? nativeMoney(s.day_low, s.currency)  : '—';
       return `<tr>
         <td><span class="symbol">${s.symbol}</span></td>
-        <td><span class="price">$${s.price.toFixed(2)}</span></td>
+        <td><span class="price">${nativeMoney(s.price, s.currency)}</span></td>
         <td>${pctCell(s.change_pct)}</td>
         <td>${pctCell(scVal)}</td>
         <td><span class="volume">${fmt(s.volume)}</span></td>
         <td><span class="volume">${hi} / ${lo}</span></td>
-        <td><span class="session-tag ${sessionClass(s.session)}">${sessionLabel(s.session)}</span></td>
+        <td>${sessionCell(s)}</td>
         <td><span class="volume">${s.updated}</span></td>
       </tr>`;
     }).join('')}</tbody>

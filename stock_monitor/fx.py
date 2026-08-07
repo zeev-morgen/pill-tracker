@@ -157,6 +157,19 @@ def to_usd(amount, currency, rate: Optional[float] = None) -> Optional[float]:
     return shekels / rate
 
 
+def currency_for_ticker(ticker) -> str:
+    """The quote currency implied by a ticker's exchange suffix.
+
+    Yahoo's ``.info`` is authoritative and can tell agorot from shekels, but it
+    is also the endpoint Yahoo throttles first, and the live monitor prices
+    every watched symbol on a loop — it cannot afford a metadata request per
+    symbol per cycle. The suffix is free and correct for effectively every
+    Tel Aviv listing, so it carries the common path; callers that already hold
+    an ``.info`` payload should prefer what it says.
+    """
+    return AGOROT if str(ticker or "").upper().endswith(".TA") else ""
+
+
 def is_israeli(currency) -> bool:
     return normalize_currency(currency) in (AGOROT, SHEKEL)
 

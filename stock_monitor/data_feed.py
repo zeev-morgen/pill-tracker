@@ -53,6 +53,18 @@ MIN_SESSION_FRACTION = 0.05
 INTRADAY_PERIOD = "2d"
 
 
+def quote_currency(symbol: str) -> str:
+    """Currency a symbol's prices are quoted in, from its exchange suffix.
+
+    Kept out of the FX module's import path at module scope so the data feed
+    stays importable on its own; see fx.currency_for_ticker for why the suffix
+    rather than Yahoo metadata decides it on this path.
+    """
+    from . import fx
+
+    return fx.currency_for_ticker(symbol)
+
+
 # ── Session helpers ───────────────────────────────────────────────────────────
 
 def get_market_session() -> str:
@@ -211,6 +223,7 @@ class StockDataFeed:
                 "day_high":        day_high,
                 "day_low":         day_low,
                 "session":         session,
+                "currency":        quote_currency(symbol),
                 "timestamp":       datetime.now(NYSE_TZ),
             }
 
@@ -362,6 +375,10 @@ class StockDataFeed:
             "day_high": day_high,
             "day_low": day_low,
             "session": session,
+            # The unit these prices are in. Every consumer that prints one
+            # needs it: a Tel Aviv quote is agorot, and a caller that assumes
+            # dollars is wrong by roughly four hundred times.
+            "currency": quote_currency(symbol),
             "timestamp": datetime.now(NYSE_TZ),
             "bar_time": priced.index[-1],
         }

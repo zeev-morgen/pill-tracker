@@ -603,12 +603,23 @@ class WatchlistStore:
         with self._lock:
             return list(self._symbols)
 
-    def add(self, symbol: str) -> str:
+    @staticmethod
+    def normalize(symbol: str) -> str:
+        """Validate the shape of a symbol without storing it.
+
+        Split out from ``add`` so a caller can check the symbol actually exists
+        before committing it — validating the characters and saving in one step
+        left no room to ask the data source anything.
+        """
         symbol = str(symbol).strip().upper()
         if not symbol or len(symbol) > 16:
             raise HoldingError("יש להזין טיקר תקין")
         if not all(c.isalnum() or c in ".-^" for c in symbol):
             raise HoldingError("טיקר יכול להכיל אותיות, ספרות ותווי '.', '-', '^' בלבד")
+        return symbol
+
+    def add(self, symbol: str) -> str:
+        symbol = self.normalize(symbol)
 
         with self._lock:
             if symbol not in self._symbols:
