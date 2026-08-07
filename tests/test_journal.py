@@ -181,6 +181,9 @@ def test_empty_journal_reports_zeroed_summary(client):
     assert body["entries"] == []
     assert body["summary"] == {
         "count": 0, "total_pnl": 0, "win_rate_pct": 0.0, "avg_holding_days": None,
+        # Trades whose sale-day exchange rate was never captured, and so are
+        # missing from total_pnl. Empty here because there are no trades.
+        "unconverted": [],
     }
 
 

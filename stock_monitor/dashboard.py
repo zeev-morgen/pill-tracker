@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from . import excel_export
+from . import excel_export, fx
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import (
     ClosedPosition,
@@ -211,14 +211,21 @@ async def api_sell_holding(ticker: str, payload: dict = Body(...)):
     # ATR and sector are captured now: after the position is gone there is no
     # way to reconstruct how volatile the stock was while it was held.
     atr_pct = sector = None
+    currency = ""
     try:
         get_data_feed()   # makes sure the analyzer can price the position
         snapshot = await run_in_threadpool(_risk_analyzer.collect_positions)
         current = next((p for p in snapshot if p["ticker"] == holding.ticker), None)
         if current:
             atr_pct, sector = current.get("atr_pct"), current.get("sector")
+            currency = current.get("currency") or ""
     except Exception as exc:
         logger.warning("Could not snapshot risk data for %s: %s", holding.ticker, exc)
+    if not currency and holding.ticker.upper().endswith(".TA"):
+        # The snapshot is best-effort, and a Tel Aviv sale recorded without a
+        # currency would enter the journal with agorot figures labelled as
+        # dollars — permanently, since the journal is the historical record.
+        currency = fx.AGOROT
 
     try:
         closed = ClosedPosition.from_sale(
@@ -228,6 +235,7 @@ async def api_sell_holding(ticker: str, payload: dict = Body(...)):
             sold_date=payload.get("sold_date"),
             atr_pct=atr_pct,
             sector=sector,
+            currency=currency,
         )
     except HoldingError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -255,24 +263,37 @@ async def api_sell_holding(ticker: str, payload: dict = Body(...)):
     )
 
 
+def journal_summary(entries: List[dict]) -> dict:
+    """Totals across closed trades.
+
+    The profit total is in dollars and only dollars. ``pnl_value`` on each
+    entry is in that trade's own currency, so summing it directly would add
+    agorot to dollars — a number with no meaning that would nonetheless look
+    like a plausible profit. An entry whose sale-day rate was never captured
+    contributes nothing and is named in ``unconverted`` instead, because
+    quietly dropping it makes the total wrong in a way nobody can see.
+    """
+    wins = [e for e in entries if e["pnl_pct"] > 0]
+    with_days = [e["holding_days"] for e in entries if e["holding_days"] is not None]
+    return {
+        "count": len(entries),
+        "total_pnl": round(
+            sum(e["pnl_value_usd"] for e in entries if e.get("pnl_value_usd") is not None), 2
+        ),
+        "unconverted": sorted(
+            {e["ticker"] for e in entries if e.get("pnl_value_usd") is None}
+        ),
+        "win_rate_pct": round(len(wins) / len(entries) * 100.0, 1) if entries else 0.0,
+        "avg_holding_days": round(sum(with_days) / len(with_days)) if with_days else None,
+    }
+
+
 @router.get("/api/journal")
 async def api_journal():
     entries = [e.as_dict() for e in closed_position_store.all()]
-    wins = [e for e in entries if e["pnl_pct"] > 0]
     return JSONResponse({
         "entries": entries,
-        "summary": {
-            "count": len(entries),
-            "total_pnl": round(sum(e["pnl_value"] for e in entries), 2),
-            "win_rate_pct": round(len(wins) / len(entries) * 100.0, 1) if entries else 0.0,
-            "avg_holding_days": (
-                round(
-                    sum(e["holding_days"] for e in entries if e["holding_days"] is not None)
-                    / max(sum(1 for e in entries if e["holding_days"] is not None), 1)
-                )
-                if any(e["holding_days"] is not None for e in entries) else None
-            ),
-        },
+        "summary": journal_summary(entries),
     })
 
 
@@ -444,17 +465,7 @@ async def api_export_portfolio():
         get_data_feed()
         report = _risk_analyzer.full_report()
         entries = [e.as_dict() for e in closed_position_store.all()]
-        wins = [e for e in entries if e["pnl_pct"] > 0]
-        with_days = [e["holding_days"] for e in entries if e["holding_days"] is not None]
-        journal = {
-            "entries": entries,
-            "summary": {
-                "count": len(entries),
-                "total_pnl": round(sum(e["pnl_value"] for e in entries), 2),
-                "win_rate_pct": round(len(wins) / len(entries) * 100.0, 1) if entries else 0.0,
-                "avg_holding_days": round(sum(with_days) / len(with_days)) if with_days else None,
-            },
-        }
+        journal = {"entries": entries, "summary": journal_summary(entries)}
         return excel_export.build_workbook(report, journal)
 
     try:
@@ -992,6 +1003,10 @@ _HTML = """<!DOCTYPE html>
   /* Under the price rather than beside it: as its own column the as-of date
      pushed the row actions off the edge. */
   .price-date { font-size: 0.72rem; margin-top: 2px; white-space: nowrap; }
+  /* The currency a price is quoted in. Muted and small: it qualifies the
+     number without competing with it, but agorot vs shekels is a factor of a
+     hundred, so it can never be dropped. */
+  .unit { font-size: 0.72rem; color: var(--muted); }
   /* The averaged result, shown before committing: the arithmetic is the whole
      point of the dialog, so it should be visible rather than taken on trust. */
   .preview {
@@ -1133,10 +1148,11 @@ _HTML = """<!DOCTYPE html>
   <div class="modal">
     <h3 id="modal-title">הזנת פוזיציה</h3>
     <label for="f-ticker">טיקר</label>
-    <input id="f-ticker" placeholder="לדוגמה: AMZN" maxlength="16" autocomplete="off">
+    <input id="f-ticker" placeholder="לדוגמה: AMZN, POLI.TA" maxlength="16" autocomplete="off"
+           oninput="updateCurrencyHint()">
     <label for="f-qty">כמות מניות</label>
     <input id="f-qty" type="number" min="0.0001" step="any" placeholder="לדוגמה: 10">
-    <label for="f-price">מחיר כניסה (למניה)</label>
+    <label for="f-price">מחיר כניסה (למניה) <span class="muted-hint" id="f-price-unit"></span></label>
     <input id="f-price" type="number" min="0.0001" step="any" placeholder="לדוגמה: 187.50">
     <label for="f-date">תאריך קנייה <span class="muted-hint">(אופציונלי — מחשב זמן החזקה)</span></label>
     <input id="f-date" type="date">
@@ -1312,6 +1328,21 @@ const money = (n) => n == null ? '—' : '<bdi>' + (n < 0 ? '-$' : '$') +
   Math.abs(Number(n)).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) +
   '</bdi>';
 
+/* A price in the currency it is quoted in.
+   Tel Aviv equities are quoted in agorot, so a share at 3,450 is worth ₪34.50.
+   Printing that with a $ would be wrong by a factor of 360; printing it with a
+   ₪ would still be wrong by 100. The unit is therefore always spelled out. */
+const nativeMoney = (n, currency) => {
+  if (n == null) return '—';
+  const code = String(currency || '').toUpperCase();
+  const abs = Math.abs(Number(n)).toLocaleString('en-US',
+    {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  const sign = n < 0 ? '-' : '';
+  if (code === 'ILA') return `<bdi>${sign}${abs}</bdi> <span class="unit">אג׳</span>`;
+  if (code === 'ILS') return `<bdi>${sign}₪${abs}</bdi>`;
+  return `<bdi>${sign}$${abs}</bdi>`;
+};
+
 /* The page is laid out LTR, so a Hebrew word after a number comes out reversed
    unless the run is explicitly marked. */
 const days = (n) => n == null ? '—'
@@ -1374,6 +1405,9 @@ function openModal(existing) {
     document.getElementById('f-sector').value = '';
     document.getElementById('f-asset-type').value = '';
   }
+  // Editing pre-fills the ticker without an input event, so the unit hint has
+  // to be refreshed explicitly or an edit of a TASE row shows no unit at all.
+  updateCurrencyHint();
   document.getElementById('modal').classList.add('open');
 }
 function closeModal() { document.getElementById('modal').classList.remove('open'); }
@@ -1465,9 +1499,13 @@ function renderHoldings(data) {
       // the headline, so it takes the colour the losses take.
       ? ` · <span class="${data.feed_lag_days ? 'down' : 'volume'}">` +
         `מחירים מ-${esc(data.latest_bar_date)}</span>` : '';
+  // Named explicitly, because with an Israeli position in the portfolio the
+  // total moves on days nothing was traded and the rate is the only reason.
+  const fx = data.has_foreign && data.fx_rate
+    ? ` · <span class="volume">שער דולר/שקל: <bdi>${data.fx_rate.toFixed(3)}</bdi></span>` : '';
   document.getElementById('portfolio-total').innerHTML =
     `שווי תיק: <b>${money(data.total_value)}</b> · ` +
-    `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>` + asOf;
+    `רווח/הפסד כולל: <span class="${pnlCls}">${money(data.total_pnl_value)}</span>` + asOf + fx;
 
   wrap.innerHTML = staleFeedNote(data) + skippedNote(data) + `<table>
     <thead><tr>
@@ -1478,10 +1516,10 @@ function renderHoldings(data) {
     <tbody>${data.positions.map((p) => `<tr>
       <td><span class="symbol">${esc(p.ticker)}</span></td>
       <td>${p.quantity}</td>
-      <td><span class="price">${money(p.entry_price)}</span></td>
-      <td><span class="price">${money(p.current_price)}</span>${priceDateCell(p)}</td>
+      <td><span class="price">${nativeMoney(p.entry_price, p.currency)}</span></td>
+      <td><span class="price">${nativeMoney(p.current_price, p.currency)}</span>${priceDateCell(p)}</td>
       <td>${extendedCell(p)}</td>
-      <td>${money(p.market_value)}</td>
+      <td>${money(p.market_value)}${nativeValueCell(p)}</td>
       <td>${pctCell(p.pnl_pct)} <span class="volume">(${money(p.pnl_value)})</span></td>
       <td><span class="volume">${days(p.holding_days)}</span></td>
       <td><span class="volume">${p.atr_pct == null ? '—' : p.atr_pct.toFixed(2) + '%'}</span></td>
@@ -1498,6 +1536,33 @@ function renderHoldings(data) {
         <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')" title="מחיקת הפוזיציה">🗑️</button>
       </td></tr>`).join('')}</tbody>
   </table>`;
+}
+
+/* Which unit the entry price should be typed in.
+   Tel Aviv is quoted in agorot, and a broker screen shows 3,450 for a share
+   worth ₪34.50. Typing 34.50 here would understate the position a hundredfold
+   and there is nothing downstream that could detect it — the number is
+   plausible on its own. So the form says which unit it wants, before the
+   mistake rather than after. */
+function updateCurrencyHint() {
+  const el = document.getElementById('f-price-unit');
+  if (!el) return;
+  const ticker = (document.getElementById('f-ticker').value || '').toUpperCase();
+  el.textContent = ticker.endsWith('.TA')
+    ? '(באגורות — כפי שמוצג במסך המסחר, לדוגמה 3450)' : '';
+}
+
+/* Shekel value under the dollar one, for Israeli positions only.
+   The dollar figure is what the totals add up, but it moves with the exchange
+   rate as well as the share price — so the shekel amount stays visible, or a
+   position appears to have gained on a day it did not move. */
+function nativeValueCell(p) {
+  const code = String(p.currency || '').toUpperCase();
+  if (code !== 'ILA' && code !== 'ILS') return '';
+  if (p.native_market_value == null) return '';
+  const shekels = code === 'ILA' ? p.native_market_value / 100 : p.native_market_value;
+  return `<div class="price-date volume" title="שווי במטבע המקור">` +
+    `<bdi>₪${shekels.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</bdi></div>`;
 }
 
 /* Which session the close came from. A price with no date attached is taken
@@ -1530,7 +1595,7 @@ function extendedCell(p) {
   }
   const label = p.session === 'pre' ? 'Pre' : 'After';
   return `<span class="session-tag session-${p.session}">${label}</span>` +
-         `<span class="ext-price"> ${money(p.extended_price)} ` +
+         `<span class="ext-price"> ${nativeMoney(p.extended_price, p.currency)} ` +
          `${pctCell(p.extended_change_pct)}</span>`;
 }
 
@@ -1718,7 +1783,8 @@ function openAdd(ticker) {
   addTarget = position;
   document.getElementById('add-title').textContent = 'הוספה לפוזיציה — ' + ticker;
   document.getElementById('add-current').innerHTML =
-    `מוחזק כעת: <b>${position.quantity}</b> מניות במחיר ממוצע <b>${money(position.entry_price)}</b>`;
+    `מוחזק כעת: <b>${position.quantity}</b> מניות במחיר ממוצע ` +
+    `<b>${nativeMoney(position.entry_price, position.currency)}</b>`;
   document.getElementById('a-qty').value = '';
   document.getElementById('a-price').value = position.current_price ?? '';
   // The date field only appears when the position has no recorded open date;
@@ -1750,11 +1816,15 @@ function updateAddPreview() {
   const total = addTarget.quantity + qty;
   const avg = (addTarget.quantity * addTarget.entry_price + qty * price) / total;
   const dir = avg > addTarget.entry_price ? 'down' : 'up';   // a higher basis is worse
+  // All three figures are in the position's own currency: the prices being
+  // averaged came from there, and converting only the cost line would put two
+  // different units in one preview.
+  const cur = addTarget.currency;
   box.innerHTML =
     `כמות אחרי ההוספה: <b>${parseFloat(total.toFixed(6))}</b><br>` +
-    `מחיר ממוצע חדש: <b class="${dir}">${money(avg)}</b> ` +
-    `<span class="volume">(היה ${money(addTarget.entry_price)})</span><br>` +
-    `<span class="volume">עלות ההוספה: ${money(qty * price)}</span>`;
+    `מחיר ממוצע חדש: <b class="${dir}">${nativeMoney(avg, cur)}</b> ` +
+    `<span class="volume">(היה ${nativeMoney(addTarget.entry_price, cur)})</span><br>` +
+    `<span class="volume">עלות ההוספה: ${nativeMoney(qty * price, cur)}</span>`;
 }
 
 ['a-qty', 'a-price'].forEach((id) =>
@@ -1837,9 +1907,15 @@ const RATING_LABEL = {green: 'החלטה טובה', orange: 'בינונית', re
 function renderJournal(data) {
   const s = data.summary;
   const pnlCls = s.total_pnl >= 0 ? 'up' : 'down';
+  // A trade whose sale-day rate was never captured is left out of the total.
+  // Naming it is the difference between a total that is incomplete and one
+  // that is wrong — the number alone cannot tell you which it is.
+  const gap = (s.unconverted && s.unconverted.length)
+    ? ` <span class="volume" title="ללא שער המרה מיום המכירה — לא נכלל בסכום">` +
+      `(ללא ${s.unconverted.map(esc).join(', ')})</span>` : '';
   document.getElementById('journal-summary').innerHTML =
     `<div>עסקאות סגורות<b>${s.count}</b></div>` +
-    `<div>רווח/הפסד מצטבר<b class="${pnlCls}">${money(s.total_pnl)}</b></div>` +
+    `<div>רווח/הפסד מצטבר<b class="${pnlCls}">${money(s.total_pnl)}${gap}</b></div>` +
     `<div>אחוז עסקאות רווחיות<b>${s.win_rate_pct.toFixed(1)}%</b></div>` +
     `<div>זמן החזקה ממוצע<b>${days(s.avg_holding_days)}</b></div>`;
 
@@ -1879,9 +1955,13 @@ function renderEntry(e) {
       <!-- No arrow in the Hebrew label: arrows are bidi-mirrored, so the glyph
            flips against the reading flow. The values below are an isolated LTR
            run, where the arrow is unambiguous. -->
-      <div><span>כניסה / יציאה</span><b>${money(e.entry_price)} → ${money(e.exit_price)}</b></div>
+      <div><span>כניסה / יציאה</span><b>${nativeMoney(e.entry_price, e.currency)} → ${nativeMoney(e.exit_price, e.currency)}</b></div>
       <div><span>תשואה</span><b class="${pnlCls}">${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%</b></div>
-      <div><span>רווח/הפסד</span><b class="${pnlCls}">${money(e.pnl_value)}</b></div>
+      <!-- Both figures for a foreign trade: what it made in its own currency,
+           and what that was worth in dollars at the rate on the day it closed. -->
+      <div><span>רווח/הפסד</span><b class="${pnlCls}">${nativeMoney(e.pnl_value, e.currency)}${
+        e.currency && e.pnl_value_usd != null ? ` <span class="volume">(${money(e.pnl_value_usd)})</span>` : ''
+      }</b></div>
       <div><span>זמן החזקה</span><b>${days(e.holding_days)}</b></div>
       <div><span>ATR בעת המכירה</span><b>${e.atr_pct_at_close == null ? '—' : e.atr_pct_at_close.toFixed(2) + '%'}</b></div>
       <div><span>סקטור</span><b>${esc(e.sector || '—')}</b></div>

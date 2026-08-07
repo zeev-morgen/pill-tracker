@@ -96,6 +96,13 @@ class ClosedPositionRow(Base):
     pnl_value: Mapped[float] = mapped_column(Float, nullable=False)
     #: Fraction of the original position this sale represents (1.0 = full exit).
     fraction_sold: Mapped[float] = mapped_column(Float, default=1.0)
+    #: Currency of entry_price, exit_price and pnl_value — 'ILA' for a Tel Aviv
+    #: position, empty or 'USD' otherwise.
+    currency: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    #: pnl_value in dollars, converted at the rate on the day of the sale. That
+    #: rate is the one actually realised and cannot be reconstructed later, so
+    #: it is stored rather than recomputed when the journal is read.
+    pnl_value_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     atr_pct_at_close: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     sector: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     #: Claude's verdict: 'green' | 'orange' | 'red'.
@@ -189,32 +196,46 @@ def _add_missing_columns() -> None:
     additive and nullable, so it is safe to re-run and never touches data.
     """
     inspector = inspect(_engine)
-    if "holdings" not in inspector.get_table_names():
-        return
-    existing = {col["name"] for col in inspector.get_columns("holdings")}
+    tables = set(inspector.get_table_names())
     additions = {
-        "sector": "VARCHAR(64)",
-        "asset_type": "VARCHAR(16)",
-        "purchase_date": "DATE",
+        "holdings": {
+            "sector": "VARCHAR(64)",
+            "asset_type": "VARCHAR(16)",
+            "purchase_date": "DATE",
+        },
+        "closed_positions": {
+            # Which currency entry_price and exit_price are in. Without it an
+            # old Tel Aviv entry's agorot figures are indistinguishable from
+            # dollars once they are in the journal.
+            "currency": "VARCHAR(8)",
+            # P&L converted at the rate on the day of the sale — the rate
+            # actually realised, which cannot be recovered afterwards.
+            "pnl_value_usd": "DOUBLE PRECISION",
+        },
     }
-    for column, ddl_type in additions.items():
-        if column in existing:
+    for table, columns in additions.items():
+        if table not in tables:
             continue
-        # One statement per transaction, and failures are contained: if the
-        # database user cannot ALTER (or the column arrives another way), that
-        # must not abort init_db and cost us persistence for every other table.
-        try:
-            with _engine.begin() as connection:
-                connection.execute(
-                    text(f"ALTER TABLE holdings ADD COLUMN {column} {ddl_type}")
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        for column, ddl_type in columns.items():
+            if column in existing:
+                continue
+            # One statement per transaction, and failures are contained: if the
+            # database user cannot ALTER (or the column arrives another way),
+            # that must not abort init_db and cost us persistence for every
+            # other table.
+            try:
+                with _engine.begin() as connection:
+                    connection.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+                    )
+                logger.info("Schema updated: added %s.%s", table, column)
+            except SQLAlchemyError as exc:
+                logger.error(
+                    "Could not add %s.%s (%s) — reads may fall back to memory. "
+                    "Grant the database user ALTER on '%s' to fix this.",
+                    table, column, exc.__class__.__name__, table,
                 )
-            logger.info("Schema updated: added holdings.%s", column)
-        except SQLAlchemyError as exc:
-            logger.error(
-                "Could not add holdings.%s (%s) — portfolio reads may fall back to "
-                "memory. Grant the database user ALTER on 'holdings' to fix this.",
-                column, exc.__class__.__name__,
-            )
 
 
 def is_enabled() -> bool:

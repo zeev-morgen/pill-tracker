@@ -64,9 +64,10 @@ def test_the_workbook_is_the_holdings_table_and_the_journal(workbook):
 def test_the_columns_mirror_the_dashboard_table(workbook):
     """The export exists to be that table, so the layout follows the screen."""
     assert [c.value for c in workbook["התיק שלי"][1]] == [
-        "סמל", "כמות", "מחיר כניסה", "מחיר נוכחי", "נכון לתאריך", "מקור המחיר",
-        "פרי / פוסט", "שינוי פרי / פוסט (%)", "שווי", "רווח/הפסד ($)",
-        "רווח/הפסד (%)", "ימי החזקה", "ATR (%)", "סקטור", "תאריך קנייה",
+        "סמל", "כמות", "מחיר כניסה", "מחיר נוכחי", "מטבע", "נכון לתאריך",
+        "מקור המחיר", "פרי / פוסט", "שינוי פרי / פוסט (%)", "שווי ($)",
+        "רווח/הפסד ($)", "רווח/הפסד (%)", "ימי החזקה", "ATR (%)", "סקטור",
+        "תאריך קנייה",
     ]
 
 
@@ -101,7 +102,7 @@ def test_positions_carry_their_numbers(workbook):
 def test_numbers_are_numbers_not_text(workbook):
     """The file should be something you can total and pivot, not just read."""
     row = _row(workbook["התיק שלי"], "AVGO")
-    for column in ("כמות", "מחיר כניסה", "מחיר נוכחי", "שווי",
+    for column in ("כמות", "מחיר כניסה", "מחיר נוכחי", "שווי ($)",
                    "רווח/הפסד ($)", "רווח/הפסד (%)", "ATR (%)"):
         assert isinstance(row[column], (int, float)), f"{column} came through as text"
 
@@ -168,7 +169,7 @@ def test_a_totals_row_closes_the_table(workbook):
     labels = [sheet.cell(row=r, column=1).value for r in range(2, sheet.max_row + 1)]
     total_row = labels.index('סה"כ') + 2
 
-    for column in ("שווי", "רווח/הפסד ($)"):
+    for column in ("שווי ($)", "רווח/הפסד ($)"):
         cell = sheet.cell(row=total_row, column=headers.index(column) + 1)
         # A live formula, so filtering or editing rows keeps the total honest.
         assert str(cell.value).startswith("=SUM(")
@@ -179,7 +180,7 @@ def test_a_totals_row_closes_the_table(workbook):
 def test_money_columns_have_a_money_format(workbook):
     sheet = workbook["התיק שלי"]
     headers = [c.value for c in sheet[1]]
-    column = headers.index("שווי") + 1
+    column = headers.index("שווי ($)") + 1
     assert sheet.cell(row=2, column=column).number_format == '#,##0.00'
 
 
@@ -274,7 +275,7 @@ def test_the_totals_formula_spans_every_data_row():
         report, {"entries": [], "summary": {}})))
     sheet = book["התיק שלי"]
     headers = [c.value for c in sheet[1]]
-    column = headers.index("שווי") + 1
+    column = headers.index("שווי ($)") + 1
     labels = [sheet.cell(row=r, column=1).value for r in range(2, sheet.max_row + 1)]
     total_row = labels.index('סה"כ') + 2
 

@@ -344,6 +344,13 @@ class ClosedPosition:
     pnl_pct: float
     pnl_value: float
     fraction_sold: float = 1.0
+    #: Currency of entry_price, exit_price and pnl_value.
+    currency: str = ""
+    #: pnl_value in dollars, at the rate on the day of the sale. None when the
+    #: rate was unavailable then — it cannot be recovered afterwards, so the
+    #: journal reports the gap rather than converting at today's rate and
+    #: presenting a number that was never realised.
+    pnl_value_usd: Optional[float] = None
     purchase_date: Optional[date] = None
     holding_days: Optional[int] = None
     atr_pct_at_close: Optional[float] = None
@@ -361,6 +368,7 @@ class ClosedPosition:
         sold_date=None,
         atr_pct: Optional[float] = None,
         sector: Optional[str] = None,
+        currency: str = "",
     ) -> "ClosedPosition":
         """Build a journal entry from a holding and the sale details."""
         try:
@@ -386,6 +394,13 @@ class ClosedPosition:
         holding_days = (
             (sold - holding.purchase_date).days if holding.purchase_date else None
         )
+        pnl_value = (exit_price - holding.entry_price) * quantity_sold
+        # Converted here, at the sale, because this is the rate that was
+        # actually realised. Reading the journal a year later and converting at
+        # that day's rate would report a dollar profit the trade never made.
+        from . import fx
+
+        pnl_value_usd = fx.to_usd(pnl_value, currency)
         return ClosedPosition(
             ticker=holding.ticker,
             quantity=quantity_sold,
@@ -395,7 +410,9 @@ class ClosedPosition:
             sold_date=sold,
             holding_days=holding_days,
             pnl_pct=(exit_price - holding.entry_price) / holding.entry_price * 100.0,
-            pnl_value=(exit_price - holding.entry_price) * quantity_sold,
+            pnl_value=pnl_value,
+            currency=currency,
+            pnl_value_usd=pnl_value_usd,
             fraction_sold=quantity_sold / holding.quantity,
             atr_pct_at_close=atr_pct,
             sector=sector or holding.sector,
@@ -413,6 +430,14 @@ class ClosedPosition:
             "holding_days": self.holding_days,
             "pnl_pct": round(self.pnl_pct, 2),
             "pnl_value": round(self.pnl_value, 2),
+            # Currency of the three figures above; the dollar P&L is separate
+            # so a Tel Aviv trade can show both what it made in agorot and what
+            # that was worth on the day.
+            "currency": self.currency or "",
+            "pnl_value_usd": (
+                round(self.pnl_value_usd, 2) if self.pnl_value_usd is not None
+                else (round(self.pnl_value, 2) if not self.currency else None)
+            ),
             "fraction_sold": round(self.fraction_sold, 4),
             "is_partial": self.fraction_sold < 0.999,
             "atr_pct_at_close": (
@@ -437,6 +462,11 @@ def _row_to_closed(row) -> ClosedPosition:
         holding_days=row.holding_days,
         pnl_pct=row.pnl_pct,
         pnl_value=row.pnl_value,
+        # Rows written before these columns existed read back as NULL, which
+        # is exactly right: no currency means dollars, and no stored USD P&L
+        # means as_dict falls back to pnl_value for those.
+        currency=getattr(row, "currency", None) or "",
+        pnl_value_usd=getattr(row, "pnl_value_usd", None),
         fraction_sold=row.fraction_sold,
         atr_pct_at_close=row.atr_pct_at_close,
         sector=row.sector,
@@ -468,6 +498,8 @@ class ClosedPositionStore:
                         holding_days=closed.holding_days,
                         pnl_pct=closed.pnl_pct,
                         pnl_value=closed.pnl_value,
+                        currency=closed.currency or None,
+                        pnl_value_usd=closed.pnl_value_usd,
                         fraction_sold=closed.fraction_sold,
                         atr_pct_at_close=closed.atr_pct_at_close,
                         sector=closed.sector,

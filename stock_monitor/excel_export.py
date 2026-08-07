@@ -54,11 +54,15 @@ def _positions_frame(report: dict) -> pd.DataFrame:
             "כמות": p.get("quantity"),
             "מחיר כניסה": p.get("entry_price"),
             "מחיר נוכחי": p.get("current_price"),
+            # Without this column the two price columns above are unreadable:
+            # a Tel Aviv price of 3,450 is agorot, not dollars, and nothing in
+            # the file would say so once it is off the screen.
+            "מטבע": _currency_label(p.get("currency")),
             "נכון לתאריך": _as_date(p.get("price_date")),
             "מקור המחיר": source,
             "פרי / פוסט": p.get("extended_price"),
             "שינוי פרי / פוסט (%)": p.get("extended_change_pct"),
-            "שווי": p.get("market_value"),
+            "שווי ($)": p.get("market_value"),
             "רווח/הפסד ($)": p.get("pnl_value"),
             "רווח/הפסד (%)": p.get("pnl_pct"),
             "ימי החזקה": p.get("holding_days"),
@@ -94,6 +98,16 @@ def _journal_frame(entries: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _currency_label(code) -> str:
+    """The unit a price column's numbers are in, spelled out.
+
+    Agorot rather than "₪": the difference is a factor of a hundred, and a
+    spreadsheet outlives the context that would have made it obvious.
+    """
+    code = str(code or "").strip().upper()
+    return {"ILA": "אגורות", "ILS": "שקל"}.get(code, "דולר")
+
+
 def _as_date(value) -> Optional[date]:
     """ISO strings become real dates so Excel can sort and filter them."""
     if not value:
@@ -114,7 +128,7 @@ _FORMATS = {
     "מחיר כניסה": _MONEY,
     "מחיר יציאה": _MONEY,
     "מחיר נוכחי": _MONEY,
-    "שווי": _MONEY,
+    "שווי ($)": _MONEY,
     "פרי / פוסט": _MONEY,
     "שינוי פרי / פוסט (%)": _PERCENT,
     "רווח/הפסד ($)": _MONEY,
@@ -195,7 +209,7 @@ def _append_totals(worksheet, frame: pd.DataFrame, report: dict) -> None:
     for index in range(1, len(columns) + 1):
         worksheet.cell(row=total_row, column=index).border = top
 
-    for column in ("שווי", "רווח/הפסד ($)"):
+    for column in ("שווי ($)", "רווח/הפסד ($)"):
         if column not in columns:
             continue
         index = columns.index(column) + 1

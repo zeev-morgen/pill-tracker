@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import yfinance as yf
 
-from . import reference_data, tiingo
+from . import fx, reference_data, tiingo
 from .store import PortfolioStore
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,9 @@ class Fundamentals:
     indexes: List[str] = field(default_factory=lambda: ["Other"])
     #: 'etf' for index funds / ETFs, 'stock' otherwise.
     asset_type: str = "stock"
+    #: Yahoo's currency code for the quote — 'USD', or 'ILA' (agorot) for
+    #: almost every Tel Aviv listing. Empty means "assume dollars".
+    currency: str = ""
 
 
 UNKNOWN_SECTOR = "Unknown"
@@ -293,7 +296,24 @@ def fetch_fundamentals(ticker: str) -> Fundamentals:
         name=info.get("shortName") or ticker,
         indexes=INDEX_MEMBERSHIP.get(ticker, ["Other"]),
         asset_type=asset_type,
+        currency=_resolve_currency(ticker, info),
     )
+
+
+def _resolve_currency(ticker: str, info: dict) -> str:
+    """Which currency a ticker's prices are quoted in.
+
+    ``.info`` is authoritative and distinguishes agorot from shekels, but it is
+    also the endpoint Yahoo throttles first — it came back empty for days on
+    the deployed host. The .TA suffix is the fallback because getting this
+    wrong is not a cosmetic error: an unconverted agorot price values the
+    position at a hundred times its worth and poisons every total and every
+    allocation slice it feeds.
+    """
+    code = fx.normalize_currency(info.get("currency"))
+    if code:
+        return code
+    return fx.AGOROT if ticker.upper().endswith(".TA") else ""
 
 
 class PortfolioRiskAnalyzer:
@@ -525,6 +545,11 @@ class PortfolioRiskAnalyzer:
             if session in ("pre", "regular", "after") or bars_behind
             else {}
         )
+        # One rate for the whole report. Fetching per holding would value two
+        # positions bought the same minute against different rates, and the
+        # totals would not reconcile with the rows above them.
+        rate = fx.usd_ils_rate() if any(t.upper().endswith(".TA") for t in tickers) else None
+        self._fx_rate = rate
 
         for holding in holdings:
             try:
@@ -591,7 +616,27 @@ class PortfolioRiskAnalyzer:
 
                 atr = compute_atr(history, self.thresholds.atr_period)
                 fundamentals = fetch_fundamentals(holding.ticker)
-                market_value = price * holding.quantity
+                currency = fundamentals.currency
+
+                # Prices stay in the currency they are quoted in, so the table
+                # can be checked against a broker screen. Values and P&L are
+                # converted, because a total that mixes agorot with dollars is
+                # not a number at all.
+                native_value = price * holding.quantity
+                native_pnl = (price - holding.entry_price) * holding.quantity
+                market_value = fx.to_usd(native_value, currency, rate)
+                pnl_value = fx.to_usd(native_pnl, currency, rate)
+                if market_value is None or pnl_value is None:
+                    # Counting an agorot figure as dollars overstates the
+                    # position a hundredfold and silently corrupts every total
+                    # and allocation slice. Dropping it is the safe failure.
+                    logger.warning(
+                        "no %s→USD rate for %s — skipping", currency, holding.ticker
+                    )
+                    self._skipped.append(holding.ticker)
+                    self._skip_reasons.append("no FX rate")
+                    continue
+
                 # A user-set sector or asset type always wins: yfinance regularly
                 # reports nothing, and the manual value is the whole point of the
                 # override.
@@ -603,9 +648,17 @@ class PortfolioRiskAnalyzer:
                         "quantity": holding.quantity,
                         "entry_price": holding.entry_price,
                         "current_price": price,
+                        "currency": currency,
+                        # What the position is worth before conversion, kept so
+                        # the dashboard can show ₪ next to $ without recomputing.
+                        "native_market_value": native_value,
+                        "native_pnl_value": native_pnl,
                         "market_value": market_value,
+                        # Percentage return is currency-free: both sides of the
+                        # ratio are in the same units, so converting would only
+                        # introduce rounding.
                         "pnl_pct": (price - holding.entry_price) / holding.entry_price * 100.0,
-                        "pnl_value": (price - holding.entry_price) * holding.quantity,
+                        "pnl_value": pnl_value,
                         "atr": atr,
                         "atr_pct": (atr / price * 100.0) if atr else None,
                         "sector": sector,
@@ -675,6 +728,12 @@ class PortfolioRiskAnalyzer:
                         p["price_date"].isoformat() if p.get("price_date") else None
                     ),
                     "price_source": p.get("price_source", "bar"),
+                    # Prices above are in this currency; values are in USD.
+                    "currency": p.get("currency", ""),
+                    "native_market_value": (
+                        round(p["native_market_value"], 2)
+                        if p.get("native_market_value") is not None else None
+                    ),
                     "price_is_stale": (
                         p.get("price_date") is not None
                         and latest_bar is not None
@@ -710,6 +769,13 @@ class PortfolioRiskAnalyzer:
             "skipped_tickers": self.skipped_tickers,
             "skip_reason": self.skip_reason,
             "latest_bar_date": latest_bar.isoformat() if latest_bar else None,
+            # Shekels per dollar, and whether anything actually needed it. The
+            # rate is shown rather than applied invisibly: a total that shifts
+            # overnight without a trade is otherwise unexplainable.
+            "fx_rate": getattr(self, "_fx_rate", None),
+            "has_foreign": any(
+                fx.is_israeli(p.get("currency")) for p in positions
+            ),
             "volatility": build_volatility_report(positions, self.thresholds),
             "sector": build_sector_report(positions, self.thresholds),
             "allocation": build_allocation(positions),

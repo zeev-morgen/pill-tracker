@@ -119,3 +119,52 @@ def test_the_as_of_label_turns_red_when_the_feed_is_behind():
     header = _HTML.split("const asOf =", 1)[1].split(";", 1)[0]
     assert "feed_lag_days" in header
     assert "down" in header
+
+
+# ── Currency rendering ────────────────────────────────────────────────────────
+
+def test_prices_are_rendered_in_their_own_currency():
+    """A $ on an agorot figure misreports the price by a factor of 360."""
+    assert "const nativeMoney =" in _HTML
+    for field in ("p.entry_price", "p.current_price"):
+        assert f"nativeMoney({field}, p.currency)" in _HTML, field
+
+
+def test_no_price_column_still_uses_the_dollar_only_formatter():
+    """money() hardcodes a $ — correct for values, wrong for foreign prices."""
+    rows = _HTML.split("<tbody>${data.positions.map(", 1)[1].split("</tbody>", 1)[0]
+    for field in ("entry_price", "current_price", "extended_price"):
+        assert f"money(p.{field})" not in rows, f"{field} bypasses nativeMoney"
+
+
+def test_agorot_and_shekels_render_differently():
+    body = _HTML.split("const nativeMoney =", 1)[1].split("};", 1)[0]
+    assert "'ILA'" in body and "'ILS'" in body
+    assert "אג" in body, "agorot must be labelled, not shown with a ₪"
+
+
+def test_values_and_pnl_stay_in_dollars():
+    """The totals column is one currency by definition, or it cannot be summed."""
+    rows = _HTML.split("<tbody>${data.positions.map(", 1)[1].split("</tbody>", 1)[0]
+    assert "money(p.market_value)" in rows
+    assert "money(p.pnl_value)" in rows
+
+
+def test_the_exchange_rate_is_shown_when_it_is_being_applied():
+    """A total that moves overnight without a trade is otherwise unexplainable."""
+    assert "data.fx_rate" in _HTML
+    assert "has_foreign" in _HTML
+
+
+def test_the_entry_form_says_which_unit_it_wants():
+    """The one place the hundredfold mistake actually gets made."""
+    assert "function updateCurrencyHint(" in _HTML
+    hint = _HTML.split("function updateCurrencyHint(", 1)[1].split("\n}", 1)[0]
+    assert ".TA" in hint
+    assert "אגורות" in hint
+
+
+def test_the_unit_hint_is_refreshed_when_the_modal_opens():
+    """Editing pre-fills the ticker without firing an input event."""
+    modal = _HTML.split("function openModal(", 1)[1].split("\nfunction closeModal", 1)[0]
+    assert "updateCurrencyHint()" in modal
