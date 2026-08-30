@@ -23,6 +23,7 @@ import logging
 import logging.handlers
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -45,7 +46,7 @@ from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
 from .store import alert_store, portfolio_store, watchlist_store
 from .telegram_bot import TelegramCommandBot
-from .version import build_label
+from .version import build_label, record_startup
 from .webhook_server import create_webhook_app
 
 #: The pre-market news scan runs 30 minutes before the 09:30 ET opening bell.
@@ -278,18 +279,57 @@ class StockMonitorApp:
 
 # ── Public runner ─────────────────────────────────────────────────────────────
 
+#: Seconds of pre-serve startup work past which the host's health probe is at
+#: risk. Render allows five, and every second spent before uvicorn binds is a
+#: second the port is shut and a probe against it times out.
+STARTUP_BUDGET = 5.0
+
+
 def run_app(config_path: str = "config/config.yaml") -> None:
-    config = load_config(config_path)
+    log = logging.getLogger(__name__)
+    timings: List[tuple] = []
+
+    def phase(name: str, fn):
+        """Run one startup step and record how long the port stayed closed.
+
+        Everything here happens before uvicorn binds, so a slow step is
+        indistinguishable from a dead service to anything probing the port —
+        and "HTTP health check failed" arrives with no clue which step it was.
+        Timing them turns the next occurrence into evidence.
+        """
+        started = time.monotonic()
+        try:
+            return fn()
+        finally:
+            timings.append((name, time.monotonic() - started))
+
+    config = phase("config", lambda: load_config(config_path))
     setup_logging(config.logging.level, config.logging.file)
     # Warm the build identity before serving. It is lru_cached but the first
     # call may shell out to git, and the first caller must not be the host's
     # health probe — that request has a five-second budget.
-    logging.getLogger(__name__).info("Build: %s", build_label())
+    log.info("Build: %s", build_label())
     # Connect to PostgreSQL when DATABASE_URL is set; otherwise the stores stay
-    # in memory and the monitor runs exactly as before.
-    db.init_db()
+    # in memory and the monitor runs exactly as before. This is the slow step:
+    # a free-tier database that has been idle cold-starts, and the schema
+    # migration adds a round trip per column it has to add.
+    phase("database", db.init_db)
     # First run only: copy config.yaml's symbols into the editable watchlist.
     # Once it holds anything, the user's edits are the source of truth.
-    watchlist_store.seed([s.symbol for s in config.stocks])
-    app = StockMonitorApp(config)
+    phase("watchlist", lambda: watchlist_store.seed([s.symbol for s in config.stocks]))
+    app = phase("app", lambda: StockMonitorApp(config))
+
+    total = sum(seconds for _, seconds in timings)
+    detail = ", ".join(f"{name} {seconds:.2f}s" for name, seconds in timings)
+    record_startup(total, {name: round(seconds, 2) for name, seconds in timings})
+    if total >= STARTUP_BUDGET:
+        log.warning(
+            "Startup took %.2fs before the port opened (%s) — longer than the "
+            "%.0fs health-check budget, so a probe in that window fails and the "
+            "host may restart the instance.",
+            total, detail, STARTUP_BUDGET,
+        )
+    else:
+        log.info("Startup %.2fs before serving (%s)", total, detail)
+
     asyncio.run(app.run())

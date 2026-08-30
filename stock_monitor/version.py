@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 
 # Bump when a change should be visibly identifiable even without git metadata.
-FEATURES_VERSION = "4.2"
+FEATURES_VERSION = "4.3"
 
 
 @lru_cache(maxsize=1)
@@ -43,8 +43,22 @@ def git_revision() -> str:
     return "unknown"
 
 
+#: How long startup spent before the HTTP port opened, and on what. Set once by
+#: run_app; surfaced in /health because that is the endpoint whose timeout
+#: raises the question, and reading it should not mean going to the host's logs.
+startup_timings: dict = {}
+
+
+def record_startup(total: float, phases: dict) -> None:
+    startup_timings.clear()
+    startup_timings.update({"seconds": round(total, 2), "phases": phases})
+
+
 def build_info() -> dict:
-    return {"version": FEATURES_VERSION, "revision": git_revision()}
+    info = {"version": FEATURES_VERSION, "revision": git_revision()}
+    if startup_timings:
+        info["startup"] = startup_timings
+    return info
 
 
 def build_label() -> str:

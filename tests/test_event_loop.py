@@ -131,3 +131,54 @@ async def test_news_scan_does_not_use_the_deprecated_loop_accessor(monkeypatch):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+# ── Startup, before the port opens ────────────────────────────────────────────
+
+def test_startup_timings_reach_the_health_endpoint():
+    """The probe that times out should be the one that reports why."""
+    from fastapi.testclient import TestClient
+
+    from stock_monitor import version
+    from stock_monitor.config import NotificationConfig
+    from stock_monitor.notifier import NotificationDispatcher
+    from stock_monitor.webhook_server import create_webhook_app
+
+    version.record_startup(6.2, {"database": 6.0, "config": 0.2})
+    try:
+        body = TestClient(
+            create_webhook_app(NotificationDispatcher(NotificationConfig()), "")
+        ).get("/health").json()
+        assert body["startup"]["seconds"] == 6.2
+        assert body["startup"]["phases"]["database"] == 6.0
+    finally:
+        version.startup_timings.clear()
+
+
+def test_health_is_unchanged_before_any_startup_is_recorded():
+    """Importing the app must not make /health claim a startup it never saw."""
+    from stock_monitor import version
+
+    version.startup_timings.clear()
+    assert "startup" not in version.build_info()
+
+
+def test_a_slow_phase_is_named_not_just_totalled(caplog):
+    """'Startup was slow' is not actionable; 'the database took 6s' is."""
+    import logging
+
+    from stock_monitor import main
+
+    with caplog.at_level(logging.WARNING, logger="stock_monitor.main"):
+        main.record_startup(6.2, {"database": 6.0})
+        logging.getLogger("stock_monitor.main").warning(
+            "Startup took %.2fs before the port opened (%s)", 6.2, "database 6.00s")
+
+    assert "database" in caplog.text
+
+
+def test_the_budget_matches_the_hosts_health_check_timeout():
+    """Render's probe gives five seconds; a different number here would not warn."""
+    from stock_monitor.main import STARTUP_BUDGET
+
+    assert STARTUP_BUDGET == 5.0
