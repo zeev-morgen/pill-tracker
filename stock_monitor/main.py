@@ -35,6 +35,7 @@ from .config import AppConfig, StockConfig, default_alerts, load_config
 from .dashboard import (
     prune_price_cache,
     set_analyst,
+    set_chat,
     set_data_feed,
     set_news_monitor,
     update_price_cache,
@@ -107,7 +108,15 @@ class StockMonitorApp:
             self._analyst = StockAnalyst(api_key=config.ai.api_key, model=config.ai.model)
             # Share it with the dashboard so /api/portfolio/analyze can use it.
             set_analyst(self._analyst)
-            self._log.info("AI analyst enabled (model=%s)", config.ai.model)
+            # The chat runs on its own model constant rather than config.ai.model:
+            # it attaches the portfolio as a mid-conversation system message, which
+            # only some models accept, and silently degrading that to a pasted-in
+            # user turn would be worse than pinning the model here.
+            from .chat import PortfolioChat
+            set_chat(PortfolioChat(api_key=config.ai.api_key))
+            self._log.info(
+                "AI analyst enabled (model=%s), portfolio chat enabled", config.ai.model
+            )
 
         self._earnings: Optional[EarningsMonitor] = None
         if config.earnings.enabled:

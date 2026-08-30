@@ -6,6 +6,7 @@ entered positions with entry price), ATR volatility and sector-concentration
 risk tabs, and allocation pie charts.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -13,9 +14,14 @@ from typing import Dict, List, Optional
 import pandas as pd
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 
-from . import excel_export, fx
+from . import chat, excel_export, fx
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import (
     ClosedPosition,
@@ -32,6 +38,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _risk_analyzer = PortfolioRiskAnalyzer(portfolio_store)
+
+#: Shown wherever an AI feature is reached without a key configured.
+_AI_DISABLED = "ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true"
 
 # The AI analyst is built by main.py only when a key is configured, and the
 # data feed is owned by the running app, so both reach the dashboard through
@@ -309,7 +318,7 @@ async def api_analyze_closed_position(entry_id: int):
     if analyst is None:
         raise HTTPException(
             status_code=503,
-            detail="ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true",
+            detail=_AI_DISABLED,
         )
     entry = closed_position_store.get(entry_id)
     if entry is None:
@@ -351,7 +360,7 @@ async def api_analyze_ticker(ticker: str):
     if analyst is None:
         raise HTTPException(
             status_code=503,
-            detail="ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true",
+            detail=_AI_DISABLED,
         )
     try:
         symbol = Holding.create(ticker, 1, 1).ticker   # reuse ticker validation
@@ -383,7 +392,7 @@ async def api_analyze_portfolio():
     if analyst is None:
         raise HTTPException(
             status_code=503,
-            detail="ניתוח AI אינו מופעל — הגדר ANTHROPIC_API_KEY ו-ai.enabled: true",
+            detail=_AI_DISABLED,
         )
     try:
         report = await run_in_threadpool(_risk_analyzer.full_report)
@@ -529,6 +538,108 @@ async def api_export_portfolio():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{name}"'},
     )
+
+
+# ── Portfolio chat ────────────────────────────────────────────────────────────
+
+_chat = None
+
+
+def set_chat(chat) -> None:
+    global _chat
+    _chat = chat
+
+
+def get_chat():
+    return _chat
+
+
+def _chat_snapshot() -> str:
+    """The portfolio state to hand the model for this turn.
+
+    Blocking — every call prices the whole portfolio — so callers run it in a
+    worker thread. A failure here is not fatal: the conversation is still worth
+    having without the numbers, as long as the model is told they are missing
+    rather than left to assume the portfolio is empty.
+    """
+    try:
+        report = _risk_analyzer.full_report()
+    except Exception as exc:
+        logger.warning("chat snapshot failed: %s", exc.__class__.__name__)
+        return (
+            "לא ניתן לקרוא את מצב התיק כרגע "
+            f"({exc.__class__.__name__}). אל תסיק מסקנות על מספרים שאין לך."
+        )
+    entries = [e.as_dict() for e in closed_position_store.all()]
+    return chat.build_snapshot(
+        report, {"entries": entries, "summary": journal_summary(entries)}
+    )
+
+
+@router.get("/api/chat")
+async def api_chat_history():
+    conversation = get_chat()
+    return JSONResponse({
+        "enabled": conversation is not None,
+        "messages": conversation.history() if conversation else [],
+    })
+
+
+@router.delete("/api/chat")
+async def api_chat_clear():
+    conversation = get_chat()
+    if conversation is None:
+        raise HTTPException(status_code=503, detail=_AI_DISABLED)
+    conversation.clear()
+    return JSONResponse({"messages": []})
+
+
+@router.post("/api/chat")
+async def api_chat_send(payload: dict = Body(...)):
+    """Send one message and stream the reply back.
+
+    Server-sent events rather than a single JSON response: a question about the
+    whole portfolio can take the better part of a minute, and a box that stays
+    empty that long is indistinguishable from one that is broken — a mistake
+    this dashboard has made before.
+    """
+    conversation = get_chat()
+    if conversation is None:
+        raise HTTPException(status_code=503, detail=_AI_DISABLED)
+
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="לא נשלחה הודעה")
+    if len(message) > 4000:
+        raise HTTPException(status_code=422, detail="ההודעה ארוכה מדי (עד 4000 תווים)")
+
+    get_data_feed()
+    snapshot = await run_in_threadpool(_chat_snapshot)
+
+    def _events():
+        """Sync generator — starlette iterates it on a worker thread."""
+        try:
+            for fragment in conversation.stream_reply(message, snapshot):
+                yield _sse({"text": fragment})
+        except Exception as exc:
+            logger.error("chat failed: %s", exc, exc_info=True)
+            # The error rides the stream rather than a status code: by the time
+            # it happens the response has already begun, so there is no code
+            # left to set. The client shows it in place of the reply.
+            yield _sse({"error": f"שגיאה בשיחה ({exc.__class__.__name__})"})
+        yield _sse({"done": True})
+
+    return StreamingResponse(
+        _events(),
+        media_type="text/event-stream",
+        # Buffering a stream defeats the point of streaming it; some proxies
+        # do so unless told otherwise.
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False, allow_nan=False)}\n\n"
 
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────
@@ -1049,6 +1160,55 @@ _HTML = """<!DOCTYPE html>
   .ext-price { font-size: 0.78rem; }
   /* Under the price rather than beside it: as its own column the as-of date
      pushed the row actions off the edge. */
+  /* ── Portfolio chat ──────────────────────────────────────────────────────
+     The log scrolls, the composer does not: the input stays reachable however
+     long the conversation gets. */
+  .chat-card { display: flex; flex-direction: column; }
+  .chat-log {
+    padding: 16px 18px; min-height: 240px; max-height: 55vh; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .chat-msg { max-width: 82%; padding: 10px 13px; border-radius: 10px; line-height: 1.6; }
+  /* The user's own words sit on the start edge, the reply opposite — logical
+     properties, so the sides follow the page direction rather than fighting it. */
+  .chat-msg.user {
+    align-self: flex-start; background: #1f6feb; color: #fff;
+    border-start-start-radius: 3px;
+  }
+  .chat-msg.assistant {
+    align-self: flex-end; background: var(--surface);
+    border: 1px solid var(--border); border-start-end-radius: 3px;
+  }
+  .chat-msg.error { align-self: flex-end; border-color: var(--red); color: var(--red); }
+  /* Model replies arrive as plain text with real newlines in them.
+     Deliberately no `unicode-bidi: plaintext` here, unlike the table cells: it
+     picks paragraph direction from the first strong character, and a Hebrew
+     reply very often opens with a Latin ticker ("ORCU היא 30% מהתיק"). That
+     one word would flip the whole sentence to LTR. Inheriting the page's
+     direction is right, and the bidi algorithm still places the ticker
+     correctly inside it. */
+  .chat-msg .body { white-space: pre-wrap; }
+  .chat-empty { color: var(--muted); text-align: center; padding: 30px 10px; }
+  .chat-composer {
+    display: flex; gap: 10px; padding: 12px 18px;
+    border-top: 1px solid var(--border); align-items: flex-end;
+  }
+  .chat-composer textarea {
+    flex: 1; resize: vertical; min-height: 44px; font: inherit;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  }
+  .chat-buttons { display: flex; flex-direction: column; gap: 6px; }
+  .chat-note {
+    padding: 0 18px 14px; color: var(--muted); font-size: 0.78rem;
+  }
+  /* Marks the reply that is still being written, so a pause reads as the model
+     thinking rather than as the page having stopped. */
+  .chat-msg.streaming .body::after {
+    content: '▍'; color: var(--muted); animation: chat-blink 1s steps(2) infinite;
+  }
+  @keyframes chat-blink { 50% { opacity: 0; } }
+
   .price-date { font-size: 0.72rem; margin-top: 2px; white-space: nowrap; }
   /* The currency a price is quoted in. Muted and small: it qualifies the
      number without competing with it, but agorot vs shekels is a factor of a
@@ -1079,6 +1239,7 @@ _HTML = """<!DOCTYPE html>
   <div class="tabs">
     <button class="tab active" data-panel="live">מעקב חי</button>
     <button class="tab" data-panel="portfolio">התיק שלי</button>
+    <button class="tab" data-panel="chat">שיחה על התיק</button>
     <button class="tab" data-panel="journal">יומן מסחר</button>
     <button class="tab" data-panel="news">חדשות מתפרצות</button>
     <button class="tab" data-panel="atr">חשיפת תנודתיות (ATR)</button>
@@ -1143,6 +1304,28 @@ _HTML = """<!DOCTYPE html>
           <div class="split-legend" id="split-legend"></div>
           <div id="index-detail" class="index-detail"></div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Portfolio chat ═══ -->
+  <div id="panel-chat" class="panel">
+    <div class="card chat-card">
+      <div class="card-title">
+        שיחה על התיק
+        <span class="muted-hint">— התיק נקרא מחדש בכל הודעה, כך שהתשובות מבוססות על המחירים הנוכחיים</span>
+      </div>
+      <div id="chat-log" class="chat-log"></div>
+      <div class="chat-composer">
+        <textarea id="chat-input" rows="2" placeholder="לדוגמה: ORCU תפסה 30% מהתיק — כדאי לצמצם?"
+                  onkeydown="chatKey(event)"></textarea>
+        <div class="chat-buttons">
+          <button class="btn primary" id="chat-send" onclick="sendChat()">שליחה</button>
+          <button class="btn" onclick="clearChat()" title="מוחק את היסטוריית השיחה">ניקוי</button>
+        </div>
+      </div>
+      <div class="chat-note">
+        תמיכה בקבלת החלטות — לא ייעוץ השקעות. השיחה נשמרת בזיכרון בלבד ונמחקת בהפעלה מחדש של השרת.
       </div>
     </div>
   </div>
@@ -1424,6 +1607,7 @@ async function api(path, options = {}) {
 
 /* ── Tabs ── */
 let newsLoaded = false;
+let chatLoaded = false;
 
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t) =>
@@ -1438,6 +1622,9 @@ function showTab(name) {
   // The news scan hits yfinance once per holding, so it waits until the tab is
   // actually opened instead of slowing down every page load.
   if (name === 'news' && !newsLoaded) { newsLoaded = true; loadNews(false); }
+  // Loaded once on first open — the history lives on the server, so reloading
+  // it on every tab switch would discard the scroll position for nothing.
+  if (name === 'chat' && !chatLoaded) { chatLoaded = true; loadChat(); }
 }
 
 document.querySelectorAll('.tab').forEach((tab) => {
@@ -2045,6 +2232,134 @@ function renderEntry(e) {
       </div>
     </div>
   </div>`;
+}
+
+/* ═══════════════════ Portfolio chat ═══════════════════ */
+
+let chatBusy = false;
+
+function chatBubble(role, text, cls) {
+  const el = document.createElement('div');
+  el.className = 'chat-msg ' + role + (cls ? ' ' + cls : '');
+  const body = document.createElement('div');
+  body.className = 'body';
+  // textContent, never innerHTML: the reply is model output and the history is
+  // whatever was typed into it. Neither is markup and neither is trusted.
+  body.textContent = text;
+  el.appendChild(body);
+  document.getElementById('chat-log').appendChild(el);
+  return body;
+}
+
+function chatScroll() {
+  const log = document.getElementById('chat-log');
+  log.scrollTop = log.scrollHeight;
+}
+
+async function loadChat() {
+  const log = document.getElementById('chat-log');
+  try {
+    const data = await (await fetch('/api/chat')).json();
+    log.innerHTML = '';
+    if (!data.enabled) {
+      log.innerHTML = '<div class="chat-empty">שיחת AI אינה מופעלת — ' +
+                      'הגדירו ANTHROPIC_API_KEY ו-ai.enabled: true</div>';
+      document.getElementById('chat-send').disabled = true;
+      return;
+    }
+    if (!data.messages.length) {
+      log.innerHTML = '<div class="chat-empty">שאלו משהו על התיק. ' +
+                      'המצב הנוכחי של הפוזיציות נשלח אוטומטית עם כל הודעה.</div>';
+      return;
+    }
+    data.messages.forEach((m) => chatBubble(m.role, m.content));
+    chatScroll();
+  } catch (e) {
+    log.innerHTML = '<div class="chat-empty">שגיאה בטעינת השיחה</div>';
+  }
+}
+
+/* Enter sends, Shift+Enter starts a new line — the convention every chat box
+   uses, and worth matching because the alternative surprises people mid-thought. */
+function chatKey(event) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    sendChat();
+  }
+}
+
+async function sendChat() {
+  if (chatBusy) return;
+  const input = document.getElementById('chat-input');
+  const message = input.value.trim();
+  if (!message) return;
+
+  const empty = document.querySelector('#chat-log .chat-empty');
+  if (empty) empty.remove();
+
+  chatBusy = true;
+  const button = document.getElementById('chat-send');
+  button.disabled = true;
+  input.value = '';
+  chatBubble('user', message);
+  const target = chatBubble('assistant', '', 'streaming');
+  chatScroll();
+
+  try {
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message}),
+    });
+    if (!response.ok) {
+      // A failure before the stream opens still answers as JSON.
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.detail || ('HTTP ' + response.status));
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let reply = '';
+    // Read frames, not chunks: a network chunk can split an SSE frame in half,
+    // so anything after the last blank line is held back until the rest lands.
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const frames = buffer.split('\\n\\n');
+      buffer = frames.pop();
+      for (const frame of frames) {
+        const line = frame.split('\\n').find((l) => l.startsWith('data: '));
+        if (!line) continue;
+        const payload = JSON.parse(line.slice(6));
+        if (payload.error) throw new Error(payload.error);
+        if (payload.text) {
+          reply += payload.text;
+          target.textContent = reply;
+          chatScroll();
+        }
+      }
+    }
+    if (!reply) target.textContent = 'לא התקבלה תשובה.';
+  } catch (e) {
+    target.parentElement.classList.add('error');
+    target.textContent = e.message || 'שגיאה בשיחה';
+  } finally {
+    target.parentElement.classList.remove('streaming');
+    chatBusy = false;
+    button.disabled = false;
+    input.focus();
+    chatScroll();
+  }
+}
+
+async function clearChat() {
+  if (!confirm('למחוק את היסטוריית השיחה?')) return;
+  try {
+    await fetch('/api/chat', {method: 'DELETE'});
+  } catch (e) { /* the reload below reports the real state either way */ }
+  loadChat();
 }
 
 async function loadJournal() {

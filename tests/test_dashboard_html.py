@@ -90,9 +90,9 @@ def test_every_tab_has_a_panel():
     assert tabs == panels, f"tabs {tabs ^ panels} have no matching panel"
 
 
-def test_all_six_tabs_are_present():
+def test_the_tabs_are_present_and_in_order():
     tabs = re.findall(r'data-panel="(\w+)"', _HTML)
-    assert tabs == ["live", "portfolio", "journal", "news", "atr", "sector"]
+    assert tabs == ["live", "portfolio", "chat", "journal", "news", "atr", "sector"]
 
 
 # ── The stale-feed banner ─────────────────────────────────────────────────────
@@ -192,3 +192,69 @@ def test_a_tel_aviv_row_is_not_labelled_with_a_new_york_session():
     rows = _HTML.split("function renderStocks(", 1)[1].split("\n}", 1)[0]
     assert "sessionCell(s)" in rows
     assert "sessionLabel(s.session)" not in rows, "the raw session label bypasses the check"
+
+
+# ── Portfolio chat ────────────────────────────────────────────────────────────
+
+def test_the_chat_panel_exists_and_is_wired():
+    assert 'id="panel-chat"' in _HTML
+    assert "function sendChat(" in _HTML
+    assert "chatLoaded = true; loadChat()" in _HTML
+
+
+def test_chat_messages_are_inserted_as_text_not_markup():
+    """Model output and typed history are neither markup nor trusted."""
+    body = _HTML.split("function chatBubble(", 1)[1].split("\n}", 1)[0]
+    # Comments stripped first: the rule is about what the code does, and the
+    # comment explaining the rule naturally names the thing it forbids.
+    code = re.sub(r"//.*", "", body)
+    assert "textContent" in code
+    assert "innerHTML" not in code
+
+
+def test_the_stream_reader_buffers_partial_frames():
+    """A network chunk can split an SSE frame; parsing it half-read throws."""
+    body = _HTML.split("async function sendChat(", 1)[1].split("\n}", 1)[0]
+    assert "buffer" in body
+    assert "frames.pop()" in body
+
+
+def test_enter_sends_and_shift_enter_does_not():
+    body = _HTML.split("function chatKey(", 1)[1].split("\n}", 1)[0]
+    assert "shiftKey" in body
+
+
+def test_the_chat_says_what_it_is_and_is_not():
+    assert "לא ייעוץ השקעות" in _HTML
+
+
+def test_the_chat_warns_that_history_is_not_persisted():
+    assert "נמחקת בהפעלה מחדש" in _HTML
+
+
+def test_the_page_script_is_valid_javascript():
+    """The page lives in a non-raw Python string, so escapes are a live hazard.
+
+    A '\\n' written for JavaScript becomes a real newline in the Python literal
+    and breaks the JS string it was inside — which kills the entire script tag,
+    not just that function. Every button on the page stops working and nothing
+    in the HTML looks wrong. Parsing the rendered script is the only check that
+    catches it; substring assertions read the Python source, where it looks fine.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available to parse the script")
+
+    script = _HTML.split("<script>")[-1].split("</script>")[0]
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
+        # Wrapped in a function: the script touches `document` at load, which a
+        # syntax check must not execute.
+        handle.write("function __page() {\n" + script + "\n}\n")
+        path = handle.name
+
+    result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
