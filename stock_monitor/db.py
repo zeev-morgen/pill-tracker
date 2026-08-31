@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Iterator, Optional
@@ -35,6 +36,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 logger = logging.getLogger(__name__)
+
+#: Why the last init_db call fell back to memory, or None when it did not.
+#: Read by status(); set only here.
+_last_error: Optional[str] = None
 
 
 class Base(DeclarativeBase):
@@ -136,6 +141,30 @@ _engine = None
 _SessionFactory: Optional[sessionmaker] = None
 
 
+#: A connection URL with credentials in it, anywhere inside a longer string.
+_URL_WITH_CREDENTIALS = re.compile(r"\b[a-z+]+://[^\s/@]*@?[^\s]*", re.IGNORECASE)
+
+
+def _redact(message: str) -> str:
+    """Remove the connection string from an error before it is displayed.
+
+    Driver errors quote the DSN back — "could not connect to
+    postgresql://user:pass@host" — and this text ends up in a browser and in
+    logs that get pasted into chats.
+
+    Scope, deliberately: URL-shaped text goes, and so does the configured
+    DATABASE_URL wherever it appears verbatim. A hostname or username
+    mentioned in prose does not — "password authentication failed for user
+    neondb_owner" survives intact, because that sentence is the diagnosis and
+    it contains no secret. The password is the thing that must never appear,
+    and it only ever appears inside the URL.
+    """
+    configured = os.environ.get("DATABASE_URL", "").strip()
+    if configured:
+        message = message.replace(configured, "<DATABASE_URL>")
+    return _URL_WITH_CREDENTIALS.sub("<url>", message)
+
+
 def _normalize_url(url: str) -> str:
     """Force the psycopg3 driver, which is what requirements.txt installs."""
     if url.startswith("postgres://"):
@@ -151,11 +180,12 @@ def init_db(url: Optional[str] = None) -> bool:
     Safe to call more than once. A connection failure is logged and downgraded
     to in-memory mode rather than crashing the monitor at startup.
     """
-    global _engine, _SessionFactory
+    global _engine, _SessionFactory, _last_error
 
     url = url or os.environ.get("DATABASE_URL", "")
     if not url:
         logger.info("DATABASE_URL not set — using in-memory storage (data is not persisted)")
+        _last_error = "DATABASE_URL is not set"
         return False
 
     try:
@@ -169,18 +199,22 @@ def init_db(url: Optional[str] = None) -> bool:
         _add_missing_columns()
         _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
         logger.info("PostgreSQL connected — alerts and holdings are persisted")
+        _last_error = None
         return True
     except Exception as exc:
         # Deliberately broad: a malformed URL surfaces as UnicodeEncodeError or
         # ValueError rather than SQLAlchemyError, and an unreachable host as
         # OSError. None of these should take the monitor down — losing
         # persistence must not also cost us price polling and Telegram alerts.
+        # Redacted here too, not only in status(): logs get pasted into chats
+        # and issue trackers, and a driver error quotes the DSN back verbatim.
         logger.error(
-            "PostgreSQL init failed (%s: %s) — falling back to in-memory storage. "
-            "Check that DATABASE_URL holds the real connection string.",
-            exc.__class__.__name__,
-            exc,
+            "PostgreSQL init failed (%s) — falling back to in-memory storage. "
+            "Saved rows are untouched; this process just cannot read them. "
+            "Check that DATABASE_URL holds a current connection string.",
+            _redact(f"{exc.__class__.__name__}: {exc}")[:300],
         )
+        _last_error = _redact(f"{exc.__class__.__name__}: {exc}")[:300]
         _engine = None
         _SessionFactory = None
         return False
@@ -240,6 +274,25 @@ def _add_missing_columns() -> None:
 
 def is_enabled() -> bool:
     return _SessionFactory is not None
+
+
+def status() -> dict:
+    """Whether persistence is live, and if not, why.
+
+    Falling back to memory is silent by design — losing the database must not
+    take the monitor down with it. The cost of that is a dashboard which then
+    shows an empty portfolio and a watchlist rebuilt from config.yaml, both of
+    which look exactly like data loss and neither of which says what happened.
+    The reason went only to the host's logs; this keeps it reachable.
+
+    Never includes the connection string or any part of it — the reason a
+    database is unreachable is frequently the credentials in it.
+    """
+    return {
+        "enabled": is_enabled(),
+        "url_configured": bool(os.environ.get("DATABASE_URL", "").strip()),
+        "error": _last_error,
+    }
 
 
 @contextmanager

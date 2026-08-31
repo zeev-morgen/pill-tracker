@@ -652,7 +652,22 @@ class WatchlistStore:
         return removed
 
     def seed(self, symbols: List[str]) -> None:
-        """Populate from config.yaml on first run, without overwriting edits."""
+        """Populate from config.yaml on first run, without overwriting edits.
+
+        "Empty" only means "first run" when the store can actually be read. If
+        a database is configured but unreachable, every read comes back empty —
+        and seeding on that would refill the watchlist with config.yaml's
+        symbols, which is how a user who curated their list months ago finds it
+        replaced by tickers they removed. Better to monitor nothing for a few
+        minutes than to show a list that is confidently wrong.
+        """
+        state = db.status()
+        if state["url_configured"] and not state["enabled"]:
+            logger.warning(
+                "Watchlist not seeded — a database is configured but unreachable, "
+                "so an empty watchlist means 'cannot read' rather than 'first run'."
+            )
+            return
         if self.all():
             return
         for symbol in symbols:

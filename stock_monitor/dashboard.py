@@ -403,15 +403,50 @@ async def api_analyze_portfolio():
     return JSONResponse({"analysis": analysis})
 
 
+@router.get("/api/storage")
+async def api_storage():
+    """Whether saved data is being read, and what is in it.
+
+    Exists because losing the database is deliberately silent — the monitor
+    keeps polling and alerting without it. What that looks like on screen is a
+    portfolio with no positions and a watchlist rebuilt from config.yaml, which
+    is indistinguishable from having lost everything. Nothing here reads or
+    returns the connection string.
+    """
+    from . import db
+
+    status = db.status()
+    return JSONResponse({
+        **status,
+        "holdings": len(portfolio_store.all()),
+        "watchlist": len(watchlist_store.all()),
+        "closed_positions": len(closed_position_store.all()),
+        # Saved rows are still on the database when it is unreachable; only
+        # this process cannot see them. Saying so is the difference between a
+        # scare and a fix.
+        "note": (
+            "הנתונים השמורים אינם נקראים — הם עדיין קיימים במסד הנתונים, "
+            "אך השרת אינו מחובר אליו כרגע."
+            if not status["enabled"] else "מחובר — הנתונים נקראים ונשמרים."
+        ),
+    })
+
+
 @router.get("/api/portfolio")
 async def api_portfolio():
     """Positions, ATR/sector risk reports and allocation weights.
 
     Runs in a worker thread: it performs blocking yfinance calls per holding.
     """
+    from . import db
+
     try:
         get_data_feed()   # attaches the feed that supplies pre/post-market data
-        return JSONResponse(await run_in_threadpool(_risk_analyzer.full_report))
+        report = await run_in_threadpool(_risk_analyzer.full_report)
+        # Carried on the report so an empty table can explain itself. Without
+        # it "no positions" and "cannot read your positions" render identically.
+        report["storage_ok"] = db.is_enabled()
+        return JSONResponse(report)
     except Exception as exc:
         logger.error("Portfolio report failed: %s", exc, exc_info=True)
         # The exception class goes to the browser too. A bare "שגיאה" left both
@@ -1733,8 +1768,18 @@ function skippedNote(data) {
 function renderHoldings(data) {
   const wrap = document.getElementById('holdings-wrap');
   if (!data.positions.length) {
-    wrap.innerHTML = skippedNote(data) ||
-      '<div class="empty">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</div>';
+    // An empty table has two very different causes and they used to look the
+    // same. "You have no positions" and "your positions cannot be read right
+    // now" call for opposite reactions, so the second one says so plainly
+    // rather than inviting the user to re-enter data that already exists.
+    wrap.innerHTML = data.storage_ok === false
+      ? `<div class="banner warn" style="margin:14px 18px">⚠️ <b>אין חיבור למסד הנתונים.</b> ` +
+        `הפוזיציות השמורות שלכם קיימות ולא אבדו — השרת פשוט לא קורא אותן כרגע, ` +
+        `ורשימת המעקב חזרה לברירת המחדל מקובץ ההגדרות. ` +
+        `אל תזינו מחדש פוזיציות: הן ידרסו את השמורות כשהחיבור יחזור. ` +
+        `פרטים ב-<code>/api/storage</code>.</div>`
+      : (skippedNote(data) ||
+         '<div class="empty">אין פוזיציות — הוסיפו דרך "הוספת פוזיציה"</div>');
     document.getElementById('portfolio-total').textContent = '';
     return;
   }
