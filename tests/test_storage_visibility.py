@@ -352,3 +352,89 @@ def test_a_routing_failure_with_no_ipv4_available_gives_up_cleanly(monkeypatch):
 
     assert db.init_db() is False
     assert "unreachable" in db.status()["error"].lower()
+
+
+# ── Read caching, and why it exists ───────────────────────────────────────────
+
+def test_the_cache_starts_cold():
+    """Nothing may be served before a successful read has actually happened."""
+    from stock_monitor.store import _cache_is_fresh
+
+    assert _cache_is_fresh(0.0) is False
+
+
+def test_a_fresh_stamp_is_reused(monkeypatch):
+    from stock_monitor import store
+
+    monkeypatch.setattr(store.time, "monotonic", lambda: 1000.0)
+    assert store._cache_is_fresh(999.0) is True
+
+
+def test_an_expired_stamp_is_not_reused(monkeypatch):
+    from stock_monitor import store
+
+    monkeypatch.setattr(store.time, "monotonic", lambda: 1000.0 + store.READ_CACHE_TTL + 1)
+    assert store._cache_is_fresh(1000.0) is False
+
+
+def test_the_polling_loop_does_not_query_on_every_cycle(monkeypatch):
+    """The reported outage: a query every 60s kept the database awake around
+    the clock and burned a month of compute quota in about a week."""
+    from stock_monitor import store
+    from stock_monitor.store import WatchlistStore
+
+    queries = []
+    monkeypatch.setattr(db, "is_enabled", lambda: True)
+
+    watch = WatchlistStore()
+    watch._symbols = ["NVDA"]
+    watch._loaded_at = store.time.monotonic()   # already loaded once
+
+    def explode():
+        queries.append(1)
+        raise AssertionError("must not query while the cache is fresh")
+
+    monkeypatch.setattr(db, "session_scope", lambda: explode())
+
+    for _ in range(60):          # an hour of polling at the configured interval
+        assert watch.all() == ["NVDA"]
+    assert queries == []
+
+
+def test_a_failed_read_is_not_cached_as_empty(monkeypatch):
+    """Otherwise a blip would serve an empty portfolio for the whole window."""
+    from stock_monitor.store import PortfolioStore
+
+    monkeypatch.setattr(db, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        db, "session_scope",
+        lambda: (_ for _ in ()).throw(RuntimeError("database is not initialized")),
+    )
+    store_ = PortfolioStore()
+
+    assert store_.all() == []
+    assert store_._loaded_at == 0.0, "a failure must leave the cache cold"
+
+
+def test_a_write_is_visible_without_waiting_for_the_window(monkeypatch):
+    """Writes update memory as well as the row, so no invalidation is needed."""
+    from stock_monitor import store
+    from stock_monitor.store import WatchlistStore
+
+    monkeypatch.setattr(db, "is_enabled", lambda: False)
+    watch = WatchlistStore()
+    watch.add("NVDA")
+    watch._loaded_at = store.time.monotonic()
+
+    watch.add("AVGO")
+    assert "AVGO" in watch.all()
+    watch.remove("NVDA")
+    assert "NVDA" not in watch.all()
+
+
+def test_the_window_is_long_enough_to_let_the_database_sleep():
+    """Under five minutes and a managed instance never suspends, which is the
+    entire failure this constant exists to prevent."""
+    from stock_monitor.store import READ_CACHE_TTL
+
+    assert READ_CACHE_TTL >= 600

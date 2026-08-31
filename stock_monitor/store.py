@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -95,6 +96,30 @@ class AlertStore:
 
 
 # ── Portfolio holdings ────────────────────────────────────────────────────────
+
+#: How long a successful database read is reused before going back to the
+#: database. This process is the only writer — every write updates the
+#: in-memory copy and the row together — so a read on a timer can only ever
+#: return what memory already holds.
+#:
+#: The number is set by compute billing, not by staleness. Managed Postgres
+#: charges for the time the instance is awake and suspends it after about five
+#: minutes idle. The polling loop asked for the watchlist every sixty seconds,
+#: so it never once went idle: 720 compute-hours a month against a free tier's
+#: ~190, which is precisely how this deployment lost its database. At an hour
+#: the same loop wakes it roughly 24 times a day instead of 1,440 — a few
+#: compute-hours a month, with the instance asleep the rest of the time.
+#:
+#: The cost of the long window: an edit made directly against the database,
+#: outside this app, can take up to an hour to appear. Nothing else writes to
+#: it, so that is a price worth paying.
+READ_CACHE_TTL = 3600
+
+
+def _cache_is_fresh(loaded_at: float) -> bool:
+    """Whether a cached read is still good. Zero means "never loaded"."""
+    return loaded_at > 0 and (time.monotonic() - loaded_at) < READ_CACHE_TTL
+
 
 class HoldingError(ValueError):
     """Raised when a holding fails validation."""
@@ -248,6 +273,8 @@ class PortfolioStore:
     def __init__(self) -> None:
         self._holdings: Dict[str, Holding] = {}
         self._lock = threading.Lock()
+        #: When the database was last read successfully. See READ_CACHE_TTL.
+        self._loaded_at = 0.0
 
     def upsert(self, holding: Holding) -> Holding:
         with self._lock:
@@ -292,13 +319,19 @@ class PortfolioStore:
             return self._holdings.get(ticker)
 
     def all(self) -> List[Holding]:
-        if db.is_enabled():
+        if db.is_enabled() and not _cache_is_fresh(self._loaded_at):
             try:
                 with db.session_scope() as session:
                     rows = session.scalars(
                         select(db.HoldingRow).order_by(db.HoldingRow.ticker)
                     ).all()
-                return [_row_to_holding(r) for r in rows]
+                holdings = [_row_to_holding(r) for r in rows]
+                with self._lock:
+                    self._holdings = {h.ticker: h for h in holdings}
+                # Stamped only after the read succeeded. Stamping on failure
+                # would cache an empty result and keep serving it.
+                self._loaded_at = time.monotonic()
+                return holdings
             except (SQLAlchemyError, RuntimeError) as exc:
                 logger.error("Failed to read holdings: %s", exc)
         with self._lock:
@@ -589,15 +622,21 @@ class WatchlistStore:
     def __init__(self) -> None:
         self._symbols: List[str] = []
         self._lock = threading.Lock()
+        #: When the database was last read successfully. See READ_CACHE_TTL.
+        self._loaded_at = 0.0
 
     def all(self) -> List[str]:
-        if db.is_enabled():
+        if db.is_enabled() and not _cache_is_fresh(self._loaded_at):
             try:
                 with db.session_scope() as session:
                     rows = session.scalars(
                         select(db.WatchlistRow).order_by(db.WatchlistRow.symbol)
                     ).all()
-                return [r.symbol for r in rows]
+                symbols = [r.symbol for r in rows]
+                with self._lock:
+                    self._symbols = list(symbols)
+                self._loaded_at = time.monotonic()
+                return symbols
             except (SQLAlchemyError, RuntimeError) as exc:
                 logger.error("Failed to read watchlist: %s", exc)
         with self._lock:
