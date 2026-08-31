@@ -170,6 +170,11 @@ class StockMonitorApp:
         await asyncio.to_thread(self._run_cycle)
 
     def _run_cycle(self) -> None:
+        # A database that was down at startup gets another chance here rather
+        # than waiting for a redeploy. No-op once connected, and rate-limited
+        # while not, so it neither costs requests nor keeps a healthy instance
+        # from sleeping.
+        db.ensure_connected()
         session   = get_market_session()
         stock_map = {sc.symbol: sc for sc in self.watched_stocks()}
         prune_price_cache(stock_map)

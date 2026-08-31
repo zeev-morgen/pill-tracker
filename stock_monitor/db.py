@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import socket
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Iterator, Optional
@@ -343,6 +344,45 @@ def _add_missing_columns() -> None:
                     "Grant the database user ALTER on '%s' to fix this.",
                     table, column, exc.__class__.__name__, table,
                 )
+
+
+#: How often a failed connection is retried. Only ever runs while the database
+#: is *down*, so it costs nothing once connected — in particular it cannot keep
+#: a healthy instance awake, which is the thing READ_CACHE_TTL exists to avoid.
+RECONNECT_INTERVAL = 60
+
+_last_attempt = 0.0
+
+
+def ensure_connected() -> bool:
+    """Retry a failed connection, so recovery does not need a restart.
+
+    init_db runs once at startup. When it failed, persistence stayed dead for
+    the whole life of the process even after the database came back — a quota
+    reset, a plan upgrade, a provider outage ending — and the only way to pick
+    it up again was to redeploy. Worse, the recorded failure kept being
+    reported long after it had stopped being true, so the diagnostics said the
+    old thing while the database sat there working.
+
+    Cheap by construction: it returns immediately once connected, and while
+    disconnected it tries at most once per RECONNECT_INTERVAL.
+    """
+    global _last_attempt
+
+    if is_enabled():
+        return True
+    if not os.environ.get("DATABASE_URL", "").strip():
+        return False
+
+    now = time.monotonic()
+    if now - _last_attempt < RECONNECT_INTERVAL:
+        return False
+    _last_attempt = now
+
+    if init_db():
+        logger.info("Database reachable again — persistence restored without a restart")
+        return True
+    return False
 
 
 def is_enabled() -> bool:

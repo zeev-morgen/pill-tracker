@@ -438,3 +438,102 @@ def test_the_window_is_long_enough_to_let_the_database_sleep():
     from stock_monitor.store import READ_CACHE_TTL
 
     assert READ_CACHE_TTL >= 600
+
+
+# ── Reconnecting without a redeploy ───────────────────────────────────────────
+
+@pytest.fixture
+def reconnect_state(monkeypatch):
+    monkeypatch.setattr(db, "_last_attempt", 0.0)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@host/db")
+    yield
+
+
+def test_a_connected_database_is_not_reconnected(reconnect_state, monkeypatch):
+    """Retrying while healthy would wake an instance we just taught to sleep."""
+    monkeypatch.setattr(db, "is_enabled", lambda: True)
+    monkeypatch.setattr(db, "init_db", lambda: pytest.fail("must not reconnect"))
+
+    assert db.ensure_connected() is True
+
+
+def test_a_failed_connection_is_retried(reconnect_state, monkeypatch):
+    """The reported symptom: the plan was upgraded and nothing changed, because
+    init_db only ever ran at startup."""
+    monkeypatch.setattr(db, "is_enabled", lambda: False)
+    calls = []
+    monkeypatch.setattr(db, "init_db", lambda: calls.append(1) or True)
+
+    assert db.ensure_connected() is True
+    assert calls == [1]
+
+
+def test_retries_are_rate_limited(reconnect_state, monkeypatch):
+    """Once a minute, not once per polling cycle times every request."""
+    monkeypatch.setattr(db, "is_enabled", lambda: False)
+    calls = []
+    monkeypatch.setattr(db, "init_db", lambda: calls.append(1) or False)
+
+    for _ in range(50):
+        db.ensure_connected()
+    assert len(calls) == 1
+
+
+def test_a_retry_is_allowed_again_after_the_interval(reconnect_state, monkeypatch):
+    monkeypatch.setattr(db, "is_enabled", lambda: False)
+    calls = []
+    monkeypatch.setattr(db, "init_db", lambda: calls.append(1) or False)
+
+    clock = [1000.0]
+    monkeypatch.setattr(db.time, "monotonic", lambda: clock[0])
+    db.ensure_connected()
+    clock[0] += db.RECONNECT_INTERVAL + 1
+    db.ensure_connected()
+
+    assert len(calls) == 2
+
+
+def test_no_url_means_no_retry(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(db, "is_enabled", lambda: False)
+    monkeypatch.setattr(db, "init_db", lambda: pytest.fail("nothing to connect to"))
+
+    assert db.ensure_connected() is False
+
+
+def test_the_polling_loop_attempts_a_reconnect():
+    """Unattended recovery: the user should not have to redeploy."""
+    import inspect
+
+    from stock_monitor.main import StockMonitorApp
+
+    assert "ensure_connected" in inspect.getsource(StockMonitorApp._run_cycle)
+
+
+def test_the_storage_endpoint_retries_before_reporting(client, monkeypatch):
+    """Refreshing the page has to be a live check, not a replay of startup."""
+    calls = []
+    monkeypatch.setattr(db, "ensure_connected", lambda: calls.append(1) or False)
+    monkeypatch.setattr(db, "status", lambda: {
+        "enabled": False, "url_configured": True, "error": "stale one"})
+
+    client.get("/api/storage")
+    assert calls == [1]
+
+
+def test_a_recovered_database_reports_itself_recovered(client, monkeypatch):
+    """The whole point: fix the cause, refresh, and see the truth."""
+    state = {"up": False}
+
+    def reconnect():
+        state["up"] = True
+        return True
+
+    monkeypatch.setattr(db, "ensure_connected", reconnect)
+    monkeypatch.setattr(db, "status", lambda: {
+        "enabled": state["up"], "url_configured": True,
+        "error": None if state["up"] else "OperationalError: quota exceeded"})
+
+    body = client.get("/api/storage").json()
+    assert body["enabled"] is True
+    assert body["error"] is None

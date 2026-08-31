@@ -415,6 +415,11 @@ async def api_storage():
     """
     from . import db
 
+    # Retry before reporting. The recorded error is from the last connection
+    # attempt, and until this existed that meant startup — so after fixing the
+    # cause (a restored quota, a corrected URL) this endpoint kept replaying
+    # the original failure and looked like the fix had not worked.
+    await run_in_threadpool(db.ensure_connected)
     status = db.status()
     return JSONResponse({
         **status,
