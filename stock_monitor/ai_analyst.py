@@ -34,6 +34,38 @@ def _fast_get(fast_info, *names):
     return None
 
 
+def friendly_error(exc: Exception) -> str:
+    """What went wrong with the AI call, and what to do about it.
+
+    The raw exception used to go straight onto the dashboard: a Python repr of
+    a JSON error object, in English, ending in a request id. Every one of the
+    common failures here has a specific and obvious remedy — top up the
+    account, wait a minute, fix the key — and none of that survives being
+    printed as a stack value. The unrecognised case still carries the class
+    name, which is the part worth searching for.
+    """
+    text = str(exc).lower()
+
+    if "credit balance is too low" in text or ("insufficient" in text and "credit" in text):
+        return (
+            "יתרת הקרדיט בחשבון Anthropic נגמרה. "
+            "היכנס ל-console.anthropic.com ← Plans & Billing והוסף קרדיט. "
+            "שאר הדשבורד ממשיך לעבוד — רק תכונות ה-AI מושבתות."
+        )
+    if "authentication" in text or "invalid x-api-key" in text or "401" in text:
+        return (
+            "מפתח ה-API של Anthropic נדחה. "
+            "בדוק את ANTHROPIC_API_KEY במשתני הסביבה — ייתכן שהוחלף או פג."
+        )
+    if "rate limit" in text or "429" in text:
+        return "יותר מדי בקשות ל-Anthropic ברצף. נסה שוב בעוד דקה."
+    if "overloaded" in text or "529" in text:
+        return "השירות של Anthropic עמוס כרגע. נסה שוב בעוד מספר דקות."
+    if isinstance(exc, (anthropic.APIConnectionError, httpx.ConnectError)):
+        return "לא ניתן להגיע ל-Anthropic. בדוק את החיבור לרשת."
+    return f"שגיאה בפנייה ל-AI ({exc.__class__.__name__})."
+
+
 def _finite_or_none(value):
     """Drop NaN / infinity so the prompt says 'אין נתון' instead of 'nan'."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -164,7 +196,7 @@ class StockAnalyst:
             )
         except Exception as exc:
             logger.error("AI analysis failed for %s: %s", symbol, exc, exc_info=True)
-            return f"❌ שגיאה בניתוח AI עבור {symbol}: {exc}"
+            return f"❌ {friendly_error(exc)}"
 
     # ── Portfolio-level analysis ──────────────────────────────────────────────
 
@@ -195,7 +227,7 @@ class StockAnalyst:
             )
         except Exception as exc:
             logger.error("Portfolio AI analysis failed: %s", exc, exc_info=True)
-            return f"❌ שגיאה בניתוח התיק: {exc}"
+            return f"❌ {friendly_error(exc)}"
 
     @staticmethod
     def _build_portfolio_prompt(report: dict) -> str:
@@ -277,7 +309,7 @@ class StockAnalyst:
             text = next((b.text for b in msg.content if b.type == "text"), "")
         except Exception as exc:
             logger.error("Closed-position review failed: %s", exc, exc_info=True)
-            return {"rating": None, "explanation": f"❌ שגיאה בניתוח העסקה: {exc}"}
+            return {"rating": None, "explanation": f"❌ {friendly_error(exc)}"}
         return _parse_review(text)
 
     @staticmethod

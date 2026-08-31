@@ -297,3 +297,31 @@ def test_a_us_quote_still_has_no_currency():
     })
     assert dashboard._price_cache["AVGO"]["currency"] == ""
     dashboard._price_cache.pop("AVGO", None)
+
+
+# ── Amounts vs prices ─────────────────────────────────────────────────────────
+
+def test_the_page_distinguishes_a_price_from_a_sum_of_money():
+    """A quote keeps its unit; a profit does not. "You lost 113,355.74 agorot"
+    is a true sentence that nobody can read."""
+    from stock_monitor.dashboard import _HTML
+
+    assert "const moneyAmount =" in _HTML
+    body = _HTML.split("const moneyAmount =", 1)[1].split("};", 1)[0]
+    assert "/ 100" in body, "agorot amounts must be shown as shekels"
+    assert "'ILS'" in body
+
+
+def test_journal_profit_is_an_amount_not_a_price():
+    from stock_monitor.dashboard import _HTML
+
+    assert "moneyAmount(e.pnl_value, e.currency)" in _HTML
+    assert "nativeMoney(e.pnl_value" not in _HTML
+
+
+def test_journal_prices_keep_their_quoted_unit():
+    """Entry and exit are quotes — they stay in agorot to match the broker."""
+    from stock_monitor.dashboard import _HTML
+
+    assert "nativeMoney(e.entry_price, e.currency)" in _HTML
+    assert "nativeMoney(e.exit_price, e.currency)" in _HTML

@@ -444,3 +444,25 @@ def test_agorot_is_written_after_the_number():
     line = [l for l in build_snapshot(REPORT).splitlines() if "POLI.TA" in l][0]
     assert "3,450.00 אג׳" in line
     assert "אג׳3,450" not in line
+
+
+# ── Failures the user can act on ──────────────────────────────────────────────
+
+def test_an_exhausted_account_says_what_to_do(client, conversation, monkeypatch):
+    """A Python repr of a JSON error, in English, ending in a request id, is
+    not a thing anyone can act on — and every common failure here has an
+    obvious remedy."""
+    monkeypatch.setattr(dashboard, "_chat", conversation)
+    monkeypatch.setattr(dashboard, "_chat_snapshot", lambda: "מצב")
+    conversation.state["fragments"] = [RuntimeError(
+        "Error code: 400 - {'type': 'error', 'error': {'message': 'Your credit "
+        "balance is too low to access the Anthropic API. Please go to Plans & "
+        "Billing to upgrade or purchase credits.'}}")]
+
+    response = client.post("/api/chat", json={"message": "שאלה"})
+    errors = [
+        json.loads(line[6:])["error"] for line in response.text.splitlines()
+        if line.startswith("data: ") and "error" in json.loads(line[6:])
+    ]
+    assert errors and "קרדיט" in errors[0]
+    assert "request_id" not in errors[0]

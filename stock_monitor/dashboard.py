@@ -21,7 +21,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import chat, excel_export, fx
+from . import ai_analyst, chat, excel_export, fx
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import (
     ClosedPosition,
@@ -666,7 +666,7 @@ async def api_chat_send(payload: dict = Body(...)):
             # The error rides the stream rather than a status code: by the time
             # it happens the response has already begun, so there is no code
             # left to set. The client shows it in place of the reply.
-            yield _sse({"error": f"שגיאה בשיחה ({exc.__class__.__name__})"})
+            yield _sse({"error": ai_analyst.friendly_error(exc)})
         yield _sse({"done": True})
 
     return StreamingResponse(
@@ -1629,6 +1629,19 @@ const nativeMoney = (n, currency) => {
   return `<bdi>${sign}$${abs}</bdi>`;
 };
 
+/* A sum of money, as opposed to a quoted price.
+   Prices keep the unit they are quoted in, because that is what a broker
+   screen shows and the whole point is being able to check one against the
+   other. A profit or a loss is not a quote — "you lost 113,355.74 agorot" is
+   a true sentence nobody can read. Amounts therefore go to shekels, which is
+   also what the holdings table already shows under each position's value. */
+const moneyAmount = (n, currency) => {
+  if (n == null) return '—';
+  const code = String(currency || '').toUpperCase();
+  if (code === 'ILA') return nativeMoney(n / 100, 'ILS');
+  return nativeMoney(n, code);
+};
+
 /* The page is laid out LTR, so a Hebrew word after a number comes out reversed
    unless the run is explicitly marked. */
 const days = (n) => n == null ? '—'
@@ -2124,7 +2137,7 @@ function updateAddPreview() {
     `כמות אחרי ההוספה: <b>${parseFloat(total.toFixed(6))}</b><br>` +
     `מחיר ממוצע חדש: <b class="${dir}">${nativeMoney(avg, cur)}</b> ` +
     `<span class="volume">(היה ${nativeMoney(addTarget.entry_price, cur)})</span><br>` +
-    `<span class="volume">עלות ההוספה: ${nativeMoney(qty * price, cur)}</span>`;
+    `<span class="volume">עלות ההוספה: ${moneyAmount(qty * price, cur)}</span>`;
 }
 
 ['a-qty', 'a-price'].forEach((id) =>
@@ -2259,7 +2272,7 @@ function renderEntry(e) {
       <div><span>תשואה</span><b class="${pnlCls}">${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%</b></div>
       <!-- Both figures for a foreign trade: what it made in its own currency,
            and what that was worth in dollars at the rate on the day it closed. -->
-      <div><span>רווח/הפסד</span><b class="${pnlCls}">${nativeMoney(e.pnl_value, e.currency)}${
+      <div><span>רווח/הפסד</span><b class="${pnlCls}">${moneyAmount(e.pnl_value, e.currency)}${
         e.currency && e.pnl_value_usd != null ? ` <span class="volume">(${money(e.pnl_value_usd)})</span>` : ''
       }</b></div>
       <div><span>זמן החזקה</span><b>${days(e.holding_days)}</b></div>
