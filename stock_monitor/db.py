@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import socket
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Iterator, Optional
@@ -32,6 +33,7 @@ from sqlalchemy import (
     inspect,
     text,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -174,6 +176,64 @@ def _normalize_url(url: str) -> str:
     return url
 
 
+#: Errors that mean "the address we tried has no route from here", as opposed
+#: to a rejected login or a missing database. These are the ones an IPv4 retry
+#: can fix; retrying anything else would just fail twice as slowly.
+_NO_ROUTE = ("network is unreachable", "no route to host",
+             "cannot assign requested address")
+
+
+def _is_unroutable(exc: Exception) -> bool:
+    """Whether an error means the address had no route, at any nesting depth.
+
+    SQLAlchemy wraps the driver error, which wraps the OS error, so the text
+    that matters is usually several layers down — but it is carried through in
+    the string form of the outermost exception.
+    """
+    return any(marker in str(exc).lower() for marker in _NO_ROUTE)
+
+
+def _ipv4_address(url: str) -> Optional[str]:
+    """The host's IPv4 address, or None if it has none we can resolve.
+
+    Managed Postgres providers publish AAAA records, and plenty of container
+    hosts — Render among them — have no IPv6 egress at all. The name then
+    resolves to an IPv6 address the machine cannot route to, and the connection
+    fails at the network layer before any credential is exchanged.
+    """
+    try:
+        parsed = make_url(_normalize_url(url))
+    except Exception:
+        return None
+    if not parsed.host:
+        return None
+    try:
+        infos = socket.getaddrinfo(
+            parsed.host, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM
+        )
+    except socket.gaierror:
+        return None
+    return infos[0][4][0] if infos else None
+
+
+def _build_engine(url: str, ipv4: Optional[str] = None):
+    """Engine for ``url``, optionally pinned to a resolved IPv4 address.
+
+    ``hostaddr`` tells libpq which address to dial while ``host`` stays the
+    name — so TLS still gets the hostname for SNI and certificate checks. That
+    matters: managed providers route on SNI, and connecting by bare IP would
+    reach the wrong project or fail verification.
+    """
+    connect_args = {"hostaddr": ipv4} if ipv4 else {}
+    return create_engine(
+        _normalize_url(url),
+        pool_pre_ping=True,   # silently reconnect after idle disconnects
+        pool_recycle=300,
+        echo=False,
+        connect_args=connect_args,
+    )
+
+
 def init_db(url: Optional[str] = None) -> bool:
     """Create the engine and tables. Returns True when Postgres is active.
 
@@ -189,13 +249,26 @@ def init_db(url: Optional[str] = None) -> bool:
         return False
 
     try:
-        _engine = create_engine(
-            _normalize_url(url),
-            pool_pre_ping=True,   # silently reconnect after idle disconnects
-            pool_recycle=300,
-            echo=False,
-        )
-        Base.metadata.create_all(_engine)
+        try:
+            _engine = _build_engine(url)
+            Base.metadata.create_all(_engine)
+        except Exception as exc:
+            # One retry, and only for a routing failure. The host resolved to
+            # an address this machine cannot reach — almost always an IPv6
+            # record on an IPv4-only container — so try the IPv4 address
+            # explicitly before giving up on persistence entirely.
+            ipv4 = _ipv4_address(url) if _is_unroutable(exc) else None
+            if not ipv4:
+                raise
+            logger.warning(
+                "Database unreachable at the resolved address (%s) — retrying "
+                "over IPv4. The host published an address this machine has no "
+                "route to; pinning the connection to its IPv4 record.",
+                exc.__class__.__name__,
+            )
+            _engine = _build_engine(url, ipv4)
+            Base.metadata.create_all(_engine)
+
         _add_missing_columns()
         _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
         logger.info("PostgreSQL connected — alerts and holdings are persisted")

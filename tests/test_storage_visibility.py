@@ -225,3 +225,130 @@ def test_the_useful_part_of_an_auth_error_is_kept(monkeypatch):
 def test_redaction_leaves_an_ordinary_message_alone(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert db._redact("TimeoutError: timed out") == "TimeoutError: timed out"
+
+
+# ── IPv6-only DNS on an IPv4-only host ────────────────────────────────────────
+
+# The error verbatim from the deployed instance. Neon published an AAAA record;
+# the container has no IPv6 egress, so the connection died at the network layer
+# before any credential was exchanged — and the dashboard rendered it as an
+# empty portfolio.
+IPV6_FAILURE = (
+    '(psycopg.OperationalError) connection is bad: connection to server at '
+    '"2a05:d014:c19:402c:535e:9fff:269d:87fa", port 5432 failed: '
+    'Network is unreachable'
+)
+
+
+def test_the_reported_failure_is_recognised_as_a_routing_problem():
+    assert db._is_unroutable(Exception(IPV6_FAILURE))
+
+
+@pytest.mark.parametrize("message", [
+    "no route to host",
+    "Cannot assign requested address",
+    "NETWORK IS UNREACHABLE",
+])
+def test_other_routing_failures_are_recognised(message):
+    assert db._is_unroutable(Exception(message))
+
+
+@pytest.mark.parametrize("message", [
+    'password authentication failed for user "owner"',
+    "database does not exist",
+    "SSL connection has been closed unexpectedly",
+    "timeout expired",
+])
+def test_a_non_routing_failure_is_not_retried(message):
+    """Retrying a rejected login over IPv4 just fails twice as slowly."""
+    assert not db._is_unroutable(Exception(message))
+
+
+def test_the_ipv4_address_is_resolved_from_the_url(monkeypatch):
+    monkeypatch.setattr(db.socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("52.1.2.3", 5432))])
+
+    assert db._ipv4_address("postgresql://u:p@db.example.com/x") == "52.1.2.3"
+
+
+def test_a_host_with_no_ipv4_record_resolves_to_nothing(monkeypatch):
+    def no_a_record(*args, **kwargs):
+        raise db.socket.gaierror("no address associated with hostname")
+
+    monkeypatch.setattr(db.socket, "getaddrinfo", no_a_record)
+    assert db._ipv4_address("postgresql://u:p@v6only.example.com/x") is None
+
+
+def test_a_malformed_url_resolves_to_nothing_rather_than_raising():
+    assert db._ipv4_address("not a url at all") is None
+
+
+def test_the_connection_is_pinned_by_hostaddr_not_by_swapping_the_host(monkeypatch):
+    """TLS still needs the name: managed providers route on SNI, and a bare IP
+    would reach the wrong project or fail certificate verification."""
+    captured = {}
+
+    def fake_create_engine(url, **kwargs):
+        captured["url"] = str(url)
+        captured["connect_args"] = kwargs.get("connect_args")
+        return object()
+
+    monkeypatch.setattr(db, "create_engine", fake_create_engine)
+    db._build_engine("postgresql://u:p@db.example.com/x", "52.1.2.3")
+
+    assert captured["connect_args"] == {"hostaddr": "52.1.2.3"}
+    assert "db.example.com" in captured["url"], "the hostname must survive for SNI"
+
+
+def test_a_routing_failure_is_retried_over_ipv4(monkeypatch):
+    """The whole point: persistence comes back without the user touching Render."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/x")
+    monkeypatch.setattr(db, "_ipv4_address", lambda url: "52.1.2.3")
+    monkeypatch.setattr(db, "_add_missing_columns", lambda: None)
+    monkeypatch.setattr(db, "_SessionFactory", None)
+    attempts = []
+
+    def fake_build(url, ipv4=None):
+        attempts.append(ipv4)
+        if ipv4 is None:
+            raise OSError(IPV6_FAILURE)
+        return object()
+
+    monkeypatch.setattr(db, "_build_engine", fake_build)
+    monkeypatch.setattr(db.Base.metadata, "create_all", lambda engine: None)
+    monkeypatch.setattr(db, "sessionmaker", lambda **kwargs: object())
+
+    assert db.init_db() is True
+    assert attempts == [None, "52.1.2.3"], "one direct attempt, then one pinned"
+    assert db.status()["error"] is None
+
+
+def test_an_auth_failure_is_not_retried(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/x")
+    monkeypatch.setattr(
+        db, "_ipv4_address", lambda url: pytest.fail("must not resolve"))
+    monkeypatch.setattr(db, "_SessionFactory", None)
+    attempts = []
+
+    def fake_build(url, ipv4=None):
+        attempts.append(ipv4)
+        raise OSError("password authentication failed")
+
+    monkeypatch.setattr(db, "_build_engine", fake_build)
+
+    assert db.init_db() is False
+    assert attempts == [None], "exactly one attempt"
+
+
+def test_a_routing_failure_with_no_ipv4_available_gives_up_cleanly(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@v6only.example.com/x")
+    monkeypatch.setattr(db, "_ipv4_address", lambda url: None)
+    monkeypatch.setattr(db, "_SessionFactory", None)
+
+    def fake_build(url, ipv4=None):
+        raise OSError(IPV6_FAILURE)
+
+    monkeypatch.setattr(db, "_build_engine", fake_build)
+
+    assert db.init_db() is False
+    assert "unreachable" in db.status()["error"].lower()
