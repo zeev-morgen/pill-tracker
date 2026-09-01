@@ -338,12 +338,43 @@ async def api_analyze_closed_position(entry_id: int):
 
 @router.patch("/api/journal/{entry_id}")
 async def api_update_journal_entry(entry_id: int, payload: dict = Body(...)):
-    """Save the user's own note. Deliberately the only user-writable field."""
+    """Save the user's own note."""
     if "personal_note" not in payload:
         raise HTTPException(status_code=422, detail="ניתן לעדכן רק את חוות הדעת האישית")
     note = payload["personal_note"]
     note = str(note).strip() if note is not None else None
     updated = closed_position_store.update_fields(entry_id, personal_note=note or None)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="הרשומה לא נמצאה")
+    return JSONResponse(updated.as_dict())
+
+
+@router.put("/api/journal/{entry_id}")
+async def api_revise_journal_entry(entry_id: int, payload: dict = Body(...)):
+    """Correct the figures of a recorded sale.
+
+    The app holds one averaged entry price per ticker, so shares sold out of a
+    second account — bought at a different basis — are recorded against the
+    blend rather than against what those particular shares cost. Only the
+    person who made the trade knows that, which is why this exists.
+
+    PUT rather than PATCH: the note endpoint patches one field as given, while
+    this restates the trade and recomputes everything that follows from it.
+    """
+    changes = {
+        field: payload[field]
+        for field in ClosedPosition.REVISABLE
+        if field in payload
+    }
+    if not changes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"לא נשלח שדה לעדכון (אפשריים: {', '.join(ClosedPosition.REVISABLE)})",
+        )
+    try:
+        updated = closed_position_store.revise(entry_id, **changes)
+    except (HoldingError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="הרשומה לא נמצאה")
     return JSONResponse(updated.as_dict())
@@ -1449,6 +1480,30 @@ _HTML = """<!DOCTYPE html>
 </div>
 
 <!-- ═══ Add-to-position modal ═══ -->
+<!-- ═══ Correct a recorded sale ═══ -->
+<div class="modal-overlay" id="revise-modal">
+  <div class="modal">
+    <h3 id="revise-title">תיקון עסקה</h3>
+    <div class="volume" id="revise-hint" style="font-size:.8rem;margin-bottom:6px"></div>
+    <label for="r-qty">כמות שנמכרה</label>
+    <input id="r-qty" type="number" min="0.0001" step="any">
+    <label for="r-entry">מחיר כניסה <span class="muted-hint" id="r-unit"></span></label>
+    <input id="r-entry" type="number" min="0.0001" step="any">
+    <label for="r-exit">מחיר יציאה <span class="muted-hint" id="r-unit-exit"></span></label>
+    <input id="r-exit" type="number" min="0.0001" step="any">
+    <label for="r-bought">תאריך רכישה</label>
+    <input id="r-bought" type="date">
+    <label for="r-sold">תאריך מכירה</label>
+    <input id="r-sold" type="date">
+    <div class="preview" id="revise-preview">—</div>
+    <div class="error" id="r-error"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeRevise()">ביטול</button>
+      <button class="btn primary" onclick="confirmRevise()">שמירה</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="add-modal">
   <div class="modal">
     <h3 id="add-title">הוספה לפוזיציה</h3>
@@ -2217,7 +2272,12 @@ async function confirmSell() {
 
 const RATING_LABEL = {green: 'החלטה טובה', orange: 'בינונית', red: 'טעונה שיפור'};
 
+/* The rendered entries, kept so the edit dialog can prefill from the same data
+   the page is showing rather than fetching one entry again. */
+let journalEntries = [];
+
 function renderJournal(data) {
+  journalEntries = data.entries || [];
   const s = data.summary;
   const pnlCls = s.total_pnl >= 0 ? 'up' : 'down';
   // A trade whose sale-day rate was never captured is left out of the total.
@@ -2258,6 +2318,7 @@ function renderEntry(e) {
       <span class="symbol">${esc(e.ticker)}</span>
       ${partial}
       <span class="grow volume">נמכר ב-${esc(e.sold_date)}</span>
+      <button class="btn" onclick="editEntry(${e.id})" title="תיקון נתוני העסקה">✏️ עריכה</button>
       <button class="btn" onclick="analyzeEntry(${e.id})">
         ${e.ai_analysis ? '🧠 ניתוח מחדש' : '🧠 נתח עסקה'}
       </button>
@@ -2295,6 +2356,97 @@ function renderEntry(e) {
       </div>
     </div>
   </div>`;
+}
+
+/* ── Correcting a recorded sale ──────────────────────────────────────────────
+   The app keeps one averaged entry price per ticker, so shares sold out of a
+   second account — bought at a different basis — get recorded against the
+   blend rather than against what those particular shares actually cost. Only
+   the person who made the trade knows that, so the figures have to be
+   correctable after the fact. */
+let reviseTarget = null;
+
+function editEntry(id) {
+  const entry = (journalEntries || []).find((e) => e.id === id);
+  if (!entry) return;
+  reviseTarget = entry;
+  document.getElementById('revise-title').textContent = 'תיקון עסקה — ' + entry.ticker;
+  const unit = String(entry.currency || '').toUpperCase() === 'ILA' ? '(באגורות)' : '';
+  document.getElementById('r-unit').textContent = unit;
+  document.getElementById('r-unit-exit').textContent = unit;
+  document.getElementById('revise-hint').textContent =
+    'המספרים כאן נרשמו לפי מחיר הכניסה הממוצע של הפוזיציה. ' +
+    'אם המניות שנמכרו הגיעו מחשבון אחר — תקנו כאן את מחיר הכניסה בפועל.';
+  document.getElementById('r-qty').value = entry.quantity;
+  document.getElementById('r-entry').value = entry.entry_price;
+  document.getElementById('r-exit').value = entry.exit_price;
+  document.getElementById('r-bought').value = entry.purchase_date || '';
+  document.getElementById('r-sold').value = entry.sold_date || '';
+  document.getElementById('r-error').textContent = '';
+  updateRevisePreview();
+  document.getElementById('revise-modal').classList.add('open');
+}
+
+function closeRevise() {
+  document.getElementById('revise-modal').classList.remove('open');
+  reviseTarget = null;
+}
+
+/* Shows the corrected result before it is saved — the arithmetic is the whole
+   reason for the dialog, so it should not have to be taken on trust. */
+function updateRevisePreview() {
+  const box = document.getElementById('revise-preview');
+  if (!reviseTarget) { box.textContent = '—'; return; }
+  const qty = parseFloat(document.getElementById('r-qty').value);
+  const entry = parseFloat(document.getElementById('r-entry').value);
+  const exit = parseFloat(document.getElementById('r-exit').value);
+  if (![qty, entry, exit].every((v) => Number.isFinite(v) && v > 0)) {
+    box.innerHTML = '<span class="volume">הזינו כמות ומחירים כדי לראות את התוצאה</span>';
+    return;
+  }
+  const cur = reviseTarget.currency;
+  const pct = (exit - entry) / entry * 100;
+  const value = (exit - entry) * qty;
+  const cls = pct >= 0 ? 'up' : 'down';
+  const wasPct = reviseTarget.pnl_pct;
+  box.innerHTML =
+    `תשואה מתוקנת: <b class="${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</b> ` +
+    `<span class="volume">(היה ${wasPct >= 0 ? '+' : ''}${wasPct.toFixed(2)}%)</span><br>` +
+    `רווח/הפסד מתוקן: <b class="${cls}">${moneyAmount(value, cur)}</b> ` +
+    `<span class="volume">(היה ${moneyAmount(reviseTarget.pnl_value, cur)})</span>`;
+}
+
+['r-qty', 'r-entry', 'r-exit'].forEach((id) =>
+  document.getElementById(id).addEventListener('input', updateRevisePreview));
+
+async function confirmRevise() {
+  if (!reviseTarget) return;
+  const errEl = document.getElementById('r-error');
+  const body = {
+    quantity: parseFloat(document.getElementById('r-qty').value),
+    entry_price: parseFloat(document.getElementById('r-entry').value),
+    exit_price: parseFloat(document.getElementById('r-exit').value),
+    purchase_date: document.getElementById('r-bought').value || null,
+    sold_date: document.getElementById('r-sold').value || null,
+  };
+  for (const [key, label] of [['quantity', 'כמות'], ['entry_price', 'מחיר כניסה'],
+                              ['exit_price', 'מחיר יציאה']]) {
+    if (!Number.isFinite(body[key]) || body[key] <= 0) {
+      errEl.textContent = label + ' חייב להיות מספר חיובי';
+      return;
+    }
+  }
+  if (!body.sold_date) { errEl.textContent = 'יש להזין תאריך מכירה'; return; }
+
+  try {
+    await api('/api/journal/' + reviseTarget.id, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    closeRevise();
+    loadJournal();
+  } catch (e) { errEl.textContent = e.message; }
 }
 
 /* ═══════════════════ Portfolio chat ═══════════════════ */

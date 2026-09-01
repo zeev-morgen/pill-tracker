@@ -9,6 +9,7 @@ locally with no database installed. The public API is identical in both modes.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -114,6 +115,17 @@ class AlertStore:
 #: outside this app, can take up to an hour to appear. Nothing else writes to
 #: it, so that is a price worth paying.
 READ_CACHE_TTL = 3600
+
+
+def _positive(value, label: str) -> float:
+    """A number greater than zero, or a Hebrew error naming the field."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HoldingError(f"{label} חייב להיות מספר") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise HoldingError(f"{label} חייב להיות גדול מאפס")
+    return number
 
 
 def _cache_is_fresh(loaded_at: float) -> bool:
@@ -451,6 +463,104 @@ class ClosedPosition:
             sector=sector or holding.sector,
         )
 
+    #: Figures a correction may change. Everything else on the entry is either
+    #: derived from these or is not a fact about the trade.
+    REVISABLE = ("quantity", "entry_price", "exit_price", "purchase_date", "sold_date")
+
+    def revised(self, **changes) -> "ClosedPosition":
+        """A copy with corrected figures and every derived value recomputed.
+
+        A recorded sale can be wrong in ways only the person who made it knows
+        about — the shares sold came from a second account with a different
+        cost basis, so the averaged entry price the app held was not the basis
+        of *those* shares. Correcting the entry price by hand and leaving
+        pnl_pct beside it would produce an entry that contradicts itself, so
+        everything downstream of the change is recomputed rather than kept.
+        """
+        unknown = set(changes) - set(self.REVISABLE)
+        if unknown:
+            raise ValueError(f"unsupported fields: {sorted(unknown)}")
+
+        quantity = _positive(changes.get("quantity", self.quantity), "כמות")
+        entry_price = _positive(changes.get("entry_price", self.entry_price), "מחיר כניסה")
+        exit_price = _positive(changes.get("exit_price", self.exit_price), "מחיר יציאה")
+
+        sold = (
+            _parse_date(changes["sold_date"]) if "sold_date" in changes else self.sold_date
+        ) or self.sold_date
+        purchased = (
+            _parse_date(changes["purchase_date"]) if "purchase_date" in changes
+            else self.purchase_date
+        )
+        if sold > date.today():
+            raise HoldingError("מועד המכירה לא יכול להיות בעתיד")
+        if purchased and sold < purchased:
+            raise HoldingError("מועד המכירה מוקדם ממועד הרכישה")
+
+        pnl_value = (exit_price - entry_price) * quantity
+        return ClosedPosition(
+            id=self.id,
+            ticker=self.ticker,
+            quantity=quantity,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            purchase_date=purchased,
+            sold_date=sold,
+            holding_days=(sold - purchased).days if purchased else None,
+            pnl_pct=(exit_price - entry_price) / entry_price * 100.0,
+            pnl_value=pnl_value,
+            currency=self.currency,
+            pnl_value_usd=self._revised_usd(pnl_value),
+            fraction_sold=self._revised_fraction(quantity),
+            atr_pct_at_close=self.atr_pct_at_close,
+            sector=self.sector,
+            # The verdict was reached about the old figures. Kept only while
+            # they still hold; see _drops_analysis.
+            rating=None if self._drops_analysis(changes) else self.rating,
+            ai_analysis=None if self._drops_analysis(changes) else self.ai_analysis,
+            # The user's own retrospective is theirs, and survives regardless.
+            personal_note=self.personal_note,
+        )
+
+    def _drops_analysis(self, changes: dict) -> bool:
+        """Whether a change invalidates the AI verdict attached to this entry.
+
+        Money changed means the trade being graded changed, and a green light
+        sitting beside numbers it never saw is worse than no light at all. A
+        date correction leaves the grade standing — holding time is part of the
+        picture, but it is not what the verdict is about.
+        """
+        return any(
+            key in changes and changes[key] != getattr(self, key)
+            for key in ("quantity", "entry_price", "exit_price")
+        )
+
+    def _revised_usd(self, pnl_value: float) -> Optional[float]:
+        """The corrected P&L in dollars, at the rate the sale actually got.
+
+        Scaled from the stored pair rather than re-converted, because the rate
+        that applied is the one on the day of the sale and it is not recorded
+        anywhere else. Re-converting at today's rate would quietly restate a
+        realised figure — the exact mistake pnl_value_usd exists to avoid.
+        """
+        if not self.currency:
+            return pnl_value
+        if self.pnl_value_usd is None or not self.pnl_value:
+            return None
+        return self.pnl_value_usd * (pnl_value / self.pnl_value)
+
+    def _revised_fraction(self, quantity: float) -> float:
+        """Fraction of the original position, kept consistent with the new size.
+
+        The position's original total is recoverable from the pair already
+        stored — quantity divided by fraction — so a corrected quantity can be
+        expressed against the same total instead of being left labelled with a
+        percentage that no longer matches it.
+        """
+        if not self.quantity or not self.fraction_sold:
+            return self.fraction_sold
+        return min(quantity * self.fraction_sold / self.quantity, 1.0)
+
     def as_dict(self) -> dict:
         return {
             "id": self.id,
@@ -579,9 +689,42 @@ class ClosedPositionStore:
         with self._lock:
             return next((r for r in self._rows if r.id == entry_id), None)
 
+    def revise(self, entry_id: int, **changes) -> Optional[ClosedPosition]:
+        """Correct a recorded sale's figures, recomputing everything derived.
+
+        Separate from update_fields because this does not set what it is given:
+        a corrected entry price implies a different return, profit and dollar
+        value, and writing one without the others would leave the entry
+        disagreeing with itself.
+        """
+        existing = self.get(entry_id)
+        if existing is None:
+            return None
+        revised = existing.revised(**changes)
+        return self.update_fields(
+            entry_id,
+            **{
+                field: getattr(revised, field)
+                for field in (
+                    "quantity", "entry_price", "exit_price", "purchase_date",
+                    "sold_date", "holding_days", "pnl_pct", "pnl_value",
+                    "pnl_value_usd", "fraction_sold", "rating", "ai_analysis",
+                )
+            },
+        )
+
     def update_fields(self, entry_id: int, **fields) -> Optional[ClosedPosition]:
-        """Patch rating / ai_analysis / personal_note on an existing entry."""
-        allowed = {"rating", "ai_analysis", "personal_note"}
+        """Patch fields on an existing entry, exactly as given.
+
+        Callers correcting a trade should use revise() instead — it recomputes
+        the values that follow from the ones being changed.
+        """
+        allowed = {
+            "rating", "ai_analysis", "personal_note",
+            "quantity", "entry_price", "exit_price", "purchase_date",
+            "sold_date", "holding_days", "pnl_pct", "pnl_value",
+            "pnl_value_usd", "fraction_sold",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unsupported fields: {sorted(unknown)}")

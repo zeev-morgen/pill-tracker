@@ -258,3 +258,29 @@ def test_the_page_script_is_valid_javascript():
 
     result = subprocess.run([node, "--check", path], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# ── Correcting a recorded sale ────────────────────────────────────────────────
+
+def test_the_journal_offers_an_edit_dialog():
+    assert 'id="revise-modal"' in _HTML
+    assert "function editEntry(" in _HTML
+    assert "editEntry(${e.id})" in _HTML
+
+
+def test_the_correction_is_previewed_before_it_is_saved():
+    """The arithmetic is the reason for the dialog; it should show its work."""
+    body = _HTML.split("function updateRevisePreview(", 1)[1].split("\n}", 1)[0]
+    assert "היה" in body, "the old figure has to stay visible for comparison"
+    assert "moneyAmount(" in body
+
+
+def test_the_correction_uses_put_not_the_note_patch():
+    """PATCH sets one field as given; PUT restates the trade and recomputes."""
+    body = _HTML.split("async function confirmRevise(", 1)[1].split("\n}", 1)[0]
+    assert "method: 'PUT'" in body
+
+
+def test_a_tel_aviv_trade_says_the_prices_are_agorot():
+    body = _HTML.split("function editEntry(", 1)[1].split("\n}", 1)[0]
+    assert "'ILA'" in body and "אגורות" in body
