@@ -997,31 +997,123 @@ _HTML = """<!DOCTYPE html>
 <title>Stock Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
+  /* ── Design tokens ─────────────────────────────────────────────────────────
+     Two themes from one set of names, so every rule below is written once. The
+     dark set is the default because that is what the page has always been and
+     what a screen full of red and green numbers reads best against; the light
+     set follows the operating system when it asks for it.
+
+     Deliberately not pure black and not pure white: a lifted charcoal and a
+     tinted off-white are easier to sit in front of for an hour, which is what
+     this page is for. */
   :root {
-    --bg: #0d1117; --surface: #161b22; --border: #30363d;
-    --text: #e6edf3; --muted: #8b949e;
-    --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
+    color-scheme: dark;
+    --bg: #0c1017;
+    --surface: #141a23;
+    --raised: #1b222d;
+    --border: #26303f;
+    --border-soft: #1e2836;
+    --text: #e9eef6;
+    --muted: #8fa0b4;
+    --blue: #5b9dff;
+    --blue-strong: #3b82f6;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --tint: 255 255 255;
+    --shadow: 0 1px 2px rgb(0 0 0 / .3), 0 8px 24px -12px rgb(0 0 0 / .5);
+    --shadow-lift: 0 2px 4px rgb(0 0 0 / .3), 0 16px 40px -16px rgb(0 0 0 / .6);
+    --radius: 14px;
+    --radius-sm: 9px;
   }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --surface: #ffffff;
+      --raised: #f7f9fc;
+      --border: #dfe6ef;
+      --border-soft: #eaeff5;
+      --text: #101826;
+      --muted: #5d6b7f;
+      --blue: #2563eb;
+      --blue-strong: #1d4ed8;
+      --green: #047857;
+      --red: #dc2626;
+      --yellow: #b45309;
+      --tint: 15 23 42;
+      --shadow: 0 1px 2px rgb(16 24 38 / .04), 0 8px 24px -14px rgb(16 24 38 / .18);
+      --shadow-lift: 0 2px 6px rgb(16 24 38 / .06), 0 18px 44px -18px rgb(16 24 38 / .25);
+    }
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; }
+  /* A stack rather than a web font: every face here ships with the operating
+     system, so Hebrew renders in the same typeface the rest of the machine
+     uses and the page has nothing to wait on before it can draw text. */
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+                 "Noto Sans Hebrew", "Arial Hebrew", Arial, sans-serif;
+    font-size: 15px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Every number on this page is meant to be compared with the one above it,
+     so digits get a fixed advance width and columns line up. */
+  .price, .summary b, .entry-stats b, .split-legend b, .preview b,
+  td, th, .chip, #portfolio-total { font-variant-numeric: tabular-nums; }
+
+  ::selection { background: color-mix(in srgb, var(--blue) 32%, transparent); }
+  :focus-visible {
+    outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px;
+  }
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted) 32%, transparent);
+    border-radius: 99px; border: 3px solid transparent; background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--muted); }
+
   header {
-    background: var(--surface); border-bottom: 1px solid var(--border);
-    padding: 16px 24px; display: flex; align-items: center; gap: 12px;
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border-soft);
+    padding: 14px 28px; display: flex; align-items: center; gap: 14px;
+    position: sticky; top: 0; z-index: 50;
   }
-  header h1 { font-size: 1.2rem; font-weight: 600; }
+  header h1 { font-size: 1.06rem; font-weight: 650; letter-spacing: -0.01em; }
   #session-badge {
-    padding: 3px 10px; border-radius: 20px; font-size: 0.75rem;
-    font-weight: 600; background: #1f6feb33; color: var(--blue); border: 1px solid #1f6feb;
+    padding: 3px 11px; border-radius: 99px; font-size: 0.74rem; font-weight: 600;
+    background: color-mix(in srgb, var(--blue) 16%, transparent);
+    color: var(--blue);
+    border: 1px solid color-mix(in srgb, var(--blue) 34%, transparent);
   }
-  #server-time { margin-inline-start: auto; color: var(--muted); font-size: 0.8rem; }
-  #refresh-indicator { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+  #server-time { margin-inline-start: auto; color: var(--muted); font-size: 0.78rem; }
+  #refresh-indicator {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 18%, transparent);
+    transition: background .3s ease, box-shadow .3s ease;
+  }
   /* 1320, not 1200: the portfolio table carries eleven columns plus the row
      actions and needed the extra width to fit without a horizontal scroll. */
-  main { padding: 24px; display: grid; gap: 24px; max-width: 1320px; margin: 0 auto; }
+  main { padding: 26px; display: grid; gap: 22px; max-width: 1320px; margin: 0 auto; }
 
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  .card-title { padding: 14px 18px; font-size: 0.85rem; font-weight: 600;
-    color: var(--muted); border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .05em; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border-soft);
+    border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow);
+  }
+  /* No uppercase and no letter-spacing: Hebrew has neither a capital form nor
+     any tolerance for tracking — spacing its letters apart is the typographic
+     equivalent of s p e l l i n g   o u t   a   w o r d. A card title is a
+     heading, so it gets a heading's weight and colour instead of small grey
+     caps pretending to be one. */
+  .card-title {
+    padding: 15px 20px; font-size: 0.95rem; font-weight: 640; color: var(--text);
+    border-bottom: 1px solid var(--border-soft);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .card-title .muted-hint { font-size: 0.8rem; }
 
   /* The card clips overflow, so a wide table has to scroll inside its own
      wrapper — otherwise the last columns (the row actions) are cut off on a
@@ -1030,16 +1122,22 @@ _HTML = """<!DOCTYPE html>
   /* max-content, not 100%: the row-action buttons cannot wrap, so a table
      pinned to the container width has them clipped instead of scrolled. */
   #holdings-wrap table { width: max-content; min-width: 100%; }
-  #holdings-wrap td, #holdings-wrap th { padding-inline: 12px; }
+  #holdings-wrap td, #holdings-wrap th { padding-inline: 14px; }
   /* Icons rather than labels: with eleven columns the words pushed the actions
      off-screen. Each button carries a title, so hovering still explains it. */
   .row-actions { white-space: nowrap; }
-  .row-actions .btn { padding: 5px 8px; margin-inline-start: 2px; font-size: 0.9rem; }
+  .row-actions .btn {
+    padding: 6px; margin-inline-start: 3px; line-height: 0;
+    color: var(--muted); background: transparent; border-color: transparent;
+  }
+  .row-actions .btn:hover { color: var(--text); background: var(--raised); border-color: var(--border); }
+  .row-actions .btn.danger:hover { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+  .row-actions svg { width: 16px; height: 16px; display: block; }
   /* The page is RTL, but most of what it shows is not: tickers, prices and
-     percentages are Latin/numeric. `plaintext` picks each element's direction
-     from its own first strong character, so "45 ימים" reads RTL while
-     "-$134.00" and "AMZN" read LTR. Without it a leading currency sign or
-     minus is treated as neutral and lands on the wrong end of the number.
+     percentages are Latin/numeric. Picking each element's direction from its
+     own first strong character makes "45 ימים" read RTL while "-$134.00" and
+     "AMZN" read LTR. Without it a leading currency sign or minus is treated as
+     neutral and lands on the wrong end of the number.
      Table *cells* are excluded: they hold several elements whose order must
      follow the page, so the first row-action button stays rightmost. Header
      cells are single strings with no such ordering, and need it — "ATR%"
@@ -1057,26 +1155,34 @@ _HTML = """<!DOCTYPE html>
   }
 
   table { width: 100%; border-collapse: collapse; }
-  th { padding: 10px 18px; text-align: start; font-size: 0.75rem; color: var(--muted);
-    font-weight: 500; border-bottom: 1px solid var(--border); }
-  td { padding: 12px 18px; font-size: 0.9rem; border-bottom: 1px solid #21262d; }
+  th {
+    padding: 11px 20px; text-align: start; font-size: 0.76rem; color: var(--muted);
+    font-weight: 600; border-bottom: 1px solid var(--border-soft);
+    background: var(--raised); position: sticky; top: 0; z-index: 1;
+    white-space: nowrap;
+  }
+  td {
+    padding: 13px 20px; font-size: 0.88rem;
+    border-bottom: 1px solid var(--border-soft);
+  }
   tr:last-child td { border-bottom: none; }
-  tr:hover td { background: #ffffff08; }
+  tbody tr { transition: background .12s ease; }
+  tbody tr:hover td { background: rgb(var(--tint) / .035); }
 
-  .symbol { font-weight: 700; color: var(--blue); }
-  .price  { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .symbol { font-weight: 700; color: var(--blue); letter-spacing: .01em; }
+  .price  { font-weight: 650; font-size: 0.94rem; }
   .up     { color: var(--green); }
   .down   { color: var(--red); }
   .flat   { color: var(--muted); }
-  .volume { color: var(--muted); font-size: 0.82rem; }
+  .volume { color: var(--muted); font-size: 0.8rem; }
   .session-tag {
-    display: inline-block; padding: 2px 8px; border-radius: 4px;
-    font-size: 0.72rem; font-weight: 600;
+    display: inline-block; padding: 3px 9px; border-radius: 99px;
+    font-size: 0.71rem; font-weight: 600;
   }
-  .session-regular { background:#3fb95022; color: var(--green); }
-  .session-pre     { background:#d2992222; color: var(--yellow); }
-  .session-after   { background:#58a6ff22; color: var(--blue); }
-  .session-closed  { background:#30363d;   color: var(--muted); }
+  .session-regular { background: color-mix(in srgb, var(--green) 15%, transparent); color: var(--green); }
+  .session-pre     { background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow); }
+  .session-after   { background: color-mix(in srgb, var(--blue) 15%, transparent); color: var(--blue); }
+  .session-closed  { background: rgb(var(--tint) / .07); color: var(--muted); }
 
   .alert-row td { font-size: 0.85rem; }
   .sev-INFO     { color: var(--blue); }
@@ -1085,193 +1191,289 @@ _HTML = """<!DOCTYPE html>
   .alert-msg { color: var(--text); }
   .alert-ts  { color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
 
-  #no-stocks, #no-alerts { padding: 32px; text-align: center; color: var(--muted); font-size: 0.9rem; }
+  #no-stocks, #no-alerts { padding: 40px; text-align: center; color: var(--muted); font-size: 0.9rem; }
 
   .progress-bar {
-    height: 2px; background: var(--border); position: fixed; top: 0; left: 0; width: 100%; z-index: 999;
+    height: 2px; background: transparent; position: fixed; top: 0; left: 0;
+    width: 100%; z-index: 999;
   }
-  #progress { height: 100%; background: var(--blue); width: 0%; transition: width linear; }
+  #progress {
+    height: 100%; width: 0%; transition: width linear;
+    background: linear-gradient(90deg, var(--blue), var(--green));
+  }
 
-  /* ── Tabs ─────────────────────────────────────────────── */
-  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  /* ── Tabs ──────────────────────────────────────────────────────────────────
+     Pills rather than a hairline underline: the underline made the active tab
+     hard to find at a glance among seven, and gave the row nothing to sit on. */
+  .tabs {
+    display: flex; gap: 4px; flex-wrap: wrap; padding: 5px;
+    background: var(--surface); border: 1px solid var(--border-soft);
+    border-radius: 99px; box-shadow: var(--shadow);
+  }
   .tab {
-    padding: 10px 16px; cursor: pointer; border: none; background: none;
-    color: var(--muted); font-size: 0.9rem; font-family: inherit;
-    border-bottom: 2px solid transparent;
+    padding: 8px 16px; cursor: pointer; border: none; background: none;
+    color: var(--muted); font-size: 0.87rem; font-weight: 550; font-family: inherit;
+    border-radius: 99px; transition: color .15s ease, background .15s ease;
   }
-  .tab.active { color: var(--text); border-bottom-color: var(--blue); }
+  .tab:hover { color: var(--text); background: rgb(var(--tint) / .05); }
+  .tab.active {
+    color: #fff; background: var(--blue-strong);
+    box-shadow: 0 2px 10px -2px color-mix(in srgb, var(--blue-strong) 60%, transparent);
+  }
   .panel { display: none; }
-  .panel.active { display: grid; gap: 24px; }
+  .panel.active { display: grid; gap: 22px; }
 
-  /* ── Buttons ──────────────────────────────────────────── */
+  /* ── Buttons ───────────────────────────────────────────────────────────── */
   button.btn {
-    background: #21262d; color: var(--text); border: 1px solid var(--border);
-    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem;
-    font-family: inherit; margin-inline-start: 4px;
+    background: var(--raised); color: var(--text); border: 1px solid var(--border);
+    padding: 7px 13px; border-radius: var(--radius-sm); cursor: pointer;
+    font-size: 0.82rem; font-weight: 550; font-family: inherit;
+    margin-inline-start: 5px;
+    transition: background .15s ease, border-color .15s ease, transform .06s ease;
   }
-  button.btn:hover { background: #30363d; }
-  button.btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-  button.btn.primary:hover { background: #388bfd; }
-  .card-actions { padding: 12px 18px; border-bottom: 1px solid var(--border); }
+  button.btn:hover { background: color-mix(in srgb, var(--text) 8%, var(--raised)); }
+  button.btn:active { transform: translateY(1px); }
+  button.btn:disabled { opacity: .5; cursor: not-allowed; }
+  button.btn.primary {
+    background: var(--blue-strong); border-color: var(--blue-strong); color: #fff;
+    box-shadow: 0 2px 10px -3px color-mix(in srgb, var(--blue-strong) 70%, transparent);
+  }
+  button.btn.primary:hover { background: var(--blue); border-color: var(--blue); }
+  .card-actions {
+    padding: 13px 20px; border-bottom: 1px solid var(--border-soft);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
 
-  /* ── Risk banners ─────────────────────────────────────── */
-  .banner { padding: 14px 18px; font-size: 0.88rem; border-radius: 6px; margin-bottom: 0; }
-  .banner.ok   { background: #3fb95015; border: 1px solid #3fb95055; color: var(--green); }
-  .banner.warn { background: #f8514915; border: 1px solid #f8514955; color: var(--red); }
+  /* ── Risk banners ──────────────────────────────────────────────────────── */
+  .banner {
+    padding: 13px 16px; font-size: 0.87rem; border-radius: var(--radius-sm);
+    line-height: 1.6;
+  }
+  .banner.ok {
+    background: color-mix(in srgb, var(--green) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--green) 32%, transparent); color: var(--green);
+  }
+  .banner.warn {
+    background: color-mix(in srgb, var(--red) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--red) 32%, transparent); color: var(--red);
+  }
+  .banner code {
+    background: rgb(var(--tint) / .09); padding: 1px 6px; border-radius: 5px;
+    font-size: 0.92em;
+  }
 
-  /* ── Charts ───────────────────────────────────────────── */
-  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  /* ── Charts ────────────────────────────────────────────────────────────── */
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
   @media (max-width: 780px) { .charts { grid-template-columns: 1fr; } }
-  .chart-box { padding: 18px; height: 320px; position: relative; }
+  .chart-box { padding: 20px; height: 320px; position: relative; }
 
-  /* ── Modal ────────────────────────────────────────────── */
+  /* ── Modal ─────────────────────────────────────────────────────────────── */
   .modal-overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65);
-    align-items: center; justify-content: center; z-index: 1000;
+    display: none; position: fixed; inset: 0;
+    background: rgb(3 6 12 / .68); backdrop-filter: blur(3px);
+    align-items: center; justify-content: center; z-index: 1000; padding: 20px;
   }
   .modal-overlay.open { display: flex; }
   .modal {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-    padding: 22px; width: 320px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px; width: 340px;
+    max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-lift);
   }
-  .modal h3 { font-size: 1rem; margin-bottom: 14px; }
-  .modal label { display: block; font-size: 0.78rem; color: var(--muted); margin: 10px 0 4px; }
-  .modal input {
-    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--bg); color: var(--text); font-size: 0.9rem; font-family: inherit;
+  .modal h3 { font-size: 1.02rem; font-weight: 640; margin-bottom: 16px; }
+  .modal label {
+    display: block; font-size: 0.78rem; color: var(--muted); font-weight: 550;
+    margin: 12px 0 5px;
   }
-  .modal input:disabled { color: var(--muted); }
-  .modal select {
-    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--bg); color: var(--text); font-size: 0.9rem; font-family: inherit;
+  .modal input, .modal select, .modal textarea {
+    width: 100%; padding: 9px 11px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.9rem; font-family: inherit;
+    transition: border-color .15s ease, box-shadow .15s ease;
   }
+  .modal input:focus, .modal select:focus, .modal textarea:focus {
+    outline: none; border-color: var(--blue);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 20%, transparent);
+  }
+  .modal input:disabled { color: var(--muted); background: var(--raised); }
   .muted-hint { color: var(--muted); font-weight: 400; }
-  .sector-cell { cursor: pointer; border-bottom: 1px dotted var(--border); }
+  .sector-cell {
+    cursor: pointer; border-bottom: 1px dashed var(--border);
+    transition: color .15s ease, border-color .15s ease;
+  }
+  .sector-cell:hover { color: var(--blue); border-bottom-color: var(--blue); }
   .sector-cell.unknown { color: var(--yellow); }
   .index-detail { color: var(--muted); font-size: 0.78rem; margin-top: 10px; }
-  .split-legend { display: flex; gap: 18px; font-size: 0.82rem; flex-wrap: wrap; }
-  .split-legend b { font-variant-numeric: tabular-nums; }
-  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-inline-end: 6px; }
-  .modal-actions { display: flex; gap: 8px; margin-top: 18px; }
-  .form-error { color: var(--red); font-size: 0.78rem; margin-top: 8px; min-height: 15px; }
-  .empty { padding: 32px; text-align: center; color: var(--muted); font-size: 0.9rem; }
-  .analysis-text { padding: 18px; white-space: pre-wrap; line-height: 1.7; font-size: 0.9rem; }
+  .split-legend { display: flex; gap: 20px; font-size: 0.82rem; flex-wrap: wrap; }
+  .dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    margin-inline-end: 7px;
+  }
+  .modal-actions { display: flex; gap: 8px; margin-top: 20px; }
+  .modal-actions .btn { flex: 1; margin-inline-start: 0; text-align: center; }
+  .form-error, .error { color: var(--red); font-size: 0.79rem; margin-top: 8px; min-height: 15px; }
+  .empty { padding: 44px 20px; text-align: center; color: var(--muted); font-size: 0.9rem; }
+  .analysis-text { padding: 20px; white-space: pre-wrap; line-height: 1.75; font-size: 0.9rem; }
   #build-label { color: var(--muted); font-size: 0.72rem; }
 
-  /* ── Watchlist chips ──────────────────────────────────── */
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 18px; }
+  /* ── Watchlist chips ───────────────────────────────────────────────────── */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px 20px; }
   .chip {
-    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
-    border-radius: 20px; background: #1f6feb22; border: 1px solid #1f6feb55;
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px;
+    border-radius: 99px;
+    background: color-mix(in srgb, var(--blue) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--blue) 30%, transparent);
     color: var(--blue); font-size: 0.82rem; font-weight: 600;
+    transition: background .15s ease;
   }
+  .chip:hover { background: color-mix(in srgb, var(--blue) 20%, transparent); }
   .chip button {
-    background: none; border: none; color: var(--muted); cursor: pointer;
-    font-size: 0.95rem; line-height: 1; padding: 0; font-family: inherit;
+    background: none; border: none; color: currentColor; cursor: pointer;
+    font-size: 1rem; line-height: 1; padding: 0; font-family: inherit; opacity: .55;
+    transition: opacity .15s ease, color .15s ease;
   }
-  .chip button:hover { color: var(--red); }
-  .inline-form { display: flex; gap: 8px; padding: 0 18px 14px; flex-wrap: wrap; }
+  .chip button:hover { opacity: 1; color: var(--red); }
+  .inline-form { display: flex; gap: 8px; padding: 0 20px 16px; flex-wrap: wrap; }
   .inline-form input {
-    padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+    padding: 7px 11px; border-radius: var(--radius-sm); border: 1px solid var(--border);
     background: var(--bg); color: var(--text); font-size: 0.85rem;
     font-family: inherit; width: 150px;
   }
+  .inline-form input:focus {
+    outline: none; border-color: var(--blue);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 20%, transparent);
+  }
 
-  /* ── Trade journal ────────────────────────────────────── */
-  .summary { display: flex; flex-wrap: wrap; gap: 26px; padding: 16px 18px; }
-  .summary div { font-size: 0.82rem; color: var(--muted); }
-  .summary b { display: block; font-size: 1.25rem; color: var(--text);
-    font-variant-numeric: tabular-nums; margin-top: 3px; }
+  /* ── Trade journal ─────────────────────────────────────────────────────── */
+  .summary {
+    display: flex; flex-wrap: wrap; gap: 12px; padding: 18px 20px;
+  }
+  .summary div {
+    font-size: 0.79rem; color: var(--muted); flex: 1; min-width: 130px;
+    background: var(--raised); border: 1px solid var(--border-soft);
+    border-radius: var(--radius-sm); padding: 12px 14px;
+  }
+  .summary b {
+    display: block; font-size: 1.32rem; color: var(--text);
+    font-weight: 650; margin-top: 4px; letter-spacing: -0.02em;
+  }
   .journal { display: grid; gap: 16px; }
-  .entry { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+  .entry {
+    background: var(--surface); border: 1px solid var(--border-soft);
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+  }
   .entry-head {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    padding: 14px 18px; border-bottom: 1px solid var(--border);
+    padding: 15px 20px; border-bottom: 1px solid var(--border-soft);
   }
   .entry-head .grow { flex: 1; }
   .light {
-    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
-    border: 1px solid #0006; flex-shrink: 0;
+    display: inline-block; width: 11px; height: 11px; border-radius: 50%;
+    flex-shrink: 0;
   }
-  .light-green  { background: var(--green); box-shadow: 0 0 8px #3fb95088; }
-  .light-orange { background: var(--yellow); box-shadow: 0 0 8px #d2992288; }
-  .light-red    { background: var(--red);   box-shadow: 0 0 8px #f8514988; }
+  .light-green  { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent); }
+  .light-orange { background: var(--yellow); box-shadow: 0 0 0 3px color-mix(in srgb, var(--yellow) 22%, transparent); }
+  .light-red    { background: var(--red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 22%, transparent); }
   .light-none   { background: var(--border); }
   .badge {
-    padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 600;
-    background: #d2992222; color: var(--yellow);
+    padding: 3px 9px; border-radius: 99px; font-size: 0.71rem; font-weight: 600;
+    background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow);
   }
   .entry-stats {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-    gap: 12px; padding: 14px 18px; border-bottom: 1px solid #21262d;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+    gap: 14px; padding: 16px 20px; border-bottom: 1px solid var(--border-soft);
   }
   .entry-stats span { font-size: 0.75rem; color: var(--muted); display: block; }
-  .entry-stats b { font-size: 0.95rem; font-variant-numeric: tabular-nums; }
-  .entry-section { padding: 14px 18px; border-bottom: 1px solid #21262d; }
+  .entry-stats b { font-size: 0.96rem; font-weight: 620; }
+  .entry-section { padding: 16px 20px; border-bottom: 1px solid var(--border-soft); }
   .entry-section:last-child { border-bottom: none; }
+  /* Same reasoning as .card-title: no caps, no tracking, because Hebrew has
+     neither. */
   .entry-section h4 {
-    font-size: 0.75rem; color: var(--muted); text-transform: uppercase;
-    letter-spacing: .05em; margin-bottom: 8px; font-weight: 600;
+    font-size: 0.84rem; color: var(--text); margin-bottom: 9px; font-weight: 620;
+    display: flex; align-items: center; gap: 7px;
   }
-  .entry-section .body { white-space: pre-wrap; line-height: 1.7; font-size: 0.88rem; }
+  .entry-section .body { white-space: pre-wrap; line-height: 1.75; font-size: 0.88rem; }
   textarea.note {
-    width: 100%; min-height: 70px; padding: 9px 11px; border-radius: 6px;
+    width: 100%; min-height: 72px; padding: 10px 12px; border-radius: var(--radius-sm);
     border: 1px solid var(--border); background: var(--bg); color: var(--text);
-    font-size: 0.88rem; font-family: inherit; resize: vertical;
+    font-size: 0.88rem; font-family: inherit; resize: vertical; line-height: 1.6;
+    transition: border-color .15s ease, box-shadow .15s ease;
   }
-  .save-hint { font-size: 0.75rem; color: var(--green); margin-inline-start: 8px; }
+  textarea.note:focus {
+    outline: none; border-color: var(--blue);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 20%, transparent);
+  }
+  .save-hint { font-size: 0.76rem; color: var(--green); margin-inline-start: 8px; }
 
-  /* ── News ─────────────────────────────────────────────── */
-  .news-item { padding: 13px 18px; border-bottom: 1px solid #21262d; }
+  /* ── News ──────────────────────────────────────────────────────────────── */
+  .news-item {
+    padding: 15px 20px; border-bottom: 1px solid var(--border-soft);
+    transition: background .12s ease;
+  }
+  .news-item:hover { background: rgb(var(--tint) / .03); }
   .news-item:last-child { border-bottom: none; }
-  .news-item a { color: var(--text); text-decoration: none; font-size: 0.9rem; }
-  .news-item a:hover { color: var(--blue); text-decoration: underline; }
-  .news-meta { color: var(--muted); font-size: 0.76rem; margin-top: 4px; }
+  .news-item a {
+    color: var(--text); text-decoration: none; font-size: 0.91rem;
+    line-height: 1.55; font-weight: 550;
+  }
+  .news-item a:hover { color: var(--blue); }
+  .news-meta { color: var(--muted); font-size: 0.76rem; margin-top: 5px; }
   .news-fresh { color: var(--yellow); font-weight: 600; }
   .ext-price { font-size: 0.78rem; }
-  /* Under the price rather than beside it: as its own column the as-of date
-     pushed the row actions off the edge. */
-  /* ── Portfolio chat ──────────────────────────────────────────────────────
+
+  /* ── Portfolio chat ────────────────────────────────────────────────────────
      The log scrolls, the composer does not: the input stays reachable however
      long the conversation gets. */
   .chat-card { display: flex; flex-direction: column; }
   .chat-log {
-    padding: 16px 18px; min-height: 240px; max-height: 55vh; overflow-y: auto;
-    display: flex; flex-direction: column; gap: 12px;
+    padding: 20px; min-height: 260px; max-height: 55vh; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 14px;
   }
-  .chat-msg { max-width: 82%; padding: 10px 13px; border-radius: 10px; line-height: 1.6; }
+  .chat-msg {
+    max-width: 78%; padding: 11px 15px; border-radius: 16px; line-height: 1.65;
+    font-size: 0.89rem; box-shadow: var(--shadow);
+  }
   /* The user's own words sit on the start edge, the reply opposite — logical
      properties, so the sides follow the page direction rather than fighting it. */
   .chat-msg.user {
-    align-self: flex-start; background: #1f6feb; color: #fff;
-    border-start-start-radius: 3px;
+    align-self: flex-start; background: var(--blue-strong); color: #fff;
+    border-start-start-radius: 5px;
   }
   .chat-msg.assistant {
-    align-self: flex-end; background: var(--surface);
-    border: 1px solid var(--border); border-start-end-radius: 3px;
+    align-self: flex-end; background: var(--raised);
+    border: 1px solid var(--border-soft); border-start-end-radius: 5px;
   }
   .chat-msg.error { align-self: flex-end; border-color: var(--red); color: var(--red); }
   /* Model replies arrive as plain text with real newlines in them.
-     Deliberately no `unicode-bidi: plaintext` here, unlike the table cells: it
+     Deliberately not direction-detected per element, unlike the table cells: it
      picks paragraph direction from the first strong character, and a Hebrew
      reply very often opens with a Latin ticker ("ORCU היא 30% מהתיק"). That
      one word would flip the whole sentence to LTR. Inheriting the page's
      direction is right, and the bidi algorithm still places the ticker
      correctly inside it. */
   .chat-msg .body { white-space: pre-wrap; }
-  .chat-empty { color: var(--muted); text-align: center; padding: 30px 10px; }
+  .chat-empty {
+    color: var(--muted); text-align: center; padding: 40px 16px;
+    line-height: 1.7; font-size: 0.89rem;
+  }
   .chat-composer {
-    display: flex; gap: 10px; padding: 12px 18px;
-    border-top: 1px solid var(--border); align-items: flex-end;
+    display: flex; gap: 10px; padding: 14px 20px;
+    border-top: 1px solid var(--border-soft); align-items: flex-end;
   }
   .chat-composer textarea {
-    flex: 1; resize: vertical; min-height: 44px; font: inherit;
-    background: var(--bg); color: var(--text);
-    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    flex: 1; resize: vertical; min-height: 46px; font: inherit;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 11px 13px;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  .chat-composer textarea:focus {
+    outline: none; border-color: var(--blue);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 20%, transparent);
   }
   .chat-buttons { display: flex; flex-direction: column; gap: 6px; }
+  .chat-buttons .btn { margin-inline-start: 0; }
   .chat-note {
-    padding: 0 18px 14px; color: var(--muted); font-size: 0.78rem;
+    padding: 0 20px 16px; color: var(--muted); font-size: 0.77rem; line-height: 1.6;
   }
   /* Marks the reply that is still being written, so a pause reads as the model
      thinking rather than as the page having stopped. */
@@ -1280,7 +1482,9 @@ _HTML = """<!DOCTYPE html>
   }
   @keyframes chat-blink { 50% { opacity: 0; } }
 
-  .price-date { font-size: 0.72rem; margin-top: 2px; white-space: nowrap; }
+  /* Under the price rather than beside it: as its own column the as-of date
+     pushed the row actions off the edge. */
+  .price-date { font-size: 0.72rem; margin-top: 3px; white-space: nowrap; }
   /* The currency a price is quoted in. Muted and small: it qualifies the
      number without competing with it, but agorot vs shekels is a factor of a
      hundred, so it can never be dropped. */
@@ -1288,11 +1492,22 @@ _HTML = """<!DOCTYPE html>
   /* The averaged result, shown before committing: the arithmetic is the whole
      point of the dialog, so it should be visible rather than taken on trust. */
   .preview {
-    margin-top: 14px; padding: 10px 12px; border-radius: 6px;
-    background: #1f6feb15; border: 1px solid #1f6feb44;
-    font-size: 0.84rem; line-height: 1.6; min-height: 40px;
+    margin-top: 16px; padding: 12px 14px; border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--blue) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--blue) 26%, transparent);
+    font-size: 0.84rem; line-height: 1.7; min-height: 42px;
   }
-  .preview b { font-variant-numeric: tabular-nums; }
+
+  /* ── Narrow screens ────────────────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    header { padding: 12px 16px; }
+    main { padding: 16px; gap: 16px; }
+    .tabs { border-radius: var(--radius); }
+    .card-title, .card-actions, .entry-head, .entry-stats, .entry-section { padding-inline: 16px; }
+    th, td { padding-inline: 14px; }
+    .chat-msg { max-width: 92%; }
+    #server-time { font-size: 0.72rem; }
+  }
 </style>
 </head>
 <body>
@@ -1300,7 +1515,7 @@ _HTML = """<!DOCTYPE html>
 
 <header>
   <div id="refresh-indicator"></div>
-  <h1>📈 Stock Monitor</h1>
+  <h1>Stock Monitor</h1>
   <span id="session-badge">—</span>
   <span id="build-label"></span>
   <span id="server-time">Loading…</span>
@@ -1350,9 +1565,9 @@ _HTML = """<!DOCTYPE html>
       <div class="card-title">הפוזיציות שלי</div>
       <div class="card-actions">
         <button class="btn primary" onclick="openModal()">+ הוספת פוזיציה</button>
-        <button class="btn" onclick="analyzePortfolio()">🧠 ניתוח AI של התיק</button>
+        <button class="btn" onclick="analyzePortfolio()">ניתוח AI של התיק</button>
         <button class="btn" onclick="loadPortfolio()">רענון</button>
-        <button class="btn" onclick="exportExcel(this)" title="הורדת התיק ויומן המסחר כקובץ Excel">⬇️ הורדת אקסל</button>
+        <button class="btn" onclick="exportExcel(this)" title="הורדת התיק ויומן המסחר כקובץ Excel">הורדת אקסל</button>
         <span id="portfolio-total" class="volume" style="margin-inline-start:12px"></span>
       </div>
       <div id="holdings-wrap"><div class="empty">טוען…</div></div>
@@ -1662,6 +1877,28 @@ const CHART_COLORS = ['#58a6ff','#bc8cff','#3fb950','#d29922','#f85149',
                       '#39c5cf','#db61a2','#a5d6ff','#ff9f45','#8b949e'];
 let sectorChart = null, indexChart = null, currentPositions = [];
 
+/* Inline SVG rather than emoji for the row actions.
+   Emoji are rendered by the operating system, so the same button was a flat
+   glyph on one machine and a full-colour cartoon on another, at whatever size
+   and baseline the font felt like — five of them in a row read as a toolbar
+   assembled by accident. These inherit currentColor and the button's size, so
+   they match the rest of the interface and the hover state reaches them. */
+const ICONS = {
+  /* A sparkle, not a brain: at sixteen pixels an outlined brain is an
+     unreadable tangle of strokes, while the sparkle is the convention for
+     "ask the model" and survives being that small. */
+  sparkle: '<path d="M12 3.5 13.7 8.3 18.5 10 13.7 11.7 12 16.5 10.3 11.7 5.5 10 10.3 8.3Z"/>' +
+           '<path d="M18 15.5 18.7 17.3 20.5 18 18.7 18.7 18 20.5 17.3 18.7 15.5 18 17.3 17.3Z"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  cash: '<rect x="2.5" y="6.5" width="19" height="11" rx="2"/><circle cx="12" cy="12" r="2.4"/>' +
+        '<path d="M6 12h.01M18 12h.01"/>',
+  pencil: '<path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17Z"/><path d="M15 6l3 3"/>',
+  trash: '<path d="M3.5 6.5h17M9 6.5V4.5h6v2M6 6.5l1 13.5h10l1-13.5"/>',
+};
+const icon = (name) => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  (ICONS[name] || '') + '</svg>';
+
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 /* Losses read as -$134.00, never $-134.00. */
@@ -1897,11 +2134,11 @@ function renderHoldings(data) {
               title="לחץ לעריכת הסקטור">${esc(p.sector)}${p.sector_is_manual ? ' ✎' : ''}</span>
       </td>
       <td class="row-actions">
-        <button class="btn" onclick="analyzeTicker('${esc(p.ticker)}')" title="ניתוח AI של המניה">🧠</button>
-        <button class="btn" onclick="openAdd('${esc(p.ticker)}')" title="קניית מניות נוספות">➕</button>
-        <button class="btn" onclick="openSell('${esc(p.ticker)}')" title="רישום מכירה">💵</button>
-        <button class="btn" onclick="editHolding('${esc(p.ticker)}')" title="עריכת הפוזיציה">✏️</button>
-        <button class="btn" onclick="deleteHolding('${esc(p.ticker)}')" title="מחיקת הפוזיציה">🗑️</button>
+        <button class="btn" onclick="analyzeTicker('${esc(p.ticker)}')" title="ניתוח AI של המניה">${icon('sparkle')}</button>
+        <button class="btn" onclick="openAdd('${esc(p.ticker)}')" title="קניית מניות נוספות">${icon('plus')}</button>
+        <button class="btn" onclick="openSell('${esc(p.ticker)}')" title="רישום מכירה">${icon('cash')}</button>
+        <button class="btn" onclick="editHolding('${esc(p.ticker)}')" title="עריכת הפוזיציה">${icon('pencil')}</button>
+        <button class="btn danger" onclick="deleteHolding('${esc(p.ticker)}')" title="מחיקת הפוזיציה">${icon('trash')}</button>
       </td></tr>`).join('')}</tbody>
   </table>`;
 }
@@ -2318,9 +2555,9 @@ function renderEntry(e) {
       <span class="symbol">${esc(e.ticker)}</span>
       ${partial}
       <span class="grow volume">נמכר ב-${esc(e.sold_date)}</span>
-      <button class="btn" onclick="editEntry(${e.id})" title="תיקון נתוני העסקה">✏️ עריכה</button>
+      <button class="btn" onclick="editEntry(${e.id})" title="תיקון נתוני העסקה">עריכה</button>
       <button class="btn" onclick="analyzeEntry(${e.id})">
-        ${e.ai_analysis ? '🧠 ניתוח מחדש' : '🧠 נתח עסקה'}
+        ${e.ai_analysis ? 'ניתוח מחדש' : 'נתח עסקה'}
       </button>
     </div>
 

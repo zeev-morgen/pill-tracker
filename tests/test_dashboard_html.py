@@ -284,3 +284,59 @@ def test_the_correction_uses_put_not_the_note_patch():
 def test_a_tel_aviv_trade_says_the_prices_are_agorot():
     body = _HTML.split("function editEntry(", 1)[1].split("\n}", 1)[0]
     assert "'ILA'" in body and "אגורות" in body
+
+
+# ── Visual design ─────────────────────────────────────────────────────────────
+
+def test_nothing_is_uppercased():
+    """Hebrew has no capital letters, so text-transform does nothing to a
+    Hebrew heading except leave the Latin words in it shouting."""
+    stripped = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    assert "text-transform: uppercase" not in stripped
+
+
+def test_headings_are_not_letter_spaced():
+    """Tracking pulls Hebrew letters apart into unreadable separate glyphs.
+    Negative tracking on a Latin wordmark is a different thing and is allowed."""
+    stripped = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    positive = re.findall(r"letter-spacing:\s*(?!-)([.\d]+)em", stripped)
+    assert all(float(v) <= 0.015 for v in positive), positive
+
+
+def test_a_light_theme_is_defined():
+    """The page is read in daylight as often as not."""
+    assert "prefers-color-scheme: light" in CSS
+    light = CSS.split("prefers-color-scheme: light", 1)[1].split("\n  }", 1)[0]
+    for token in ("--bg:", "--surface:", "--text:", "--border:", "--muted:"):
+        assert token in light, token
+
+
+def test_both_themes_declare_color_scheme():
+    """Without it the browser paints its own form controls and scrollbars in
+    the wrong theme, which is where a dark page starts looking half-finished."""
+    assert CSS.count("color-scheme:") >= 2
+
+
+def test_the_row_actions_are_drawn_not_typed():
+    """Emoji are rendered by the operating system, so the same five buttons
+    were flat glyphs on one machine and colour cartoons on another."""
+    rows = _HTML.split("<td class=\"row-actions\">", 1)[1].split("</td>", 1)[0]
+    assert "icon(" in rows
+    assert not re.search(r"[\U0001F300-\U0001FAFF]", rows), "an emoji is still in use"
+
+
+def test_the_icons_inherit_the_button_colour():
+    """currentColor is what lets the hover and danger states reach the glyph."""
+    body = _HTML.split("const icon = ", 1)[1].split(";", 1)[0]
+    assert "currentColor" in body
+    assert "aria-hidden" in body, "decorative icons must not be announced"
+
+
+def test_focus_is_visible_for_keyboard_users():
+    assert ":focus-visible" in CSS
+
+
+def test_the_interface_has_a_shared_radius_scale():
+    """Cards, inputs and buttons agreeing on their corners is most of what
+    separates a designed page from an assembled one."""
+    assert "--radius:" in CSS and "--radius-sm:" in CSS
