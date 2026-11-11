@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 
 import uvicorn
 
-from . import db
+from . import db, messages
 from .alert_engine import AlertEngine
 from .config import AppConfig, StockConfig, default_alerts, load_config
 from .dashboard import (
@@ -215,12 +215,58 @@ class StockMonitorApp:
                     alert_store.add(
                         symbol=event.symbol,
                         alert_type=event.alert_type,
-                        message=event.message,
+                        # Hebrew: this is read by a person, in the dashboard's
+                        # alert table and in the bot's 🔔 התראות screen. The
+                        # English one-liner stays in the log above.
+                        message=messages.alert_summary(event),
                         severity=event.severity,
                     )
 
             except Exception as exc:
                 self._log.error("Error monitoring %s: %s", symbol, exc, exc_info=True)
+
+    # ── Telegram ──────────────────────────────────────────────────────────────
+
+    def build_telegram_bot(self) -> Optional[TelegramCommandBot]:
+        """The command bot, plus its daily digest job. None when unconfigured.
+
+        Separate from run() so the wiring — above all which jobs get scheduled
+        — can be tested without starting a web server.
+        """
+        tg_cfg = self.config.notifications.telegram
+        if not (tg_cfg.enabled and tg_cfg.bot_token):
+            return None
+
+        bot = TelegramCommandBot(
+            bot_token=tg_cfg.bot_token,
+            data_feed=self.data_feed,
+            monitored_symbols=[s.symbol for s in self.watched_stocks()],
+            regular_close_ref=self._regular_close,
+            analyst=self._analyst,
+            authorized_chat_id=tg_cfg.chat_id,
+            # The same cache the dashboard's news tab reads, so asking the bot
+            # for headlines costs nothing extra.
+            news_monitor=self._news,
+        )
+
+        if not tg_cfg.digest_time:
+            return bot
+        if not tg_cfg.chat_id:
+            # Nothing to push to: the digest is unprompted, so it needs a
+            # destination the user did not have to name in the moment.
+            self._log.info("Daily digest disabled: TELEGRAM_CHAT_ID is not set")
+            return bot
+        try:
+            hour, minute = (int(part) for part in tg_cfg.digest_time.split(":"))
+        except ValueError:
+            self._log.warning(
+                "Ignoring digest_time %r — expected HH:MM", tg_cfg.digest_time
+            )
+            return bot
+
+        self.scheduler.add_daily_job(bot.daily_digest, hour=hour, minute=minute)
+        self._log.info("Daily Telegram digest at %s ET", tg_cfg.digest_time)
+        return bot
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
@@ -237,19 +283,14 @@ class StockMonitorApp:
         self._log.info("=" * 60)
 
         self.scheduler.add_callback(self.monitor_cycle)
+
+        # Built before the scheduler starts: MarketScheduler registers its
+        # daily jobs at start(), and the digest is one of them.
+        tg_bot = self.build_telegram_bot()
+
         self.scheduler.start()
 
-        # Start Telegram command bot if token is configured
-        tg_cfg = self.config.notifications.telegram
-        if tg_cfg.enabled and tg_cfg.bot_token:
-            tg_bot = TelegramCommandBot(
-                bot_token=tg_cfg.bot_token,
-                data_feed=self.data_feed,
-                monitored_symbols=[s.symbol for s in self.watched_stocks()],
-                regular_close_ref=self._regular_close,
-                analyst=self._analyst,
-                authorized_chat_id=tg_cfg.chat_id,
-            )
+        if tg_bot is not None:
             asyncio.create_task(tg_bot.poll_loop())
             self._log.info("Telegram command bot active — send a ticker to your bot")
 

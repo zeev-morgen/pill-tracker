@@ -8,6 +8,8 @@ from typing import List, Optional, Set
 import pytz
 import yfinance as yf
 
+from . import messages
+
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
 
@@ -65,12 +67,10 @@ class EarningsMonitor:
         self._alerted.add(key)
 
         date_str = earnings_date.strftime("%d/%m/%Y")
-        title    = f"📅 התראת דיווח תוצאות: {symbol}"
-        body     = (
-            f"*{symbol}* עתיד לדווח תוצאות בעוד *{days} ימים* ({date_str}).\n"
-            "⚠️ כדאי להתכונן מראש."
-        )
-        self._dispatcher.dispatch_raw(title, body)
+        title, body = messages.earnings_alert(symbol, days, date_str)
+        # framed=False: the body is already a complete Hebrew message, and the
+        # webhook frame would stack a second header on top of its own.
+        self._dispatcher.dispatch_raw(title, body, framed=False)
         logger.info("Earnings alert dispatched: %s in %d days (%s)", symbol, days, date_str)
 
     def _fetch_next_earnings(self, symbol: str) -> Optional[date]:

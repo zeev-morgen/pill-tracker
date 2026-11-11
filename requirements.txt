@@ -1,5 +1,5 @@
 # Core market data
-yfinance>=0.2.40
+yfinance>=1.8.0   # 1.8.0 restores Ticker.news: Yahoo retired the old endpoint in Oct 2026
 pandas>=2.0.0
 
 # Excel export of the portfolio (pandas writes .xlsx through this)

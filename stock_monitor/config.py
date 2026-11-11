@@ -82,6 +82,10 @@ class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
     chat_id: str = ""
+    #: A daily Hebrew digest — portfolio, biggest moves, fresh headlines — sent
+    #: unprompted at this ET time on trading days. 16:45 is 45 minutes after
+    #: the closing bell, so the day's figures are final. Empty disables it.
+    digest_time: str = "16:45"
 
 
 @dataclass
@@ -186,6 +190,7 @@ def load_config(config_path: str = "config/config.yaml") -> AppConfig:
             enabled=bool(tg.get("enabled", False)),
             bot_token=str(tg.get("bot_token", "")),
             chat_id=str(tg.get("chat_id", "")),
+            digest_time=str(tg.get("digest_time", "16:45")).strip(),
         ),
         discord=DiscordConfig(
             enabled=bool(dc.get("enabled", False)),

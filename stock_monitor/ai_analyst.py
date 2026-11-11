@@ -9,10 +9,42 @@ import httpx
 import urllib3
 import yfinance as yf
 
-from . import reference_data
+from . import news, reference_data
 from .data_feed import MIN_SESSION_FRACTION, session_elapsed_fraction
 
 logger = logging.getLogger(__name__)
+
+
+def _news_block(result) -> str:
+    """The prompt's news section, worded to match what we actually know.
+
+    Three states, and the model is told which one it is in. Conflating the
+    last two — as a bare empty list does — invites an analysis that reads as
+    though the news was checked and found quiet.
+    """
+    items = getattr(result, "items", result) or []
+    available = getattr(result, "available", True)
+
+    if items:
+        lines = [f"**חדשות אחרונות ({news.FRESH_WINDOW_HOURS} שעות):**"]
+        for item in items:
+            age = item.get("age_hours")
+            when = f"לפני {age:.0f} ש׳ · " if age is not None else ""
+            pub = f" — {item['publisher']}" if item.get("publisher") else ""
+            lines.append(f"• {when}{item['title']}{pub}")
+        return "\n".join(lines)
+
+    if available:
+        return (
+            f"**חדשות אחרונות:** לא פורסמו כותרות ב-{news.FRESH_WINDOW_HOURS} "
+            "השעות האחרונות (מקור החדשות נבדק והשיב)."
+        )
+
+    return (
+        "**חדשות אחרונות:** מקור החדשות אינו זמין כרגע — אין לי כותרות לנתח. "
+        "אל תתייחס לחדשות או לאירועים מהתקופה האחרונה כאילו בדקת אותם, "
+        "וציין במפורש שהניתוח נשען על נתוני מחיר ופונדמנטלס בלבד."
+    )
 
 
 def _fast_get(fast_info, *names):
@@ -176,9 +208,9 @@ class StockAnalyst:
         prompt so the recommendation is tailored to that entry point.
         """
         extra    = self._fetch_fundamentals(symbol)
-        news     = self._fetch_news(symbol)
+        headlines = self._fetch_news(symbol)
         momentum = self._fetch_momentum(symbol, data)
-        prompt   = self._build_prompt(symbol, data, extra, news, momentum, holding)
+        prompt   = self._build_prompt(symbol, data, extra, headlines, momentum, holding)
         try:
             try:
                 msg = self._stream_once(self._client, prompt)
@@ -415,25 +447,15 @@ class StockAnalyst:
             )
         return out
 
-    def _fetch_news(self, symbol: str, limit: int = 5) -> list:
-        """Return a list of recent news headlines (title + publisher)."""
-        try:
-            items = yf.Ticker(symbol).news or []
-        except Exception:
-            return []
-        out = []
-        for item in items[:limit]:
-            # yfinance news item formats vary across versions
-            content = item.get("content") or item
-            title     = content.get("title") or item.get("title")
-            publisher = (
-                content.get("provider", {}).get("displayName")
-                if isinstance(content.get("provider"), dict)
-                else content.get("publisher") or item.get("publisher")
-            )
-            if title:
-                out.append({"title": title, "publisher": publisher or ""})
-        return out
+    def _fetch_news(self, symbol: str, limit: int = 5) -> news.NewsResult:
+        """Recent headlines, with the provenance the prompt needs.
+
+        The result distinguishes "nothing was published" from "no source
+        answered". The old code could not: it called one endpoint and turned
+        every outcome, failure included, into an empty list — which is how
+        months of analyses came to carry no news at all without ever saying so.
+        """
+        return news.fetch(symbol, limit=limit)
 
     def _fetch_momentum(self, symbol: str, data: dict) -> dict:
         """Compute volume-vs-average and distance-from-52w metrics."""
@@ -478,7 +500,7 @@ class StockAnalyst:
         symbol: str,
         data: dict,
         extra: dict,
-        news: list,
+        headlines,                  # news.NewsResult, or a bare list of items
         momentum: dict,
         holding=None,
     ) -> str:
@@ -549,13 +571,7 @@ class StockAnalyst:
             f"• סקטור: {extra.get('sector') or 'אין נתון'}",
         ]
 
-        if news:
-            parts += ["", "**חדשות אחרונות (כותרות):**"]
-            for item in news:
-                pub = f" — {item['publisher']}" if item.get("publisher") else ""
-                parts.append(f"• {item['title']}{pub}")
-        else:
-            parts += ["", "**חדשות אחרונות:** אין נתון"]
+        parts += ["", _news_block(headlines)]
 
         if holding is not None and p > 0:
             pnl_pct   = (p - holding.entry_price) / holding.entry_price * 100.0

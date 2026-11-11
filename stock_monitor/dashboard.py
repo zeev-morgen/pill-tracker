@@ -21,7 +21,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import ai_analyst, chat, excel_export, fx
+from . import ai_analyst, chat, excel_export, fx, news
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import (
     ClosedPosition,
@@ -576,6 +576,19 @@ async def api_news(max_age_minutes: int = 60):
     except Exception as exc:
         logger.error("News snapshot failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="שגיאה בשליפת החדשות") from exc
+
+
+@router.get("/api/diagnostics/news")
+async def api_news_diagnostics():
+    """Which news source is answering on *this* host, and which yfinance it runs.
+
+    The news outage of October 2026 was invisible from the outside: the feed
+    returned 200 with an empty list, and the only way to tell a broken source
+    from a quiet day was to read the deployed library's version. This says both
+    in one request, so the next time headlines stop arriving the answer takes a
+    minute instead of a week.
+    """
+    return JSONResponse(await run_in_threadpool(news.status))
 
 
 # ── Excel export ──────────────────────────────────────────────────────────────
@@ -2860,8 +2873,13 @@ function renderNews(data) {
     : '';
   const wrap = document.getElementById('news-wrap');
   if (!data.items.length) {
-    wrap.innerHTML = `<div class="empty">אין חדשות מה-${data.fresh_window_hours} שעות האחרונות ` +
-                     `על המניות בתיק</div>`;
+    /* An empty feed and a broken feed looked identical here for a month. */
+    const dead = (data.unavailable || []).length && !Object.keys(data.sources || {}).length;
+    wrap.innerHTML = dead
+      ? `<div class="empty" style="color:var(--yellow)">מקור החדשות אינו זמין כרגע —
+         אין כותרות לשליפה. זו תקלה בשירות החדשות, לא יום שקט.</div>`
+      : `<div class="empty">אין חדשות מה-${data.fresh_window_hours} שעות האחרונות ` +
+        `על המניות בתיק</div>`;
     return;
   }
   wrap.innerHTML = data.items.map((n) => {

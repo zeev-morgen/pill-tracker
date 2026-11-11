@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from stock_monitor import dashboard as _dashboard
+from stock_monitor import news as _news
 from stock_monitor import portfolio_risk
 
 
@@ -36,6 +37,18 @@ def no_symbol_verification(monkeypatch):
     Tests that care about the verified or rejected paths override this.
     """
     monkeypatch.setattr(_dashboard, "symbol_is_known", lambda symbol: None)
+
+
+@pytest.fixture(autouse=True)
+def no_news_fallbacks(monkeypatch):
+    """Only the first news source is live in tests; the fallbacks are not.
+
+    ``news.fetch`` deliberately keeps trying when a source comes back empty, so
+    a test that stubs the yfinance ticker path alone would otherwise fall
+    through to Yahoo's search endpoint and then to the RSS feed over real HTTP.
+    Tests aimed at the fallback chain install their own ``news.SOURCES``.
+    """
+    monkeypatch.setattr(_news, "SOURCES", [("ticker", _news._from_ticker)])
 
 
 @pytest.fixture

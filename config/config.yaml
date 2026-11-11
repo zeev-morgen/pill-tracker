@@ -111,6 +111,11 @@ notifications:
     enabled: true
     bot_token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
+    # A daily Hebrew digest — portfolio, biggest moves, fresh headlines — sent
+    # without being asked, at this ET time on trading days. 16:45 is 45 minutes
+    # after the closing bell, so the day's numbers are final. Leave it empty to
+    # turn the digest off; alerts and the commands are unaffected either way.
+    digest_time: "16:45"
 
   discord:
     enabled: false

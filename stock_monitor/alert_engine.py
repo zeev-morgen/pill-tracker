@@ -14,7 +14,7 @@ price_threshold   — fires when price crosses above/below a fixed level
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +44,12 @@ class AlertEvent:
     price: float
     timestamp: datetime
     severity: str = "INFO"      # INFO | WARNING | CRITICAL
+    #: The facts behind the alert — what moved, from where, against which
+    #: benchmark. ``message`` is the English one-liner for the log and the
+    #: alert history; the text a person reads is rendered from these by
+    #: :mod:`stock_monitor.messages`, so adding a language or a channel does
+    #: not mean parsing a sentence back apart.
+    details: Dict = field(default_factory=dict)
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -120,21 +126,28 @@ class AlertEngine:
     def _check(
         self, symbol: str, alert: AlertConfig, data: Dict
     ) -> Optional[AlertEvent]:
+        # The quote's own currency, so a Tel Aviv alert is worded in agorot
+        # rather than dollars. Empty means "whatever the ticker implies".
+        currency = data.get("currency") or ""
         if alert.type == "price_change_pct":
-            return self._check_price_change_pct(symbol, alert, data["price"])
+            return self._check_price_change_pct(
+                symbol, alert, data["price"], currency
+            )
         if alert.type == "volume_spike":
             return self._check_volume_spike(
-                symbol, alert, data["volume"], data.get("session")
+                symbol, alert, data["volume"], data.get("session"), currency
             )
         if alert.type == "price_threshold":
-            return self._check_price_threshold(symbol, alert, data["price"])
+            return self._check_price_threshold(
+                symbol, alert, data["price"], currency
+            )
         logger.warning("Unknown alert type: %s", alert.type)
         return None
 
     # ── Individual checks ─────────────────────────────────────────────────────
 
     def _check_price_change_pct(
-        self, symbol: str, alert: AlertConfig, price: float
+        self, symbol: str, alert: AlertConfig, price: float, currency: str = ""
     ) -> Optional[AlertEvent]:
         history = self._history_for(symbol)
         if len(history) < 2:
@@ -171,11 +184,18 @@ class AlertEngine:
             price=price,
             timestamp=datetime.now(NYSE_TZ),
             severity=severity,
+            details={
+                "change_pct": change_pct,
+                "window_minutes": alert.window_minutes,
+                "from_price": base,
+                "to_price": price,
+                "currency": currency,
+            },
         )
 
     def _check_volume_spike(
         self, symbol: str, alert: AlertConfig, volume: int,
-        session: Optional[str] = None,
+        session: Optional[str] = None, currency: str = "",
     ) -> Optional[AlertEvent]:
         """Cumulative session volume against the 10-day average.
 
@@ -198,9 +218,11 @@ class AlertEngine:
         # so a spike can fire intraday — e.g. a full day's volume already
         # traded in the first 3 hours. Clamp the fraction so the noisy first
         # minutes don't inflate the ratio.
+        elapsed_pct: Optional[float] = None
         if alert.time_adjusted:
             frac = max(session_elapsed_fraction(), MIN_SESSION_FRACTION)
             expected = avg * frac
+            elapsed_pct = frac * 100.0
             benchmark = (
                 f"the pace expected by {frac * 100:.0f}% into the day "
                 f"({int(expected):,} of the {int(avg):,} 10-day avg)"
@@ -231,10 +253,18 @@ class AlertEngine:
             price=0.0,
             timestamp=datetime.now(NYSE_TZ),
             severity="WARNING",
+            details={
+                "volume": volume,
+                "ratio": ratio,
+                "avg_volume": avg,
+                "session_elapsed_pct": elapsed_pct,
+                "time_adjusted": alert.time_adjusted,
+                "currency": currency,
+            },
         )
 
     def _check_price_threshold(
-        self, symbol: str, alert: AlertConfig, price: float
+        self, symbol: str, alert: AlertConfig, price: float, currency: str = ""
     ) -> Optional[AlertEvent]:
         if alert.above is not None:
             sk = (symbol, "above", alert.above)
@@ -258,6 +288,12 @@ class AlertEngine:
                         price=price,
                         timestamp=datetime.now(NYSE_TZ),
                         severity="INFO",
+                        details={
+                            "direction": "above",
+                            "level": alert.above,
+                            "price": price,
+                            "currency": currency,
+                        },
                     )
 
         if alert.below is not None:
@@ -280,6 +316,12 @@ class AlertEngine:
                         price=price,
                         timestamp=datetime.now(NYSE_TZ),
                         severity="WARNING",
+                        details={
+                            "direction": "below",
+                            "level": alert.below,
+                            "price": price,
+                            "currency": currency,
+                        },
                     )
 
         return None

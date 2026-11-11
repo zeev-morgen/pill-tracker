@@ -5,9 +5,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from stock_monitor import dashboard, news_monitor
+from stock_monitor import dashboard, news, news_monitor
 from stock_monitor.config import NotificationConfig
-from stock_monitor.news_monitor import FRESH_WINDOW_HOURS, NewsMonitor, _normalize, _published_at
+from stock_monitor.news import FRESH_WINDOW_HOURS, _normalize, _published_at
+from stock_monitor.news_monitor import NewsMonitor
 from stock_monitor.notifier import NotificationDispatcher
 from stock_monitor.store import Holding, portfolio_store
 from stock_monitor.webhook_server import create_webhook_app
@@ -100,7 +101,7 @@ def _item(title, hours_ago):
 def test_scan_collects_headlines_for_every_holding(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
     portfolio_store.upsert(Holding.create("CF", 1, 50.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({
         "AMZN": [_item("A", 1)], "CF": [_item("C", 2)],
     }))
     titles = {i["title"] for i in NewsMonitor(portfolio_store).scan()}
@@ -109,7 +110,7 @@ def test_scan_collects_headlines_for_every_holding(monkeypatch):
 
 def test_stale_headlines_are_filtered_out(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({
         "AMZN": [_item("fresh", 3), _item("stale", FRESH_WINDOW_HOURS + 5)],
     }))
     assert [i["title"] for i in NewsMonitor(portfolio_store).scan()] == ["fresh"]
@@ -118,7 +119,7 @@ def test_stale_headlines_are_filtered_out(monkeypatch):
 def test_undated_headlines_are_kept(monkeypatch):
     """yfinance omits the timestamp often enough that dropping them empties the feed."""
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({
         "AMZN": [{"content": {"title": "no date", "provider": {"displayName": "P"}}}],
     }))
     assert [i["title"] for i in NewsMonitor(portfolio_store).scan()] == ["no date"]
@@ -126,7 +127,7 @@ def test_undated_headlines_are_kept(monkeypatch):
 
 def test_results_are_ordered_newest_first(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({
         "AMZN": [_item("older", 8), _item("newer", 1)],
     }))
     assert [i["title"] for i in NewsMonitor(portfolio_store).scan()] == ["newer", "older"]
@@ -135,7 +136,7 @@ def test_results_are_ordered_newest_first(monkeypatch):
 def test_one_ticker_cannot_crowd_out_the_others(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
     portfolio_store.upsert(Holding.create("CF", 1, 50.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({
         "AMZN": [_item(f"noise {n}", 1) for n in range(20)],
         "CF": [_item("signal", 2)],
     }))
@@ -147,7 +148,7 @@ def test_one_ticker_cannot_crowd_out_the_others(monkeypatch):
 def test_a_failing_ticker_does_not_sink_the_whole_scan(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
     portfolio_store.upsert(Holding.create("CF", 1, 50.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({
         "AMZN": RuntimeError("rate limited"), "CF": [_item("survived", 1)],
     }))
     assert [i["title"] for i in NewsMonitor(portfolio_store).scan()] == ["survived"]
@@ -157,7 +158,7 @@ def test_an_empty_portfolio_scans_nothing(monkeypatch):
     def explode(symbol):
         raise AssertionError("no holdings means no fetches")
 
-    monkeypatch.setattr(news_monitor.yf, "Ticker", explode)
+    monkeypatch.setattr(news.yf, "Ticker", explode)
     assert NewsMonitor(portfolio_store).scan() == []
 
 
@@ -173,7 +174,7 @@ def test_snapshot_scans_on_first_call_then_serves_the_cache(monkeypatch):
 
         news = [_item("A", 1)]
 
-    monkeypatch.setattr(news_monitor.yf, "Ticker", Counting)
+    monkeypatch.setattr(news.yf, "Ticker", Counting)
     monitor = NewsMonitor(portfolio_store)
     first = monitor.snapshot()
     assert len(first["items"]) == 1 and first["scanned_at"] is not None
@@ -191,7 +192,7 @@ def test_max_age_zero_forces_a_rescan(monkeypatch):
 
         news = [_item("A", 1)]
 
-    monkeypatch.setattr(news_monitor.yf, "Ticker", Counting)
+    monkeypatch.setattr(news.yf, "Ticker", Counting)
     monitor = NewsMonitor(portfolio_store)
     monitor.snapshot()
     monitor.snapshot(max_age_minutes=0)
@@ -203,7 +204,7 @@ def test_max_age_zero_forces_a_rescan(monkeypatch):
 @pytest.fixture
 def client(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({"AMZN": [_item("headline", 1)]}))
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({"AMZN": [_item("headline", 1)]}))
     dashboard.set_news_monitor(NewsMonitor(portfolio_store))
     try:
         yield TestClient(create_webhook_app(NotificationDispatcher(NotificationConfig()), ""))
@@ -225,7 +226,7 @@ def test_api_accepts_a_forced_rescan(client):
 @pytest.mark.anyio
 async def test_daily_scan_runs_the_scan(monkeypatch):
     portfolio_store.upsert(Holding.create("AMZN", 1, 100.0))
-    monkeypatch.setattr(news_monitor.yf, "Ticker", _fake_yf({"AMZN": [_item("A", 1)]}))
+    monkeypatch.setattr(news.yf, "Ticker", _fake_yf({"AMZN": [_item("A", 1)]}))
     monitor = NewsMonitor(portfolio_store)
     await monitor.daily_scan()
     assert monitor.snapshot()["items"], "the scheduled job must fill the cache"
