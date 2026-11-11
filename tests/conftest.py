@@ -12,8 +12,10 @@ import pandas as pd
 import pytest
 
 from stock_monitor import dashboard as _dashboard
+from stock_monitor import data_feed as _data_feed
 from stock_monitor import news as _news
 from stock_monitor import portfolio_risk
+from stock_monitor import telegram_bot as _telegram_bot
 
 
 @pytest.fixture(autouse=True)
@@ -35,8 +37,13 @@ def no_symbol_verification(monkeypatch):
     None is the "could not tell" answer, which is what the route sees in
     production when Yahoo is unreachable — the symbol is accepted on trust.
     Tests that care about the verified or rejected paths override this.
+
+    Patched in three places because three modules hold a reference: the
+    definition in data_feed, the dashboard's re-export, and the Telegram bot's
+    import. Missing one would leave a path to the real network.
     """
-    monkeypatch.setattr(_dashboard, "symbol_is_known", lambda symbol: None)
+    for module in (_data_feed, _dashboard, _telegram_bot):
+        monkeypatch.setattr(module, "symbol_is_known", lambda symbol: None)
 
 
 @pytest.fixture(autouse=True)

@@ -211,6 +211,30 @@ def alert(event, session: str = "regular") -> str:
     return "\n".join(lines)
 
 
+def rules_summary(alerts, currency: str = "USD") -> str:
+    """The alert rules for one symbol, in a phrase: "שינוי ±3% ב-10 דק׳ · מחזור ×2.5".
+
+    So the stock-management screen can say what adding a stock actually buys —
+    rather than leaving it to be inferred from whether an alert ever arrives.
+    A price threshold is a figure in the stock's own currency, so the caller
+    passes the currency; percentages and volume multiples need none.
+    """
+    parts = []
+    for alert in alerts or []:
+        kind = getattr(alert, "type", "")
+        if kind == "price_change_pct":
+            threshold = ltr(f"±{alert.threshold_pct:g}%")
+            parts.append(f"שינוי {threshold} ב-{ltr(alert.window_minutes)} דק׳")
+        elif kind == "volume_spike":
+            parts.append(f"מחזור {ltr(f'×{alert.multiplier:g}')}")
+        elif kind == "price_threshold":
+            if getattr(alert, "above", None) is not None:
+                parts.append(f"מעל {money(alert.above, currency)}")
+            if getattr(alert, "below", None) is not None:
+                parts.append(f"מתחת ל-{money(alert.below, currency)}")
+    return " · ".join(parts) if parts else "ללא כללי התראה"
+
+
 def alert_summary(event) -> str:
     """One plain Hebrew line for the alert history — no markup, no direction marks.
 

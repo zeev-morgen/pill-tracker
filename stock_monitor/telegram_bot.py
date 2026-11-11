@@ -27,6 +27,7 @@ The bot runs as a background asyncio task using long-polling.
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -34,11 +35,12 @@ import pytz
 import requests
 import urllib3
 
-from . import messages, mute, news
-from .data_feed import StockDataFeed, get_market_session
+from . import fx, messages, mute, news
+from .config import default_alerts
+from .data_feed import StockDataFeed, get_market_session, symbol_is_known
 from .messages import ltr, money, rtl
 from .portfolio_risk import PortfolioRiskAnalyzer
-from .store import alert_store, portfolio_store, watchlist_store
+from .store import HoldingError, alert_store, portfolio_store, watchlist_store
 
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
@@ -47,6 +49,15 @@ NYSE_TZ = pytz.timezone("America/New_York")
 _TICKER_RE  = re.compile(r"^[A-Z]{1,6}(?:\.[A-Z]{2})?$")
 _ANALYZE_RE = re.compile(
     r"^(?:ANALYZE|ניתוח)\s+([A-Za-z]{1,6}(?:\.[A-Za-z]{2})?)$", re.IGNORECASE
+)
+#: "הוסף AVGO", "/add avgo", "+AVGO" — and the same for removal. The symbol is
+#: validated by WatchlistStore.normalize, so anything ticker-shaped is passed on.
+_ADD_RE = re.compile(
+    r"^(?:/?ADD|הוסף|הוסיף|\+)\s*([A-Za-z0-9.\-^]{1,16})$", re.IGNORECASE
+)
+_REMOVE_RE = re.compile(
+    r"^(?:/?(?:REMOVE|DEL|DELETE)|הסר|הסיר|מחק|\-)\s*([A-Za-z0-9.\-^]{1,16})$",
+    re.IGNORECASE,
 )
 #: Anything that is not a letter, digit, space or dot — emoji and punctuation —
 #: so a tapped keyboard label ("💼 התיק שלי") routes like the typed command.
@@ -67,13 +78,16 @@ _COMMANDS: Dict[str, str] = {
     "NEWS": "news", "חדשות": "news",
     "SUMMARY": "summary", "סיכום": "summary", "DIGEST": "summary",
     "ALERTS": "alerts", "התראות": "alerts", "MUTE": "alerts", "השתקה": "alerts",
+    "MANAGE": "manage", "ניהול": "manage", "ניהול מניות": "manage",
+    "WATCHLIST": "manage", "ניהול התראות": "manage",
 }
 
 MENU_KEYBOARD = {
     "keyboard": [
         [{"text": "💼 התיק שלי"}, {"text": "📋 מעקב"}],
         [{"text": "📰 חדשות"}, {"text": "🧾 סיכום"}],
-        [{"text": "🔔 התראות"}, {"text": "❓ עזרה"}],
+        [{"text": "🔔 התראות"}, {"text": "⚙️ ניהול מניות"}],
+        [{"text": "❓ עזרה"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -99,6 +113,9 @@ _HELP_TEXT = "\n".join([
     rtl("• 📰 *חדשות* ← כותרות אחרונות על המניות שבתיק"),
     rtl("• 🧾 *סיכום* ← תמונת מצב אחת: תיק, תנועות חריגות וחדשות"),
     rtl("• 🔔 *התראות* ← מה הושתק, מה נשלח לאחרונה, והשתקה בלחיצה"),
+    rtl("• ⚙️ *ניהול מניות* ← הוספה והסרה של מניות מהמעקב, בלחיצה"),
+    "",
+    rtl(f"גם בהקלדה: {ltr('`הוסף AVGO`')} או {ltr('`הסר AVGO`')}."),
 ])
 
 
@@ -203,6 +220,7 @@ class TelegramCommandBot:
         analyst=None,                       # Optional[StockAnalyst]
         authorized_chat_id: str = "",       # if set, bot ignores all other users
         news_monitor=None,                  # Optional[NewsMonitor] — shared cache
+        alert_rules=None,                   # Optional[Dict[str, List[AlertConfig]]]
     ) -> None:
         self._base               = f"https://api.telegram.org/bot{bot_token}"
         self._feed               = data_feed
@@ -212,6 +230,11 @@ class TelegramCommandBot:
         self._risk               = PortfolioRiskAnalyzer(portfolio_store, data_feed=data_feed)
         self._authorized_chat_id = authorized_chat_id
         self._news               = news_monitor
+        self._rules              = {s.upper(): rules for s, rules in (alert_rules or {}).items()}
+        #: chat_id → (what the bot is waiting for, when it started waiting).
+        #: The only conversational state here: "➕ הוסף מניה" has to be
+        #: followed by a ticker, and a button cannot carry one.
+        self._pending: Dict[int, tuple] = {}
         self._offset             = 0
 
     @property
@@ -296,6 +319,18 @@ class TelegramCommandBot:
 
         command = route(text)
         analyze_match = _ANALYZE_RE.match(text)
+        add_match = _ADD_RE.match(text)
+        remove_match = _REMOVE_RE.match(text)
+
+        # A pending "send me a ticker" wins over the ticker-shaped fallback, so
+        # a bare AVGO adds the stock instead of quoting it. Any menu command
+        # cancels the wait: tapping elsewhere is as good as saying never mind.
+        if self._take_pending(chat_id) and not command:
+            if add_match or remove_match:
+                pass        # an explicit "הוסף X" says what it wants
+            else:
+                await self._add_symbol(chat_id, text)
+                return
 
         if command == "start":
             self._send(
@@ -325,6 +360,12 @@ class TelegramCommandBot:
             await self._send_summary(chat_id)
         elif command == "alerts":
             await self._send_alerts(chat_id)
+        elif command == "manage":
+            await self._send_manage(chat_id)
+        elif add_match:
+            await self._add_symbol(chat_id, add_match.group(1))
+        elif remove_match:
+            await self._remove_symbol(chat_id, remove_match.group(1).upper())
         elif analyze_match:
             await self._send_analysis(chat_id, analyze_match.group(1).upper())
         elif _TICKER_RE.match(text.lstrip("/").upper()):
@@ -380,6 +421,27 @@ class TelegramCommandBot:
             self._answer_callback(cb_id, "ההשתקה בוטלה")
             await self._send_alerts(chat_id)
             return
+        if data == "wl_add":
+            self._pending[chat_id] = ("add_symbol", time.monotonic())
+            self._answer_callback(cb_id)
+            self._send(chat_id, "\n".join([
+                rtl("➕ *איזו מניה להוסיף?*"),
+                rtl(f"שלח לי את הטיקר — לדוגמה {ltr('`AVGO`')}, "
+                    f"או {ltr('`ESLT.TA`')} לבורסה בתל אביב."),
+            ]))
+            return
+        if data.startswith("wl_rm:"):
+            self._answer_callback(cb_id)
+            await self._remove_symbol(chat_id, data.split(":", 1)[1].upper())
+            return
+        if data.startswith("wl_undo:"):
+            self._answer_callback(cb_id, "הוחזר")
+            await self._add_symbol(chat_id, data.split(":", 1)[1].upper(), verify=False)
+            return
+        if data == "manage":
+            self._answer_callback(cb_id)
+            await self._send_manage(chat_id)
+            return
         if data == "mute_today":
             self._mute_until_tomorrow(chat_id)
             self._answer_callback(cb_id, "הושתק עד מחר")
@@ -399,10 +461,16 @@ class TelegramCommandBot:
         elif data.startswith("news:"):
             await self._send_news(chat_id, data.split(":", 1)[1].upper())
 
+    #: Opens the stock-management screen from wherever the watchlist is shown.
+    MANAGE_BUTTON = {"inline_keyboard": [[
+        {"text": "⚙️ ניהול מניות", "callback_data": "manage"}
+    ]]}
+
     async def _send_status(self, chat_id: int) -> None:
         if not self._syms:
             self._send(chat_id, rtl("אין מניות במעקב.") + "\n"
-                       + rtl("הוסף מניות בדשבורד — טאב *מעקב חי*."))
+                       + rtl("הקש ⚙️ ניהול מניות כדי להוסיף."),
+                       reply_markup=self.MANAGE_BUTTON)
             return
         session = _SESSION_HE.get(get_market_session(), get_market_session())
         lines = [rtl(f"📋 *רשימת מעקב* — {session}"), ""]
@@ -418,7 +486,7 @@ class TelegramCommandBot:
                 ))
             else:
                 lines.append(rtl(f"⚪ *{ltr(sym)}* — אין נתון"))
-        self._send(chat_id, "\n".join(lines))
+        self._send(chat_id, "\n".join(lines), reply_markup=self.MANAGE_BUTTON)
 
     # ── Portfolio ─────────────────────────────────────────────────────────────
 
@@ -641,6 +709,123 @@ class TelegramCommandBot:
         except Exception as exc:
             logger.error("Daily digest failed: %s", exc, exc_info=True)
 
+    # ── Managing which stocks are watched ─────────────────────────────────────
+
+    #: How long "send me a ticker" stays armed. Past this, a stray message is
+    #: much more likely to be a new thought than an answer to an old prompt.
+    PENDING_TTL = 300.0
+
+    def _take_pending(self, chat_id: int) -> str:
+        """The action this chat was asked for, consumed. Empty if none or stale."""
+        action, started = self._pending.pop(chat_id, ("", 0.0))
+        if action and time.monotonic() - started > self.PENDING_TTL:
+            return ""
+        return action
+
+    def _rules_for(self, symbol: str) -> List:
+        """The alert rules a symbol is polled under.
+
+        config.yaml's entries keep their tuned numbers; anything added at
+        runtime — from here or from the dashboard — gets the defaults.
+        """
+        return self._rules.get(symbol.upper()) or default_alerts()
+
+    async def _send_manage(self, chat_id: int, notice: str = "",
+                           undo: str = "") -> None:
+        """The interactive watchlist: one ❌ per stock, plus ➕ to add one.
+
+        Adding a stock here is what starts it being alerted on, so the screen
+        states the rules it will be watched under rather than leaving that to
+        be discovered from an alert that does or does not arrive.
+        """
+        symbols = list(self._syms)
+        lines = [rtl("⚙️ *ניהול מניות במעקב*"), ""]
+        if notice:
+            lines += [rtl(notice), ""]
+
+        if symbols:
+            # "1 מניות" is not Hebrew; one takes the singular.
+            count_he = ("מניה אחת במעקב" if len(symbols) == 1
+                        else f"{ltr(len(symbols))} מניות במעקב")
+            lines.append(rtl(f"{count_he}. הקש ❌ להסרה, ➕ להוספה."))
+            lines.append("")
+            for symbol in symbols[:40]:
+                tuned = symbol.upper() in self._rules
+                rules = messages.rules_summary(
+                    self._rules_for(symbol), fx.currency_for_ticker(symbol) or "USD"
+                )
+                lines.append(rtl(f"• *{ltr(symbol)}* — {rules}"
+                                 + (" 🔧" if tuned else "")))
+            if len(symbols) > 40:
+                lines.append(rtl(f"…ועוד {ltr(len(symbols) - 40)}"))
+            if any(s.upper() in self._rules for s in symbols):
+                lines += ["", rtl("🔧 = כללים מותאמים מ-`config.yaml`")]
+        else:
+            lines.append(rtl("אין מניות במעקב. הקש ➕ כדי להוסיף."))
+
+        rows = []
+        if undo:
+            rows.append([{"text": f"↩️ החזר את {undo}", "callback_data": f"wl_undo:{undo}"}])
+        # Two per row: a Hebrew phone screen fits two ticker buttons comfortably,
+        # and one long column makes a thirteen-stock watchlist a scroll.
+        buttons = [{"text": f"❌ {s}", "callback_data": f"wl_rm:{s}"} for s in symbols[:40]]
+        rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([{"text": "➕ הוסף מניה", "callback_data": "wl_add"}])
+        self._send(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": rows})
+
+    async def _add_symbol(self, chat_id: int, raw: str, verify: bool = True) -> None:
+        """Add one stock to the watchlist, after asking whether it exists.
+
+        The three-way verification is the point: a typo must be refused, but an
+        unreachable Yahoo must not be allowed to refuse a valid ticker — so an
+        unverifiable symbol is accepted and the reply says it was taken on trust.
+        """
+        try:
+            symbol = watchlist_store.normalize(raw)
+        except HoldingError as exc:
+            self._send(chat_id, rtl(f"❌ {exc}"))
+            await self._send_manage(chat_id)
+            return
+
+        if symbol in self._syms:
+            await self._send_manage(chat_id, notice=f"ℹ️ {symbol} כבר במעקב.")
+            return
+
+        known = await asyncio.to_thread(symbol_is_known, symbol) if verify else None
+        if known is False:
+            self._send(chat_id, "\n".join([
+                rtl(f"❌ לא נמצאו נתונים עבור *{ltr(symbol)}* — בדוק את הכתיב."),
+                rtl(f"מניות בבורסה בתל אביב מסתיימות ב-{ltr('`.TA`')} "
+                    f"(לדוגמה {ltr('`TEVA.TA`')})."),
+            ]))
+            return
+
+        await asyncio.to_thread(watchlist_store.add, symbol)
+        notice = (
+            f"✅ *{symbol}* נוספה למעקב."
+            if known is True or not verify
+            else f"✅ *{symbol}* נוספה למעקב (לא ניתן לאמת מול Yahoo כרגע, "
+                 "אז היא נוספה על סמך מה ששלחת)."
+        )
+        logger.info("Watchlist: %s added from Telegram", symbol)
+        await self._send_manage(chat_id, notice=notice)
+
+    async def _remove_symbol(self, chat_id: int, symbol: str) -> None:
+        """Remove one stock, with a way back — a tap is easy to mistype."""
+        removed = await asyncio.to_thread(watchlist_store.remove, symbol)
+        if not removed:
+            await self._send_manage(chat_id, notice=f"ℹ️ {symbol} לא היה במעקב.")
+            return
+
+        logger.info("Watchlist: %s removed from Telegram", symbol)
+        notice = f"🗑 *{symbol}* הוסרה מהמעקב — לא יישלחו עליה התראות."
+        if not watchlist_store.all():
+            # An empty store means "not configured", so the monitor falls back
+            # to config.yaml. Saying nothing would look like the removal failed.
+            notice += ("\nזו הייתה המניה האחרונה, "
+                       "ולכן המערכת חוזרת לרשימה שב-`config.yaml`.")
+        await self._send_manage(chat_id, notice=notice, undo=symbol)
+
     # ── Alerts and muting ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -700,5 +885,8 @@ class TelegramCommandBot:
         ]
         if muted:
             buttons.append([{"text": "🔔 בטל את כל ההשתקות", "callback_data": "unmute_all"}])
+        # Muting is about noise; this is about which stocks exist at all. Both
+        # belong to "my alerts", so one screen leads to the other.
+        buttons.append([{"text": "⚙️ ניהול מניות", "callback_data": "manage"}])
         self._send(chat_id, "\n".join(lines),
                    reply_markup={"inline_keyboard": buttons})

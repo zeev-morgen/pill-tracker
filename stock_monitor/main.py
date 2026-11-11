@@ -247,6 +247,9 @@ class StockMonitorApp:
             # The same cache the dashboard's news tab reads, so asking the bot
             # for headlines costs nothing extra.
             news_monitor=self._news,
+            # So the stock-management screen can show the rules each symbol is
+            # actually watched under, tuned ones included.
+            alert_rules={s.symbol: s.alerts for s in self.config.stocks},
         )
 
         if not tg_cfg.digest_time:

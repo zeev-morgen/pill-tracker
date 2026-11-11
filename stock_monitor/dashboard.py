@@ -22,6 +22,9 @@ from fastapi.responses import (
 )
 
 from . import ai_analyst, chat, excel_export, fx, news
+# Re-exported, not just used: tests and the watchlist route both refer to
+# dashboard.symbol_is_known, and it is a question about the data feed.
+from .data_feed import symbol_is_known
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .store import (
     ClosedPosition,
@@ -499,31 +502,6 @@ async def api_portfolio():
 @router.get("/api/watchlist")
 async def api_watchlist():
     return JSONResponse({"symbols": watchlist_store.all()})
-
-
-def symbol_is_known(symbol: str) -> Optional[bool]:
-    """Whether the data source recognises a symbol. None means "cannot tell".
-
-    A misspelled ticker used to be accepted without complaint and then simply
-    never appear on the live tab, which is indistinguishable from the feature
-    being broken. Checking on the way in turns that into a message.
-
-    The three-way answer matters. An *empty* result means the symbol does not
-    exist — reject it. An *exception* means the source was unreachable or
-    throttling, which says nothing about the symbol, so the caller must not
-    treat it as a rejection or a bad afternoon at Yahoo would block adding
-    perfectly valid tickers.
-    """
-    try:
-        import yfinance as yf
-
-        frame = yf.Ticker(symbol).history(period="5d")
-    except Exception as exc:
-        logger.warning("could not verify %s (%s)", symbol, exc.__class__.__name__)
-        return None
-    if frame is None or frame.empty or "Close" not in frame.columns:
-        return False
-    return bool(frame["Close"].notna().any())
 
 
 @router.post("/api/watchlist")

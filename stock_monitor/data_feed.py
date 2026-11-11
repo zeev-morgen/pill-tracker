@@ -27,6 +27,32 @@ def _usable(value) -> bool:
     """
     return isinstance(value, (int, float)) and math.isfinite(value) and value != 0
 
+
+def symbol_is_known(symbol: str) -> Optional[bool]:
+    """Whether the data source recognises a symbol. None means "cannot tell".
+
+    A misspelled ticker used to be accepted without complaint and then simply
+    never appear on the live tab, which is indistinguishable from the feature
+    being broken. Checking on the way in turns that into a message.
+
+    The three-way answer matters. An *empty* result means the symbol does not
+    exist — reject it. An *exception* means the source was unreachable or
+    throttling, which says nothing about the symbol, so the caller must not
+    treat it as a rejection or a bad afternoon at Yahoo would block adding
+    perfectly valid tickers.
+
+    Lives here rather than in the dashboard because it is a question about the
+    data feed, and the Telegram bot has to ask it too.
+    """
+    try:
+        frame = yf.Ticker(symbol).history(period="5d")
+    except Exception as exc:
+        logger.warning("could not verify %s (%s)", symbol, exc.__class__.__name__)
+        return None
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return False
+    return bool(frame["Close"].notna().any())
+
 NYSE_TZ = pytz.timezone("America/New_York")
 
 # Market session boundaries (hour, minute) in ET
