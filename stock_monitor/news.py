@@ -27,6 +27,7 @@ So the lesson, rather than the patch:
 from __future__ import annotations
 
 import logging
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -106,6 +107,33 @@ def _age_hours(published: Optional[datetime]) -> Optional[float]:
     return round((datetime.now(timezone.utc) - published).total_seconds() / 3600.0, 1)
 
 
+#: HTML a feed's blurb can arrive wrapped in. RSS descriptions in particular
+#: carry anchors and <p> tags that would reach the prompt and the screen as-is.
+_TAG_RE = re.compile(r"<[^>]+>")
+#: Enough of a blurb to summarise from, bounded so one chatty feed cannot
+#: dominate a prompt that carries ten of them.
+SUMMARY_LIMIT = 700
+
+
+def _blurb(content: dict, item: dict) -> str:
+    """The item's own description, as plain text.
+
+    This is what makes a Hebrew summary possible without fetching the article:
+    Yahoo ships a paragraph of its own with most items.
+    """
+    raw = (
+        content.get("summary")
+        or content.get("description")
+        or item.get("summary")
+        or item.get("description")
+        or ""
+    )
+    text = _TAG_RE.sub(" ", str(raw))
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = " ".join(text.split())
+    return text[:SUMMARY_LIMIT]
+
+
 def _normalize(item: dict, ticker: str) -> Optional[dict]:
     """One news item from any yfinance shape, or None when it carries no title."""
     content = item.get("content") or item
@@ -127,6 +155,7 @@ def _normalize(item: dict, ticker: str) -> Optional[dict]:
     return {
         "ticker": ticker,
         "title": str(title).strip(),
+        "summary": _blurb(content, item),
         "publisher": publisher or "",
         "link": link or "",
         "published_at": published.isoformat() if published else None,
@@ -195,6 +224,7 @@ def _from_rss(ticker: str, limit: int) -> List[dict]:
                 published = None
         items.append({
             "title": title,
+            "description": (node.findtext("description") or "").strip(),
             "link": (node.findtext("link") or "").strip(),
             "publisher": (node.findtext("source") or "Yahoo Finance").strip(),
             "providerPublishTime": published.timestamp() if published else None,

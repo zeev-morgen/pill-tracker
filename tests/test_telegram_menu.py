@@ -6,7 +6,7 @@ thing in each state, and that a quote is shown in the currency it is quoted in.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -42,8 +42,11 @@ class Recorder:
     def __init__(self):
         self.messages = []
 
-    def send(self, chat_id, text, reply_markup=None):
-        self.messages.append({"text": text, "reply_markup": reply_markup})
+    def send(self, chat_id, text, reply_markup=None, disable_preview=False,
+             parse_mode="Markdown"):
+        self.messages.append({"text": text, "reply_markup": reply_markup,
+                              "disable_preview": disable_preview,
+                              "parse_mode": parse_mode})
 
     @property
     def last(self):
@@ -237,10 +240,35 @@ def test_an_analysis_request_accepts_a_suffixed_ticker():
 
 # ── News ──────────────────────────────────────────────────────────────────────
 
-def _item(title, ticker="AVGO", age=2.0):
+def _item(title, ticker="AVGO", age=2.0, summary=""):
+    """A normalized news item, as stock_monitor.news hands them over."""
+    published = datetime.now(timezone.utc) - timedelta(hours=age)
     return {"ticker": ticker, "title": title, "publisher": "Reuters",
-            "link": "https://example.com/a", "age_hours": age,
-            "published_at": datetime.now(timezone.utc).isoformat()}
+            "summary": summary,
+            # Distinct per title so the summary cache does not confuse two items.
+            "link": f"https://example.com/{title.replace(' ', '-')}",
+            "age_hours": age, "published_at": published.isoformat()}
+
+
+class _Summarizer:
+    """An analyst that answers the numbered news prompt."""
+
+    def __init__(self, *summaries):
+        self.summaries = summaries
+        self.calls = 0
+
+    def summarize_news(self, system_prompt, prompt, max_tokens=1400):
+        self.calls += 1
+        return "\n".join(f"{n}| {s}" for n, s in enumerate(self.summaries, start=1))
+
+
+@pytest.fixture(autouse=True)
+def clean_summary_cache():
+    from stock_monitor import news_digest
+
+    news_digest.reset_cache()
+    yield
+    news_digest.reset_cache()
 
 
 def test_news_lists_the_headlines_with_their_age():
@@ -254,6 +282,136 @@ def test_news_lists_the_headlines_with_their_age():
     assert "Broadcom lifts guidance" in text
     assert "לפני 2 ש׳" in text
     assert "Reuters" in text
+
+
+# ── Hebrew summaries, not just links ──────────────────────────────────────────
+
+def test_each_item_is_summarised_in_hebrew():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("Broadcom lifts guidance", summary="Revenue up."),
+                                  _item("Elbit wins contract", "ESLT.TA",
+                                        summary="A new deal.")],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    analyst = _Summarizer("ברודקום העלתה תחזית", "אלביט זכתה בחוזה")
+    run(make_bot(recorder, analyst=analyst, news_monitor=monitor)._send_news(1))
+
+    text = recorder.text()
+    assert "ברודקום העלתה תחזית" in text
+    assert "אלביט זכתה בחוזה" in text
+    assert analyst.calls == 1, "one call for the whole screen"
+
+
+def test_the_link_trails_the_summary_instead_of_replacing_it():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("Broadcom lifts guidance", summary="Revenue up.")],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, analyst=_Summarizer("ברודקום העלתה תחזית"),
+                 news_monitor=monitor)._send_news(1))
+
+    text = recorder.text()
+    assert '<a href="https://example.com/Broadcom-lifts-guidance">לכתבה המלאה</a>' in text
+    assert text.index("ברודקום") < text.index("לכתבה המלאה"), \
+        "the summary leads; the link follows it"
+
+
+def test_every_item_carries_its_publication_time():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("A", age=0.25), _item("B", age=5.0)],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, analyst=_Summarizer("ראשון", "שני"),
+                 news_monitor=monitor)._send_news(1))
+
+    text = recorder.text()
+    assert "לפני 15 דק׳" in text
+    assert "לפני 5 ש׳" in text
+    assert "שעון ישראל" in text, "the zone is stated, not left to be guessed"
+
+
+def test_a_headline_only_item_is_marked_as_such():
+    """A translated headline is not a summary of an article nobody read."""
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("Teva updates timeline")],   # no summary
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, analyst=_Summarizer("טבע עדכנה לוח זמנים"),
+                 news_monitor=monitor)._send_news(1))
+
+    assert "כותרת בלבד" in recorder.text()
+
+
+def test_an_item_with_a_blurb_is_not_marked():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("Broadcom", summary="Revenue up.")],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, analyst=_Summarizer("ברודקום"),
+                 news_monitor=monitor)._send_news(1))
+
+    assert "כותרת בלבד" not in recorder.text()
+
+
+def test_without_ai_the_original_headline_is_shown_and_explained():
+    """No key, no credit, or an outage — the screen still works and says why."""
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("Broadcom lifts guidance")],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, analyst=None, news_monitor=monitor)._send_news(1))
+
+    text = recorder.text()
+    assert "Broadcom lifts guidance" in text
+    assert "התמצות לעברית לא היה זמין" in text
+
+
+def test_a_summarised_screen_has_no_such_caveat():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("Broadcom", summary="Revenue up.")],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, analyst=_Summarizer("ברודקום"),
+                 news_monitor=monitor)._send_news(1))
+
+    assert "לא היה זמין" not in recorder.text()
+
+
+def test_link_previews_are_off_for_the_news_screen():
+    """Ten links would unfurl one picture card and bury the summaries."""
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("A")], "scanned_at": None,
+                        "sources": {"AVGO": "ticker"}, "unavailable": [],
+                        "fresh_window_hours": 24})
+    run(make_bot(recorder, news_monitor=monitor)._send_news(1))
+
+    assert recorder.last["disable_preview"] is True
+
+
+def test_a_single_symbols_news_is_summarised_too(monkeypatch):
+    recorder = Recorder()
+
+    def fake_fetch(ticker, limit=6, **kwargs):
+        return news.NewsResult(
+            items=[{**_item("Nvidia beats", ticker), "summary": "Revenue up."}],
+            source="ticker",
+        )
+
+    monkeypatch.setattr(news, "fetch", fake_fetch)
+    run(make_bot(recorder, analyst=_Summarizer("אנבידיה היכתה את התחזיות"))
+        ._send_news(1, "NVDA"))
+
+    assert "אנבידיה היכתה את התחזיות" in recorder.text()
+
+
+def test_one_publication_is_counted_in_the_singular():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("A")], "scanned_at": None,
+                        "sources": {"AVGO": "ticker"}, "unavailable": [],
+                        "fresh_window_hours": 24})
+    run(make_bot(recorder, news_monitor=monitor)._send_news(1))
+
+    assert "פרסום אחד" in recorder.text()
 
 
 def test_news_distinguishes_a_quiet_day_from_a_broken_feed():
@@ -297,16 +455,62 @@ def test_news_for_a_single_symbol_fetches_that_symbol(monkeypatch):
     assert "one stock" in recorder.text()
 
 
-def test_headlines_cannot_break_the_message_formatting():
+def test_the_news_screen_is_sent_as_html():
+    """Titles, publishers and URLs all come from the open web.
+
+    Telegram's legacy Markdown cannot be escaped, so one stray asterisk in a
+    headline — or a bracket in a URL — rejects the entire message. HTML
+    escaping is exact, which is why this screen alone does not use Markdown.
+    """
     recorder = Recorder()
     monitor = _Monitor({"items": [_item("Earnings *beat* [big]_")], "scanned_at": None,
                         "sources": {"AVGO": "ticker"}, "unavailable": [],
                         "fresh_window_hours": 24})
     run(make_bot(recorder, news_monitor=monitor)._send_news(1))
 
+    assert recorder.last["parse_mode"] == "HTML"
+    # Markdown metacharacters are now ordinary text and survive intact.
+    assert "Earnings *beat* [big]_" in recorder.text()
+
+
+def test_html_in_a_headline_is_escaped():
+    recorder = Recorder()
+    monitor = _Monitor({"items": [_item("AT&T <b>buys</b> stake")],
+                        "scanned_at": None, "sources": {"AVGO": "ticker"},
+                        "unavailable": [], "fresh_window_hours": 24})
+    run(make_bot(recorder, news_monitor=monitor)._send_news(1))
+
     text = recorder.text()
-    assert "*beat*" not in text and "[big]" not in text
-    assert "Earnings beat big" in text
+    assert "AT&amp;T" in text
+    assert "<b>buys</b>" not in text, "a feed cannot inject its own markup"
+    assert "&lt;b&gt;buys&lt;/b&gt;" in text
+
+
+def test_a_link_that_is_not_http_is_dropped():
+    """A feed URL is offered to the reader as an article; only the web is."""
+    recorder = Recorder()
+    item = {**_item("Odd item"), "link": "javascript:alert(1)"}
+    monitor = _Monitor({"items": [item], "scanned_at": None,
+                        "sources": {"AVGO": "ticker"}, "unavailable": [],
+                        "fresh_window_hours": 24})
+    run(make_bot(recorder, news_monitor=monitor)._send_news(1))
+
+    text = recorder.text()
+    assert "javascript:" not in text
+    assert "לכתבה המלאה" not in text
+    assert "Odd item" in text, "the item itself is still listed"
+
+
+def test_a_quote_in_a_url_cannot_escape_the_attribute():
+    recorder = Recorder()
+    item = {**_item("Quoted"), "link": 'https://e.com/a"onmouseover="x'}
+    monitor = _Monitor({"items": [item], "scanned_at": None,
+                        "sources": {"AVGO": "ticker"}, "unavailable": [],
+                        "fresh_window_hours": 24})
+    run(make_bot(recorder, news_monitor=monitor)._send_news(1))
+
+    assert 'onmouseover="x"' not in recorder.text()
+    assert "&quot;" in recorder.text()
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────

@@ -254,6 +254,69 @@ def test_the_quote_currency_reaches_the_event_through_evaluate():
     assert events and events[0].details["currency"] == "ILA"
 
 
+# ── Publication times ─────────────────────────────────────────────────────────
+
+def _iso(hours_ago):
+    from datetime import timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+def test_a_publication_time_carries_both_the_clock_and_the_age():
+    """"08:40" and "לפני 20 דקות" answer different questions, so both are shown."""
+    label = strip_bidi(messages.published_label(_iso(2), 2.0))
+
+    assert "לפני 2 ש׳" in label
+    assert ":" in label, "and an actual clock time"
+
+
+def test_todays_time_omits_the_date_and_an_older_one_keeps_it():
+    today = strip_bidi(messages.published_label(_iso(1), 1.0))
+    older = strip_bidi(messages.published_label(_iso(50), 50.0))
+
+    assert "/" not in today
+    assert "/" in older
+
+
+def test_minutes_hours_and_days_are_declined():
+    assert "לפני 15 דק׳" in strip_bidi(messages.published_label(None, 0.25))
+    assert "לפני 5 ש׳" in strip_bidi(messages.published_label(None, 5.0))
+    # "לפני 1 ימים" is not Hebrew, and two days has its own form.
+    assert "לפני יום" in strip_bidi(messages.published_label(None, 30.0))
+    assert "לפני יומיים" in strip_bidi(messages.published_label(None, 50.0))
+    assert "לפני 4 ימים" in strip_bidi(messages.published_label(None, 100.0))
+
+
+def test_something_published_seconds_ago_is_not_zero_minutes():
+    assert "לפני 1 דק׳" in strip_bidi(messages.published_label(None, 0.001))
+
+
+def test_the_clock_is_israel_time():
+    """News is read in Israel; a publication time is not a market-session time."""
+    from datetime import datetime as dt
+    from datetime import timezone as tz
+
+    noon_utc = dt(2026, 6, 15, 12, 0, tzinfo=tz.utc)      # 15:00 in Jerusalem (DST)
+    label = strip_bidi(messages.published_label(noon_utc.isoformat(), 1.0))
+
+    assert "15:00" in label
+
+
+def test_a_timestamp_without_a_zone_is_read_as_utc():
+    assert messages.published_label("2026-06-15T12:00:00", 1.0)
+
+
+def test_an_unparsable_timestamp_still_yields_the_age():
+    assert "לפני 3 ש׳" in strip_bidi(messages.published_label("not a date", 3.0))
+
+
+def test_an_item_with_neither_says_so_rather_than_guessing():
+    assert "ללא זמן פרסום" in messages.published_label(None, None)
+
+
+def test_a_stamp_without_an_age_is_still_shown():
+    assert ":" in messages.published_label(_iso(2), None)
+
+
 # ── What gets stored ──────────────────────────────────────────────────────────
 
 def test_the_stored_summary_is_hebrew_and_plain():

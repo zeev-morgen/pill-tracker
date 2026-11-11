@@ -15,6 +15,11 @@ from .data_feed import MIN_SESSION_FRACTION, session_elapsed_fraction
 logger = logging.getLogger(__name__)
 
 
+#: Per-item blurb budget in the analysis prompt. Five items of a full feed
+#: paragraph each would crowd out the fundamentals the same prompt carries.
+_NEWS_BLURB_LIMIT = 280
+
+
 def _news_block(result) -> str:
     """The prompt's news section, worded to match what we actually know.
 
@@ -32,6 +37,13 @@ def _news_block(result) -> str:
             when = f"לפני {age:.0f} ש׳ · " if age is not None else ""
             pub = f" — {item['publisher']}" if item.get("publisher") else ""
             lines.append(f"• {when}{item['title']}{pub}")
+            # The feed's own paragraph, when it sent one. A headline says that
+            # guidance was raised; the blurb says by how much, which is the
+            # difference between an analysis that read the news and one that
+            # read its title.
+            blurb = (item.get("summary") or "").strip()
+            if blurb:
+                lines.append(f"  {blurb[:_NEWS_BLURB_LIMIT]}")
         return "\n".join(lines)
 
     if available:
@@ -199,6 +211,40 @@ class StockAnalyst:
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             return stream.get_final_message()
+
+    def summarize_news(
+        self, system_prompt: str, prompt: str, max_tokens: int = 1400
+    ) -> str:
+        """Raw model output for a batch of headlines. Blocking.
+
+        Deliberately thin: the wording, the batching and the parsing belong to
+        :mod:`stock_monitor.news_digest`, and this is the one place that knows
+        how to talk to the API — including the verify=False retry for networks
+        with TLS inspection. No adaptive thinking: translating a supplied
+        paragraph is not a reasoning task, and the latency lands in front of
+        someone waiting in a chat.
+        """
+        def once(client: anthropic.Anthropic):
+            return client.messages.create(
+                model=self._model,
+                max_tokens=max_tokens,
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+        try:
+            msg = once(self._client)
+        except (anthropic.APIConnectionError, httpx.ConnectError) as exc:
+            logger.warning(
+                "Anthropic API connection error (%s) — retrying with SSL verify=False.",
+                exc.__class__.__name__,
+            )
+            msg = once(self._get_insecure_client())
+        return next((b.text for b in msg.content if b.type == "text"), "")
 
     def analyze(self, symbol: str, data: dict, holding=None) -> str:
         """Return a Hebrew analysis string. Blocks until the full response arrives.

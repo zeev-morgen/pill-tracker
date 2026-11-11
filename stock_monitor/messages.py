@@ -25,8 +25,10 @@ stays Hebrew.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+import pytz
 
 from . import fx
 
@@ -117,6 +119,49 @@ def _currency_of(event) -> str:
     """The quote currency for an event's symbol, from its details or its suffix."""
     details = getattr(event, "details", None) or {}
     return details.get("currency") or fx.currency_for_ticker(event.symbol) or "USD"
+
+
+#: News is read in Israel, and a publication time is not a market-session time,
+#: so it is shown in local time rather than in the ET the alerts use. Every
+#: place that prints it says which zone it is, because a timestamp whose zone
+#: the reader has to guess is worse than a relative age alone.
+ISRAEL_TZ = pytz.timezone("Asia/Jerusalem")
+
+
+def published_label(published_at: Optional[str], age_hours: Optional[float]) -> str:
+    """When an item was published: a clock time, and how long ago that was.
+
+    Both, because they answer different questions — "is this this morning's
+    news?" and "did this just happen?" — and because an item with no timestamp
+    still deserves whichever half it has.
+    """
+    stamp = ""
+    if published_at:
+        try:
+            moment = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+        except ValueError:
+            moment = None
+        if moment is not None:
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            local = moment.astimezone(ISRAEL_TZ)
+            today = datetime.now(ISRAEL_TZ).date()
+            stamp = local.strftime("%H:%M" if local.date() == today else "%d/%m %H:%M")
+
+    if age_hours is None:
+        return ltr(stamp) if stamp else "ללא זמן פרסום"
+
+    if age_hours < 1:
+        ago = f"לפני {ltr(max(int(age_hours * 60), 1))} דק׳"
+    elif age_hours < 24:
+        ago = f"לפני {ltr(f'{age_hours:.0f}')} ש׳"
+    else:
+        # "לפני 1 ימים" is not Hebrew, and two has its own form.
+        whole_days = int(age_hours // 24)
+        ago = ("לפני יום" if whole_days == 1 else
+               "לפני יומיים" if whole_days == 2 else
+               f"לפני {ltr(whole_days)} ימים")
+    return f"{ltr(stamp)} · {ago}" if stamp else ago
 
 
 def footer(session: str, timestamp: Optional[datetime] = None) -> str:

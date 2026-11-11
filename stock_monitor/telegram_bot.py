@@ -25,6 +25,7 @@ The bot runs as a background asyncio task using long-polling.
 """
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -35,7 +36,7 @@ import pytz
 import requests
 import urllib3
 
-from . import fx, messages, mute, news
+from . import fx, messages, mute, news, news_digest
 from .config import default_alerts
 from .data_feed import StockDataFeed, get_market_session, symbol_is_known
 from .messages import ltr, money, rtl
@@ -132,6 +133,19 @@ def _fmt_vol(v: int) -> str:
 def _plain(text: str) -> str:
     """Text from outside, with the characters that break Markdown removed."""
     return _MD_UNSAFE_RE.sub("", str(text or "")).strip()
+
+
+def _safe_url(url) -> str:
+    """A link fit for an href, or "" — anything but http(s) is not a news link.
+
+    Escaped for the attribute, and scheme-checked: the URL arrives from a feed,
+    and a ``javascript:`` or ``data:`` target has no business being offered to
+    the reader as an article.
+    """
+    text = str(url or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return ""
+    return html.escape(text, quote=True)
 
 
 def route(text: str) -> Optional[str]:
@@ -279,10 +293,18 @@ class TelegramCommandBot:
             return r.json().get("result", [])
         return []
 
-    def _send(self, chat_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    def _send(self, chat_id: int, text: str, reply_markup: Optional[dict] = None,
+              disable_preview: bool = False, parse_mode: str = "Markdown") -> None:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        if disable_preview:
+            # A news digest carries ten links, and Telegram would unfurl a
+            # picture card for the first one — pushing the summaries the
+            # message exists for off the screen.
+            payload["link_preview_options"] = {"is_disabled": True}
+            # The deprecated spelling, for bot API versions before 7.0.
+            payload["disable_web_page_preview"] = True
         try:
             resp = _post(f"{self._base}/sendMessage", json=payload)
             if resp.status_code == 400 and "parse" in resp.text.lower():
@@ -597,45 +619,88 @@ class TelegramCommandBot:
     # ── News ──────────────────────────────────────────────────────────────────
 
     async def _send_news(self, chat_id: int, symbol: str = "") -> None:
-        """Recent headlines — for one symbol, or for everything in the portfolio."""
+        """Recent headlines, summarised in Hebrew — one symbol or the whole portfolio."""
         if symbol:
             self._send(chat_id, rtl(f"📰 מחפש חדשות על *{ltr(symbol)}*…"))
-            result = await asyncio.to_thread(news.fetch, symbol, 5)
+            result = await asyncio.to_thread(news.fetch, symbol, 6)
+            items = await self._summarize(result.items)
             self._send(chat_id, self._news_text(
-                f"📰 *חדשות — {ltr(symbol)}*", result.items, result.available
-            ))
+                f"📰 <b>חדשות — {ltr(symbol)}</b>", items, result.available
+            ), disable_preview=True, parse_mode="HTML")
             return
 
-        self._send(chat_id, rtl("📰 אוסף כותרות…"))
+        self._send(chat_id, rtl("📰 אוסף כותרות ומתמצת לעברית…"))
         monitor = self._news
         if monitor is None:
             from .news_monitor import NewsMonitor
             monitor = self._news = NewsMonitor(portfolio_store)
         snapshot = await asyncio.to_thread(monitor.snapshot, 30)
-        items = snapshot.get("items") or []
+        items = await self._summarize(snapshot.get("items") or [])
         # Unavailable only if no ticker's feed answered — one broken ticker
         # among several is not a feed outage.
         unavailable = snapshot.get("unavailable") or []
         available = bool(snapshot.get("sources")) or not unavailable
-        text = self._news_text(
-            f"📰 *חדשות על התיק* (עד {ltr(news.FRESH_WINDOW_HOURS)} שעות)",
+        self._send(chat_id, self._news_text(
+            f"📰 <b>חדשות על התיק</b> (עד {ltr(news.FRESH_WINDOW_HOURS)} שעות)",
             items, available,
-        )
-        self._send(chat_id, text)
+        ), disable_preview=True, parse_mode="HTML")
+
+    async def _summarize(self, items: list) -> list:
+        """Hebrew summaries for a batch of items. Never fails the screen."""
+        if not items:
+            return []
+        return await asyncio.to_thread(news_digest.summarize, items, self._analyst)
 
     def _news_text(self, header: str, items: list, available: bool) -> str:
+        """The news screen: what each item says, in Hebrew, and when it was published.
+
+        A headline and a link left the reader to translate and then click
+        before finding out whether an item mattered. The Hebrew summary now
+        leads, the link trails as "לכתבה המלאה", and the publication time is on
+        every line — twice over, as a clock time and as an age, because
+        "08:40" and "לפני 20 דקות" answer different questions.
+
+        Built as HTML rather than Markdown, uniquely among the bot's screens.
+        Everything here — titles, publisher names, URLs — comes from the open
+        web, and Telegram's legacy Markdown has no escape syntax, so a single
+        stray asterisk or a bracket in a URL rejects the whole message. HTML
+        escaping is exact.
+        """
         lines = [rtl(header), ""]
         if items:
-            for item in items[:10]:
-                age = item.get("age_hours")
-                when = f"לפני {ltr(f'{age:.0f}')} ש׳ · " if age is not None else ""
-                publisher = _plain(item.get("publisher") or "")
-                title = _plain(item.get("title"))
-                link = item.get("link") or ""
-                headline = f"[{title}]({link})" if link else title
-                lines.append(rtl(f"• {when}*{ltr(item['ticker'])}* — {headline}"))
+            fallbacks = 0
+            for item in items[:news_digest.MAX_ITEMS]:
+                when = messages.published_label(
+                    item.get("published_at"), item.get("age_hours")
+                )
+                hebrew = (item.get("hebrew") or "").strip()
+                if not hebrew:
+                    hebrew, fallbacks = item.get("title") or "", fallbacks + 1
+
+                ticker = html.escape(str(item.get("ticker", "")))
+                lines.append(rtl(f"🕒 {when} · <b>{ltr(ticker)}</b>"))
+                lines.append(rtl(html.escape(hebrew)))
+                # Marked, because a translated headline is not a summary of an
+                # article — and the reader should not have to wonder which.
+                tail = ["📌 כותרת בלבד"] if item.get("headline_only") else []
+                publisher = html.escape(str(item.get("publisher") or ""))
                 if publisher:
-                    lines.append(rtl(f"   {ltr(publisher)}"))
+                    tail.append(ltr(publisher))
+                link = _safe_url(item.get("link"))
+                if link:
+                    tail.append(f'<a href="{link}">לכתבה המלאה</a>')
+                if tail:
+                    lines.append(rtl(" · ".join(tail)))
+                lines.append("")
+
+            shown = min(len(items), news_digest.MAX_ITEMS)
+            counted = "פרסום אחד" if shown == 1 else f"{ltr(shown)} פרסומים"
+            lines.append(rtl(f"🕒 השעות בשעון ישראל · {counted}"))
+            if fallbacks:
+                lines.append(rtl(
+                    "ℹ️ חלק מהפריטים מוצגים בכותרת המקורית — "
+                    "התמצות לעברית לא היה זמין כרגע."
+                ))
             return "\n".join(lines)
 
         if available:
