@@ -13,6 +13,7 @@ import pytest
 
 from stock_monitor import dashboard as _dashboard
 from stock_monitor import data_feed as _data_feed
+from stock_monitor import fundamentals as _fundamentals
 from stock_monitor import news as _news
 from stock_monitor import portfolio_risk
 from stock_monitor import telegram_bot as _telegram_bot
@@ -44,6 +45,26 @@ def no_symbol_verification(monkeypatch):
     """
     for module in (_data_feed, _dashboard, _telegram_bot):
         monkeypatch.setattr(module, "symbol_is_known", lambda symbol: None)
+
+
+@pytest.fixture(autouse=True)
+def no_fundamentals_fetching(monkeypatch):
+    """Nobody reaches Yahoo for multiples, and nobody inherits a cached answer.
+
+    ``analyze()`` fetches fundamentals, so without this an unrelated test that
+    exercises the analyst would quietly open four network connections. Tests
+    aimed at the fetcher install their own ``fundamentals.yf.Ticker``.
+    """
+    def unreachable(symbol):
+        raise AssertionError(
+            f"a test tried to fetch fundamentals for {symbol}; stub "
+            "fundamentals.yf.Ticker instead"
+        )
+
+    monkeypatch.setattr(_fundamentals.yf, "Ticker", unreachable)
+    _fundamentals.reset_cache()
+    yield
+    _fundamentals.reset_cache()
 
 
 @pytest.fixture(autouse=True)

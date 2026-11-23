@@ -21,7 +21,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import ai_analyst, chat, excel_export, fx, news
+from . import ai_analyst, chat, excel_export, fundamentals, fx, news
 # Re-exported, not just used: tests and the watchlist route both refer to
 # dashboard.symbol_is_known, and it is a question about the data feed.
 from .data_feed import symbol_is_known
@@ -554,6 +554,18 @@ async def api_news(max_age_minutes: int = 60):
     except Exception as exc:
         logger.error("News snapshot failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="שגיאה בשליפת החדשות") from exc
+
+
+@router.get("/api/diagnostics/fundamentals")
+async def api_fundamentals_diagnostics(ticker: str = "AAPL"):
+    """Which Yahoo endpoint is answering for multiples on *this* host, right now.
+
+    The analyses were reporting "אין נתון" for every multiple, and from the
+    outside that is indistinguishable from a company that has none. This names
+    the endpoint behind each figure and says whether the probe ticker — which
+    always has a P/E — came back complete.
+    """
+    return JSONResponse(await run_in_threadpool(fundamentals.status, ticker.upper()))
 
 
 @router.get("/api/diagnostics/news")

@@ -1,7 +1,6 @@
 """AI stock analysis via Claude API (claude-opus-4-7), with Hebrew output."""
 
 import logging
-import math
 from typing import Optional
 
 import anthropic
@@ -9,7 +8,7 @@ import httpx
 import urllib3
 import yfinance as yf
 
-from . import news, reference_data
+from . import fundamentals, news
 from .data_feed import MIN_SESSION_FRACTION, session_elapsed_fraction
 
 logger = logging.getLogger(__name__)
@@ -59,25 +58,6 @@ def _news_block(result) -> str:
     )
 
 
-def _fast_get(fast_info, *names):
-    """Read a fast_info field; its key naming has changed across versions.
-
-    NaN counts as missing. yfinance hands back float('nan') for fields it could
-    not resolve, and NaN is truthy — left alone it reaches the prompt as a
-    literal "nan", which is worse than saying the figure is unavailable.
-    """
-    for name in names:
-        try:
-            value = getattr(fast_info, name, None)
-            if value is None and hasattr(fast_info, "get"):
-                value = fast_info.get(name)
-            if value is not None and math.isfinite(float(value)):
-                return float(value)
-        except Exception:
-            continue
-    return None
-
-
 def friendly_error(exc: Exception) -> str:
     """What went wrong with the AI call, and what to do about it.
 
@@ -109,12 +89,6 @@ def friendly_error(exc: Exception) -> str:
         return "לא ניתן להגיע ל-Anthropic. בדוק את החיבור לרשת."
     return f"שגיאה בפנייה ל-AI ({exc.__class__.__name__})."
 
-
-def _finite_or_none(value):
-    """Drop NaN / infinity so the prompt says 'אין נתון' instead of 'nan'."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return value if math.isfinite(value) else None
-    return value
 
 _SYSTEM_PROMPT = (
     "אתה אנליסט מניות מקצועי שעונה אך ורק בעברית.\n"
@@ -253,7 +227,9 @@ class StockAnalyst:
         actual position (quantity, entry price, live P/L) is injected into the
         prompt so the recommendation is tailored to that entry point.
         """
-        extra    = self._fetch_fundamentals(symbol)
+        # The live price lets a trailing P/E be derived from earnings per share
+        # when no Yahoo endpoint will quote one.
+        extra    = self._fetch_fundamentals(symbol, price=data.get("price"))
         headlines = self._fetch_news(symbol)
         momentum = self._fetch_momentum(symbol, data)
         prompt   = self._build_prompt(symbol, data, extra, headlines, momentum, holding)
@@ -422,75 +398,19 @@ class StockAnalyst:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _fetch_fundamentals(self, symbol: str) -> dict:
-        """Valuation multiples and company facts.
+    def _fetch_fundamentals(self, symbol: str, price: Optional[float] = None) -> dict:
+        """Valuation multiples and company facts, from whichever endpoint answers.
 
-        yfinance's ``.info`` is the only source for multiples but is unreliable
-        — it regularly returns an empty payload or raises, which used to be
-        swallowed silently and rendered as 'אין נתון' across the whole section
-        with no way to tell a genuinely missing figure from a failed fetch.
-        So: retry once, fall back to ``fast_info`` for the fields it carries,
-        and fall back to the curated table for the sector.
+        The assembling lives in :mod:`stock_monitor.fundamentals`; see that
+        module for why one endpoint was never going to be enough. The dict
+        shape is unchanged, with two additions the prompt uses: ``_sources``
+        and ``_growth_basis``.
         """
-        info: dict = {}
-        for attempt in (1, 2):
-            try:
-                info = yf.Ticker(symbol).info or {}
-                if info:
-                    break
-                logger.warning(
-                    "Empty fundamentals for %s (attempt %d/2)", symbol, attempt
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Fundamentals fetch failed for %s (attempt %d/2): %s",
-                    symbol, attempt, exc,
-                )
-
-        out = {
-            "pe_ratio":            info.get("trailingPE"),
-            "forward_pe":          info.get("forwardPE"),
-            "peg_ratio":           info.get("pegRatio"),
-            "market_cap":          info.get("marketCap"),
-            "revenue_growth":      info.get("revenueGrowth"),
-            "earnings_growth":     info.get("earningsGrowth"),
-            "gross_margins":       info.get("grossMargins"),
-            "profit_margins":      info.get("profitMargins"),
-            "analyst_rating":      info.get("recommendationKey"),
-            "target_price":        info.get("targetMeanPrice"),
-            "fifty_two_high":      info.get("fiftyTwoWeekHigh"),
-            "fifty_two_low":       info.get("fiftyTwoWeekLow"),
-            "sector":              info.get("sector"),
-            "short_name":          info.get("shortName"),
-        }
-
-        # fast_info is a separate, lighter endpoint that often succeeds when
-        # .info does not. It cannot supply multiples, but it does carry market
-        # cap and the 52-week range.
-        if out["market_cap"] is None or out["fifty_two_high"] is None:
-            try:
-                fast = yf.Ticker(symbol).fast_info
-                out["market_cap"] = out["market_cap"] or _fast_get(fast, "market_cap", "marketCap")
-                out["fifty_two_high"] = out["fifty_two_high"] or _fast_get(fast, "year_high", "yearHigh")
-                out["fifty_two_low"] = out["fifty_two_low"] or _fast_get(fast, "year_low", "yearLow")
-            except Exception as exc:
-                logger.debug("fast_info fallback failed for %s: %s", symbol, exc)
-
-        # .info can also carry NaN for a field Yahoo has no value for.
-        out = {key: _finite_or_none(value) for key, value in out.items()}
-
-        if not out["sector"]:
-            out["sector"] = reference_data.lookup_sector(symbol)
-        if not out["short_name"]:
-            out["short_name"] = symbol
-
-        missing = [k for k in ("pe_ratio", "market_cap", "profit_margins") if out[k] is None]
-        if missing:
-            logger.info(
-                "Fundamentals partially unavailable for %s (missing: %s) — "
-                "the analysis will report 'אין נתון' for those",
-                symbol, ", ".join(missing),
-            )
+        figures = fundamentals.fetch(symbol, price=price)
+        out = dict(figures.values)
+        out["_sources"] = figures.sources
+        out["_growth_basis"] = figures.growth_basis
+        out["_any_data"] = figures.any_data
         return out
 
     def _fetch_news(self, symbol: str, limit: int = 5) -> news.NewsResult:
@@ -534,7 +454,9 @@ class StockAnalyst:
     @staticmethod
     def _fmt_cap(v: Optional[float]) -> str:
         if v is None:
-            return "N/A"
+            # "אין נתון", like every other missing figure in the block: an
+            # English "N/A" in a Hebrew list reads as a different kind of gap.
+            return "אין נתון"
         if v >= 1e12:
             return f"${v / 1e12:.1f}T"
         if v >= 1e9:
@@ -601,6 +523,8 @@ class StockAnalyst:
             )
         parts.append(f"• סשן: {sess}")
 
+        growth_basis = extra.get("_growth_basis")
+        basis = f" ({growth_basis})" if growth_basis else ""
         parts += [
             "",
             "**מכפילים ויסוד:**",
@@ -608,14 +532,24 @@ class StockAnalyst:
             f"• P/E עתידי: {f'{fpe:.1f}' if fpe is not None else 'אין נתון'}",
             f"• PEG: {f'{peg:.2f}' if peg is not None else 'אין נתון'}",
             f"• שווי שוק: {self._fmt_cap(extra.get('market_cap'))}",
-            f"• צמיחת הכנסות: {f'{rg * 100:.1f}%' if rg is not None else 'אין נתון'}",
-            f"• צמיחת רווחים: {f'{eg * 100:.1f}%' if eg is not None else 'אין נתון'}",
+            f"• צמיחת הכנסות{basis}: {f'{rg * 100:.1f}%' if rg is not None else 'אין נתון'}",
+            f"• צמיחת רווחים{basis}: {f'{eg * 100:.1f}%' if eg is not None else 'אין נתון'}",
             f"• מרווח גולמי: {f'{gm * 100:.1f}%' if gm is not None else 'אין נתון'}",
             f"• מרווח נקי: {f'{pm * 100:.1f}%' if pm is not None else 'אין נתון'}",
             f"• מחיר יעד אנליסטים: {f'${tp:.2f}' if tp is not None else 'אין נתון'}",
             f"• המלצת אנליסטים: {extra.get('analyst_rating') or 'אין נתון'}",
             f"• סקטור: {extra.get('sector') or 'אין נתון'}",
         ]
+        # The distinction the old prompt could not draw. A block of "אין נתון"
+        # reads as a company without multiples — a loss-making one has no P/E,
+        # after all — when in fact Yahoo refused to answer. Saying which it is
+        # keeps the analysis from treating absent data as a finding.
+        if "_any_data" in extra and not extra.get("_any_data"):
+            parts.append(
+                "⚠️ אף אחד ממקורות הנתונים לא השיב כרגע, ולכן כל השורות בסעיף "
+                "הזה ריקות — זו תקלה בשליפה, לא היעדר מכפילים במניה. "
+                "אל תסיק דבר מהיעדר הנתונים, וציין במפורש שהסעיף הזה חסר."
+            )
 
         parts += ["", _news_block(headlines)]
 
