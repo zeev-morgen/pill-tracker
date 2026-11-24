@@ -18,7 +18,6 @@ import urllib3
 from . import custom_alerts, email_notifier, messages, mute
 from .alert_engine import AlertEvent
 from .config import NotificationConfig
-from .email_notifier import EmailNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -154,11 +153,14 @@ class NotificationDispatcher:
         self._telegram: Optional[TelegramNotifier] = None
         self._discord:  Optional[DiscordNotifier]  = None
         self._desktop:  Optional[DesktopNotifier]  = None
-        # Always present: it reads the environment on each send, so mail
-        # configured after this process started still works.
-        self._email = EmailNotifier()
+        # The shared instance, so the reason a send failed is readable both
+        # here and from the diagnostics endpoint. It reads the environment on
+        # each send, so mail configured after startup still works.
+        self._email = email_notifier.notifier
         if email_notifier.is_configured():
-            logger.info("Email alerts enabled (to=%s)", email_notifier.settings()["to"])
+            logger.info("Email alerts enabled via %s (to=%s)",
+                        email_notifier.active_provider(),
+                        email_notifier.settings()["to"])
         else:
             logger.info(
                 "Email alerts not configured (missing %s) — rules that ask for "
@@ -221,11 +223,12 @@ class NotificationDispatcher:
 
         text = custom_alerts.alert_text(alert, reason, session)
         if wants_email and not emailed:
-            missing = ", ".join(email_notifier.missing_settings())
+            # The reason is known at this moment — the exception said so. Making
+            # the user go and read the host's logs for it, as this line first
+            # did, is the avoidable half of the problem.
+            why = getattr(self._email, "last_error", "") or "השליחה נכשלה."
             text += "\n" + messages.rtl(
-                "✉️ ביקשת את ההתראה הזו במייל, אבל השליחה לא יצאה לדרך"
-                + (f" (חסר: {missing})" if missing else "")
-                + " — לכן היא נשלחת כאן."
+                f"✉️ ביקשת את ההתראה הזו במייל, אבל {why} לכן היא נשלחת כאן."
             )
         elif alert.channel == "email":
             # Delivered by mail as asked; the chat gets a one-line receipt so a

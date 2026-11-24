@@ -33,8 +33,14 @@ services:
         sync: false
       - key: TRADINGVIEW_WEBHOOK_SECRET
         sync: false
-      # Optional — only for alerts you ask to receive by email. Gmail needs an
-      # App Password here, not the account password; see .env.example.
+      # Optional — only for alerts you ask to receive by email.
+      # Free Render services block outbound SMTP on 25, 465 and 587, so on the
+      # free plan use RESEND_API_KEY (an HTTPS API) rather than the SMTP_* set.
+      # See DEPLOY.md step 4.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

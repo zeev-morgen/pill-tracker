@@ -7,10 +7,12 @@ for must not disappear because the channel they chose is not configured.
 
 import asyncio
 import json
+import smtplib
 from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
+import requests
 
 from stock_monitor import custom_alerts, email_notifier, messages
 from stock_monitor import telegram_bot as tb
@@ -94,7 +96,9 @@ def clean(monkeypatch):
     monkeypatch.setattr(tb, "symbol_is_known", lambda symbol: True)
     # No SMTP in the test environment unless a test says otherwise.
     for name in (email_notifier.ENV_HOST, email_notifier.ENV_USER,
-                 email_notifier.ENV_PASSWORD, email_notifier.ENV_TO):
+                 email_notifier.ENV_PASSWORD, email_notifier.ENV_TO,
+                 email_notifier.ENV_RESEND_KEY, email_notifier.ENV_RESEND_FROM,
+                 email_notifier.ENV_PORT):
         monkeypatch.delenv(name, raising=False)
     yield
     for existing in list(custom_alert_store.all()):
@@ -268,7 +272,7 @@ def test_an_email_rule_warns_when_mail_is_not_configured():
 
     text = recorder.text()
     assert "שליחה במייל עוד לא מוגדרת" in text
-    assert "SMTP_HOST" in text, "and it names what is missing"
+    assert "RESEND_API_KEY" in text, "and it names what is missing"
 
 
 def test_no_such_warning_once_mail_is_configured(monkeypatch):
@@ -427,8 +431,9 @@ class _Telegram:
 
 
 class _Email:
-    def __init__(self, ok=True):
+    def __init__(self, ok=True, last_error=""):
         self.ok, self.sent = ok, []
+        self.last_error = last_error
 
     def send(self, subject, body, to=None):
         self.sent.append({"subject": subject, "body": body})
@@ -472,14 +477,26 @@ def test_both_channels_send_the_whole_alert(dispatcher):
 
 
 def test_a_failed_email_falls_back_to_telegram_with_the_reason(dispatcher):
-    """The alert was asked for; losing it because SMTP is unset is not an option."""
+    """The alert was asked for; losing it because mail is unset is not an option.
+
+    And the reason travels with it: the exception knew why, so sending the user
+    to read the host's logs would be the avoidable half of the problem.
+    """
     inst, telegram, email = dispatcher
-    inst._email = _Email(ok=False)
+    inst._email = _Email(ok=False, last_error="מפתח ה-API של Resend נדחה.")
     inst.dispatch_custom(rule(channel="email"), "עלתה 3.2% מהפתיחה")
 
     text = strip_bidi(telegram.sent[0])
     assert "עלתה 3.2%" in text
-    assert "SMTP_HOST" in text
+    assert "מפתח ה-API של Resend נדחה" in text
+
+
+def test_a_failure_with_no_recorded_reason_still_says_something(dispatcher):
+    inst, telegram, email = dispatcher
+    inst._email = _Email(ok=False)
+    inst.dispatch_custom(rule(channel="email"), "עלתה 3.2%")
+
+    assert "נכשלה" in strip_bidi(telegram.sent[0])
 
 
 def test_a_muted_symbol_silences_its_custom_alerts_too(dispatcher):
@@ -608,7 +625,9 @@ def test_rule_symbols_are_quoted_even_when_not_on_the_watchlist(monkeypatch):
 
 def test_email_is_not_configured_without_the_variables():
     assert email_notifier.is_configured() is False
-    assert email_notifier.ENV_HOST in email_notifier.missing_settings()
+    assert email_notifier.active_provider() == ""
+    # The one-line path is asked for first, not both providers at once.
+    assert email_notifier.ENV_RESEND_KEY in email_notifier.missing_settings()
 
 
 def test_email_is_configured_once_the_variables_are_set(monkeypatch):
@@ -643,6 +662,208 @@ def test_the_password_is_never_returned(monkeypatch):
 
 def test_sending_without_configuration_fails_quietly():
     assert email_notifier.EmailNotifier().send("נושא", "גוף") is False
+
+
+# ── Choosing a provider ───────────────────────────────────────────────────────
+
+def test_resend_is_used_when_its_key_is_set(monkeypatch):
+    monkeypatch.setenv(email_notifier.ENV_RESEND_KEY, "re_test")
+    monkeypatch.setenv(email_notifier.ENV_TO, "me@example.com")
+
+    assert email_notifier.active_provider() == "resend"
+    assert email_notifier.is_configured() is True
+
+
+def test_smtp_is_used_when_only_it_is_configured(monkeypatch):
+    monkeypatch.setenv(email_notifier.ENV_HOST, "smtp.example.com")
+    monkeypatch.setenv(email_notifier.ENV_USER, "me@example.com")
+    monkeypatch.setenv(email_notifier.ENV_PASSWORD, "app-password")
+
+    assert email_notifier.active_provider() == "smtp"
+
+
+def test_resend_wins_when_both_are_configured(monkeypatch):
+    """On a host that blocks SMTP, it is the one that can actually deliver."""
+    monkeypatch.setenv(email_notifier.ENV_RESEND_KEY, "re_test")
+    monkeypatch.setenv(email_notifier.ENV_HOST, "smtp.example.com")
+    monkeypatch.setenv(email_notifier.ENV_USER, "me@example.com")
+    monkeypatch.setenv(email_notifier.ENV_PASSWORD, "app-password")
+
+    assert email_notifier.active_provider() == "resend"
+
+
+def test_a_resend_key_without_a_recipient_is_not_configured(monkeypatch):
+    monkeypatch.setenv(email_notifier.ENV_RESEND_KEY, "re_test")
+    assert email_notifier.active_provider() == ""
+    assert email_notifier.ENV_TO in email_notifier.missing_settings()
+
+
+def test_a_half_configured_smtp_is_asked_to_be_finished(monkeypatch):
+    """Having started down one path, the user is not sent down the other."""
+    monkeypatch.setenv(email_notifier.ENV_HOST, "smtp.example.com")
+    missing = email_notifier.missing_settings()
+
+    assert email_notifier.ENV_PASSWORD in missing
+    assert email_notifier.ENV_RESEND_KEY not in missing
+
+
+def test_the_smtp_status_carries_the_render_warning(monkeypatch):
+    """A correct SMTP setup on Render's free plan looks fine and cannot deliver."""
+    monkeypatch.setenv(email_notifier.ENV_HOST, "smtp.gmail.com")
+    monkeypatch.setenv(email_notifier.ENV_USER, "me@example.com")
+    monkeypatch.setenv(email_notifier.ENV_PASSWORD, "app-password")
+
+    assert "Render" in email_notifier.status()["warning"]
+
+
+def test_the_resend_status_has_no_such_warning(monkeypatch):
+    monkeypatch.setenv(email_notifier.ENV_RESEND_KEY, "re_test")
+    monkeypatch.setenv(email_notifier.ENV_TO, "me@example.com")
+
+    assert "warning" not in email_notifier.status()
+
+
+# ── Sending through Resend ────────────────────────────────────────────────────
+
+class _Response:
+    def __init__(self, status_code=200, text='{"id": "abc"}'):
+        self.status_code, self.text = status_code, text
+
+
+@pytest.fixture
+def resend(monkeypatch):
+    monkeypatch.setenv(email_notifier.ENV_RESEND_KEY, "re_test_key")
+    monkeypatch.setenv(email_notifier.ENV_TO, "me@example.com")
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update({"url": url, "headers": headers, "body": json})
+        return captured.get("response") or _Response()
+
+    monkeypatch.setattr(email_notifier.requests, "post", fake_post)
+    return captured
+
+
+def test_a_mail_goes_out_over_https(resend):
+    notifier = email_notifier.EmailNotifier()
+    assert notifier.send("התראה: ZS", "חצתה את $233.30") is True
+
+    assert resend["url"] == email_notifier.RESEND_URL
+    assert resend["url"].startswith("https://"), "port 443, which Render allows"
+    assert resend["body"]["to"] == ["me@example.com"]
+    assert resend["body"]["subject"] == "התראה: ZS"
+    assert "233.30" in resend["body"]["text"]
+    assert notifier.last_error == ""
+
+
+def test_the_key_travels_as_a_bearer_token(resend):
+    email_notifier.EmailNotifier().send("נושא", "גוף")
+    assert resend["headers"]["Authorization"] == "Bearer re_test_key"
+
+
+def test_the_default_sender_is_resends_shared_address(resend):
+    email_notifier.EmailNotifier().send("נושא", "גוף")
+    assert resend["body"]["from"] == email_notifier.DEFAULT_FROM
+
+
+def test_a_custom_sender_is_used_when_set(resend, monkeypatch):
+    monkeypatch.setenv(email_notifier.ENV_RESEND_FROM, "alerts@mydomain.com")
+    email_notifier.EmailNotifier().send("נושא", "גוף")
+
+    assert resend["body"]["from"] == "alerts@mydomain.com"
+
+
+def test_the_own_address_only_rule_is_explained(resend):
+    """Resend's free sender delivers only to the account's own address."""
+    resend["response"] = _Response(403, json.dumps(
+        {"message": "You can only send testing emails to your own email address"}))
+    notifier = email_notifier.EmailNotifier()
+
+    assert notifier.send("נושא", "גוף") is False
+    assert "אותה כתובת של חשבון ה-Resend" in notifier.last_error
+
+
+def test_a_rejected_key_is_named_as_such(resend):
+    resend["response"] = _Response(401, json.dumps({"message": "Invalid API key"}))
+    notifier = email_notifier.EmailNotifier()
+
+    assert notifier.send("נושא", "גוף") is False
+    assert email_notifier.ENV_RESEND_KEY in notifier.last_error
+
+
+def test_an_unverified_domain_is_explained(resend):
+    resend["response"] = _Response(422, json.dumps(
+        {"message": "The example.com domain is not verified"}))
+    notifier = email_notifier.EmailNotifier()
+    notifier.send("נושא", "גוף")
+
+    assert "מאומת" in notifier.last_error
+
+
+def test_a_rate_limit_says_to_wait(resend):
+    resend["response"] = _Response(429, "{}")
+    notifier = email_notifier.EmailNotifier()
+    notifier.send("נושא", "גוף")
+
+    assert "מגבלת השליחה" in notifier.last_error
+
+
+def test_a_network_failure_does_not_raise(resend, monkeypatch):
+    def boom(*args, **kwargs):
+        raise requests.ConnectionError("dns failure")
+
+    monkeypatch.setattr(email_notifier.requests, "post", boom)
+    notifier = email_notifier.EmailNotifier()
+
+    assert notifier.send("נושא", "גוף") is False
+    assert notifier.last_error
+
+
+def test_the_reason_is_readable_from_the_diagnostics(resend):
+    resend["response"] = _Response(401, json.dumps({"message": "Invalid API key"}))
+    email_notifier.notifier.send("נושא", "גוף")
+
+    assert email_notifier.ENV_RESEND_KEY in email_notifier.status()["last_error"]
+
+
+def test_a_success_clears_the_previous_reason(resend):
+    notifier = email_notifier.EmailNotifier()
+    notifier.last_error = "משהו קודם"
+    notifier.send("נושא", "גוף")
+
+    assert notifier.last_error == ""
+
+
+# ── What a failure says ───────────────────────────────────────────────────────
+
+def test_a_blocked_port_is_named_as_the_likely_cause():
+    """The failure this whole provider split exists for."""
+    message = email_notifier.friendly_error(TimeoutError("timed out"))
+
+    assert "Render" in message and "SMTP" in message
+
+
+def test_a_rejected_password_points_at_the_app_password():
+    message = email_notifier.friendly_error(
+        smtplib.SMTPAuthenticationError(535, b"Username and Password not accepted"))
+
+    assert "App Password" in message
+
+
+def test_a_wrong_port_for_the_handshake_is_named():
+    assert "465" in email_notifier.friendly_error(
+        smtplib.SMTPNotSupportedError("STARTTLS extension not supported"))
+
+
+def test_a_refused_recipient_points_at_the_recipient_variable():
+    message = email_notifier.friendly_error(
+        smtplib.SMTPRecipientsRefused({"x@y.com": (550, b"no such user")}))
+
+    assert email_notifier.ENV_TO in message
+
+
+def test_an_unrecognised_failure_still_names_its_class():
+    assert "ValueError" in email_notifier.friendly_error(ValueError("odd"))
 
 
 class _SMTP:
