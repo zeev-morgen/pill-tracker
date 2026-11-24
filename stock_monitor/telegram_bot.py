@@ -88,6 +88,8 @@ _COMMANDS: Dict[str, str] = {
     "MANAGE": "manage", "ניהול": "manage", "ניהול מניות": "manage",
     "ALERT": "new_alert", "התראה חדשה": "new_alert", "NEWALERT": "new_alert",
     "חדשה": "new_alert",
+    "TESTMAIL": "email_test", "בדיקת מייל": "email_test",
+    "מייל בדיקה": "email_test", "בדיקת אימייל": "email_test",
     "WATCHLIST": "manage", "ניהול התראות": "manage",
 }
 
@@ -418,6 +420,8 @@ class TelegramCommandBot:
             await self._send_manage(chat_id)
         elif command == "new_alert":
             self._ask_for_alert_request(chat_id)
+        elif command == "email_test":
+            await self._send_email_test(chat_id)
         elif custom_alerts.looks_like_request(text):
             # A sentence rather than a command: "תתריע לי כש…". Read as an
             # alert request without the user having to find a button first,
@@ -481,6 +485,10 @@ class TelegramCommandBot:
             mute.unmute(symbol)
             self._answer_callback(cb_id, "ההשתקה בוטלה")
             await self._send_alerts(chat_id)
+            return
+        if data == "email_test":
+            self._answer_callback(cb_id, "שולח…")
+            await self._send_email_test(chat_id)
             return
         if data == "ca_new":
             self._answer_callback(cb_id)
@@ -1064,6 +1072,33 @@ class TelegramCommandBot:
                        {"text": "🔔 ההתראות שלי", "callback_data": "alerts"}
                    ]]})
 
+    async def _send_email_test(self, chat_id: int) -> None:
+        """Send one test mail now and report the result, whatever it is.
+
+        The point is to learn whether mail works without having to write a
+        rule and wait for the market to satisfy it — which is how a blocked
+        SMTP port stayed hidden until a real alert needed it.
+        """
+        self._send(chat_id, rtl("✉️ שולח מייל בדיקה…"))
+        result = await asyncio.to_thread(email_notifier.send_test)
+
+        if result["sent"]:
+            self._send(chat_id, "\n".join([
+                rtl(f"✅ *מייל הבדיקה נשלח אל {ltr(result['to'])}.*"),
+                rtl(f"דרך: {ltr(result['provider'])}"),
+                rtl("אם הוא לא מופיע בתיבה תוך דקה — בדוק בספאם."),
+            ]))
+            return
+
+        lines = [rtl("❌ *מייל הבדיקה לא נשלח.*"),
+                 rtl(result["error"])]
+        if not email_notifier.is_configured():
+            lines.append(rtl(
+                "הדרך הקצרה: הגדר `RESEND_API_KEY` ו-`ALERT_EMAIL_TO`. "
+                "ההוראות ב-DEPLOY.md, שלב 4."
+            ))
+        self._send(chat_id, "\n".join(lines))
+
     async def _remove_custom_alert(self, chat_id: int, rule_id: str) -> None:
         rule = await asyncio.to_thread(custom_alert_store.get, rule_id)
         removed = await asyncio.to_thread(custom_alert_store.remove, _as_id(rule_id))
@@ -1146,8 +1181,20 @@ class TelegramCommandBot:
         else:
             lines += ["", rtl("עדיין לא נשלחו התראות.")]
 
+        mail = email_notifier.status()
+        if mail["configured"]:
+            lines += ["", rtl(f"✉️ מייל: {ltr(mail['provider'])} → "
+                              f"{ltr(mail['to'])}")]
+            if mail.get("last_error"):
+                lines.append(rtl("⚠️ השליחה האחרונה נכשלה: "
+                                 + mail["last_error"]))
+        else:
+            names = ", ".join(f"`{name}`" for name in mail["missing"])
+            lines += ["", rtl(f"✉️ מייל: לא מוגדר (חסר {names})")]
+
         buttons = [[{"text": "🔔 התראה חדשה בשפה חופשית",
-                     "callback_data": "ca_new"}]]
+                     "callback_data": "ca_new"}],
+                   [{"text": "✉️ שלח מייל בדיקה", "callback_data": "email_test"}]]
         buttons += [rule_buttons[i:i + 2] for i in range(0, len(rule_buttons), 2)]
         buttons.append(
             [{"text": "🔕 השתק הכול לשעה", "callback_data": f"mute:{mute.ALL}:60"},

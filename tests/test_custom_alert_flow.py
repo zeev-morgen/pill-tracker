@@ -834,6 +834,143 @@ def test_a_success_clears_the_previous_reason(resend):
     assert notifier.last_error == ""
 
 
+# ── Sending a test on demand ──────────────────────────────────────────────────
+
+def test_a_test_mail_goes_through_the_real_path(resend):
+    """The point: learn whether mail works without waiting for a real alert."""
+    result = email_notifier.send_test()
+
+    assert result["sent"] is True
+    assert result["provider"] == "resend"
+    assert result["to"] == "me@example.com"
+    assert result["error"] == ""
+    assert resend["body"]["subject"] == email_notifier.TEST_SUBJECT
+
+
+def test_the_test_mail_says_it_is_a_test_and_asks_for_nothing(resend):
+    email_notifier.send_test()
+    body = resend["body"]["text"]
+
+    assert "בדיקה" in body
+    assert "לא נדרשת שום פעולה" in body
+
+
+def test_the_test_mail_shows_what_a_real_alert_looks_like(resend):
+    email_notifier.send_test()
+    assert "ZS" in resend["body"]["text"]
+
+
+def test_a_test_can_be_sent_to_another_address(resend):
+    email_notifier.send_test("someone@example.com")
+    assert resend["body"]["to"] == ["someone@example.com"]
+
+
+def test_a_failed_test_reports_the_provider_s_own_reason(resend):
+    resend["response"] = _Response(401, json.dumps({"message": "Invalid API key"}))
+    result = email_notifier.send_test()
+
+    assert result["sent"] is False
+    assert email_notifier.ENV_RESEND_KEY in result["error"]
+
+
+def test_a_test_without_any_configuration_says_what_is_missing():
+    result = email_notifier.send_test()
+
+    assert result["sent"] is False
+    assert result["provider"] == "none"
+    assert email_notifier.ENV_RESEND_KEY in result["error"]
+
+
+def test_the_bot_reports_a_successful_test(resend):
+    recorder = Recorder()
+    run(make_bot(recorder)._send_email_test(1))
+
+    text = recorder.text()
+    assert "נשלח" in text and "me@example.com" in text
+
+
+def test_the_bot_reports_a_failed_test_with_the_reason(resend):
+    resend["response"] = _Response(401, json.dumps({"message": "Invalid API key"}))
+    recorder = Recorder()
+    run(make_bot(recorder)._send_email_test(1))
+
+    text = recorder.text()
+    assert "לא נשלח" in text
+    assert "RESEND_API_KEY" in text
+
+
+def test_an_unconfigured_test_points_at_the_short_path():
+    recorder = Recorder()
+    run(make_bot(recorder)._send_email_test(1))
+
+    assert "RESEND_API_KEY" in recorder.text()
+    assert "DEPLOY.md" in recorder.text()
+
+
+def test_the_alerts_screen_offers_the_test_and_states_the_mail_setup(monkeypatch,
+                                                                    resend):
+    monkeypatch.setattr(tb.alert_store, "recent", lambda n=5: [])
+    recorder = Recorder()
+    run(make_bot(recorder)._send_alerts(1))
+
+    text = recorder.text()
+    assert "מייל: resend" in text and "me@example.com" in text
+    data = [b["callback_data"] for row in recorder.last["reply_markup"]["inline_keyboard"]
+            for b in row]
+    assert "email_test" in data
+
+
+def test_the_alerts_screen_says_when_mail_is_unconfigured(monkeypatch):
+    monkeypatch.setattr(tb.alert_store, "recent", lambda n=5: [])
+    recorder = Recorder()
+    run(make_bot(recorder)._send_alerts(1))
+
+    assert "מייל: לא מוגדר" in recorder.text()
+    assert "RESEND_API_KEY" in recorder.text()
+
+
+def test_the_alerts_screen_surfaces_the_last_failure(monkeypatch, resend):
+    monkeypatch.setattr(tb.alert_store, "recent", lambda n=5: [])
+    resend["response"] = _Response(401, json.dumps({"message": "Invalid API key"}))
+    email_notifier.notifier.send("נושא", "גוף")
+
+    recorder = Recorder()
+    run(make_bot(recorder)._send_alerts(1))
+
+    assert "השליחה האחרונה נכשלה" in recorder.text()
+
+
+@pytest.mark.parametrize("text", ["בדיקת מייל", "/testmail", "מייל בדיקה"])
+def test_the_test_can_be_asked_for_by_typing(text):
+    from stock_monitor.telegram_bot import route
+
+    assert route(text) == "email_test"
+
+
+def test_the_route_sends_a_test(resend):
+    from fastapi.testclient import TestClient
+
+    from stock_monitor.webhook_server import create_webhook_app
+
+    client = TestClient(create_webhook_app(
+        NotificationDispatcher(NotificationConfig()), ""))
+    body = client.post("/api/diagnostics/email/test").json()
+
+    assert body["sent"] is True
+
+
+def test_sending_a_test_is_not_a_get(resend):
+    """A GET with an effect fires on every link preview and crawler."""
+    from fastapi.testclient import TestClient
+
+    from stock_monitor.webhook_server import create_webhook_app
+
+    client = TestClient(create_webhook_app(
+        NotificationDispatcher(NotificationConfig()), ""))
+
+    assert client.get("/api/diagnostics/email/test").status_code == 405
+
+
 # ── What a failure says ───────────────────────────────────────────────────────
 
 def test_a_blocked_port_is_named_as_the_likely_cause():
@@ -864,6 +1001,20 @@ def test_a_refused_recipient_points_at_the_recipient_variable():
 
 def test_an_unrecognised_failure_still_names_its_class():
     assert "ValueError" in email_notifier.friendly_error(ValueError("odd"))
+
+
+def test_variable_names_survive_the_trip_to_a_markdown_chat():
+    """They are instructions to copy; an underscore eaten by Markdown is a typo.
+
+    A code span carries them through legacy Markdown intact, which stripping
+    the underscores — as the chat helper does for text from the open web —
+    did not: RESEND_API_KEY arrived as RESENDAPIKEY.
+    """
+    message = email_notifier._http_error(
+        401, json.dumps({"message": "Invalid API key"}))
+
+    assert "RESEND_API_KEY" in message
+    assert "`" in message, "wrapped as code, so the underscores are literal"
 
 
 class _SMTP:

@@ -567,6 +567,20 @@ async def api_email_diagnostics():
     return JSONResponse(email_notifier.status())
 
 
+@router.post("/api/diagnostics/email/test")
+async def api_email_test(payload: dict = Body(default=None)):
+    """Send one test mail now and report what happened.
+
+    POST rather than GET because it has an effect in the world: a GET that
+    sends mail would fire on every link preview and every crawler. The bot's
+    "✉️ שלח מייל בדיקה" button is the same call.
+    """
+    recipient = (payload or {}).get("to")
+    return JSONResponse(
+        await run_in_threadpool(email_notifier.send_test, recipient)
+    )
+
+
 @router.get("/api/diagnostics/fundamentals")
 async def api_fundamentals_diagnostics(ticker: str = "AAPL"):
     """Which Yahoo endpoint is answering for multiples on *this* host, right now.

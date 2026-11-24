@@ -160,9 +160,9 @@ def friendly_error(exc: Exception) -> str:
             "(16 תווים, עם אימות דו-שלבי מופעל) ולא סיסמת החשבון."
         )
     if isinstance(exc, smtplib.SMTPRecipientsRefused):
-        return f"כתובת הנמען נדחתה — בדוק את {ENV_TO}."
+        return f"כתובת הנמען נדחתה — בדוק את `{ENV_TO}`."
     if isinstance(exc, smtplib.SMTPSenderRefused):
-        return f"כתובת השולח נדחתה — היא חייבת להיות אותה כתובת של {ENV_USER}."
+        return f"כתובת השולח נדחתה — היא חייבת להיות אותה כתובת של `{ENV_USER}`."
     if isinstance(exc, smtplib.SMTPNotSupportedError):
         return "השרת לא תומך ב-STARTTLS בפורט הזה. נסה SMTP_PORT=465."
     if isinstance(exc, ssl.SSLError):
@@ -190,13 +190,13 @@ def _http_error(status: int, body: str) -> str:
     if status in (401, 403) and "own email address" in detail.lower():
         return (
             "Resend מאפשר שליחה רק לכתובת שבה נרשמת אליו, כל עוד לא אימתת "
-            f"דומיין. ודא ש-{ENV_TO} היא אותה כתובת של חשבון ה-Resend."
+            f"דומיין. ודא ש-`{ENV_TO}` היא אותה כתובת של חשבון ה-Resend."
         )
     if status in (401, 403):
-        return f"מפתח ה-API של Resend נדחה — בדוק את {ENV_RESEND_KEY}."
+        return f"מפתח ה-API של Resend נדחה — בדוק את `{ENV_RESEND_KEY}`."
     if status == 422:
         return (f"Resend דחה את הבקשה: {detail or 'נתונים לא תקינים'}. "
-                f"אם הגדרת {ENV_RESEND_FROM} — הדומיין שבו חייב להיות מאומת.")
+                f"אם הגדרת `{ENV_RESEND_FROM}` — הדומיין שבו חייב להיות מאומת.")
     if status == 429:
         return "חרגת ממגבלת השליחה של Resend. נסה שוב בעוד כמה דקות."
     return f"Resend החזיר שגיאה {status}{f': {detail}' if detail else ''}."
@@ -303,6 +303,47 @@ class _HttpRejection(Exception):
 #: Shared instance, so ``last_error`` from the most recent send is readable by
 #: the diagnostics endpoint as well as by the dispatcher that sent it.
 notifier = EmailNotifier()
+
+TEST_SUBJECT = "בדיקה: התראות המניות שלך"
+TEST_BODY = "\n".join([
+    "זו הודעת בדיקה שנשלחה ביוזמתך מתוך מערכת מעקב המניות.",
+    "",
+    "אם הגיעה — שליחת המייל עובדת, והתראות שתגדיר עם 'במייל' יגיעו לכאן.",
+    "כך תיראה התראה אמיתית:",
+    "",
+    "    ZS — חצתה את $233.30 כלפי מעלה (מחיר נוכחי $233.57)",
+    "    הבקשה שהגדרת: תתריע במייל אם ZS חוצה את מחיר 233.3",
+    "",
+    "לא נדרשת שום פעולה בעקבות ההודעה הזו.",
+])
+
+
+def send_test(to: Optional[str] = None) -> dict:
+    """Send one test message on demand, and report exactly what happened.
+
+    Without this, the only way to find out whether mail works was to write a
+    rule, wait for the market to satisfy it, and see whether anything arrived —
+    which is how a blocked SMTP port went unnoticed until a real alert needed
+    it. This runs the same code path a real alert takes, on the host that will
+    take it, and hands back the provider's own answer.
+    """
+    provider = active_provider()
+    if not provider:
+        missing = ", ".join(missing_settings())
+        return {
+            "sent": False, "provider": "none",
+            "to": settings()["to"],
+            "error": f"שליחת מייל אינה מוגדרת (חסר {missing}).",
+        }
+
+    recipient = (to or settings()["to"]).strip()
+    sent = notifier.send(TEST_SUBJECT, TEST_BODY, recipient)
+    return {
+        "sent": sent,
+        "provider": provider,
+        "to": recipient,
+        "error": "" if sent else notifier.last_error,
+    }
 
 
 def status() -> dict:
