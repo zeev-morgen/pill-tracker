@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 
 import uvicorn
 
-from . import db, messages
+from . import custom_alerts, db, messages
 from .alert_engine import AlertEngine
 from .config import AppConfig, StockConfig, default_alerts, load_config
 from .dashboard import (
@@ -45,7 +45,12 @@ from .earnings import EarningsMonitor
 from .news_monitor import NewsMonitor
 from .notifier import NotificationDispatcher
 from .scheduler import MarketScheduler
-from .store import alert_store, portfolio_store, watchlist_store
+from .store import (
+    alert_store,
+    custom_alert_store,
+    portfolio_store,
+    watchlist_store,
+)
 from .telegram_bot import TelegramCommandBot
 from .version import build_label, record_startup
 from .webhook_server import create_webhook_app
@@ -179,11 +184,19 @@ class StockMonitorApp:
         stock_map = {sc.symbol: sc for sc in self.watched_stocks()}
         prune_price_cache(stock_map)
 
+        # Symbols a user-written rule refers to have to be quoted too, even
+        # when they are not on the watchlist — a rule about a stock nobody is
+        # polling would simply never be evaluated.
+        rules = custom_alert_store.all(include_disabled=False)
+        rule_symbols = sorted({r.symbol for r in rules} - set(stock_map))
+
         # One request for the whole watchlist. Quoting each symbol separately
         # cost 26 requests a minute for thirteen symbols — 1,560 an hour, which
         # is what Yahoo started rate-limiting, and a throttled account then
         # fails to return the pre-market bars the dashboard is waiting for.
-        quotes = self.data_feed.get_current_data_batch(list(stock_map))
+        quotes = self.data_feed.get_current_data_batch(
+            list(stock_map) + rule_symbols
+        )
 
         for symbol, stock_cfg in stock_map.items():
             try:
@@ -224,6 +237,49 @@ class StockMonitorApp:
 
             except Exception as exc:
                 self._log.error("Error monitoring %s: %s", symbol, exc, exc_info=True)
+
+        self._run_custom_rules(rules, quotes, session)
+
+    def _run_custom_rules(self, rules, quotes: Dict, session: str) -> None:
+        """Evaluate the rules the user wrote in their own words.
+
+        Kept apart from the configured alerts because the failure modes differ:
+        one bad rule — a symbol that has stopped quoting, a moving average with
+        no history — must not stop the others, and must not stop the built-in
+        alerts that ran above it either.
+        """
+        for rule in rules:
+            try:
+                if rule.on_cooldown():
+                    continue
+                data = quotes.get(rule.symbol)
+                if data is None:
+                    data = self.data_feed.get_current_data(rule.symbol)
+                if data is None:
+                    self._log.warning(
+                        "No data for %s — custom alert %s not evaluated",
+                        rule.symbol, rule.id,
+                    )
+                    continue
+
+                reason = custom_alerts.evaluate(rule, data, feed=self.data_feed)
+                if not reason:
+                    continue
+
+                self.dispatcher.dispatch_custom(rule, reason, session)
+                custom_alert_store.mark_fired(rule.id, disable=rule.once)
+                alert_store.add(
+                    symbol=rule.symbol,
+                    alert_type=f"custom:{rule.kind}",
+                    message=custom_alerts._plain(reason),
+                    severity="INFO",
+                )
+            except Exception as exc:
+                self._log.error(
+                    "Error evaluating custom alert %s for %s: %s",
+                    getattr(rule, "id", "?"), getattr(rule, "symbol", "?"), exc,
+                    exc_info=True,
+                )
 
     # ── Telegram ──────────────────────────────────────────────────────────────
 

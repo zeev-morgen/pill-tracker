@@ -24,6 +24,7 @@ from datetime import date, datetime, timezone
 from typing import Iterator, Optional
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -120,6 +121,36 @@ class ClosedPositionRow(Base):
     personal_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class CustomAlertRow(Base):
+    """An alert the user asked for in their own words.
+
+    ``params`` is JSON text rather than columns because each kind takes
+    different fields — a percentage and a direction, or a moving-average
+    length — and a column per field across every future kind would be a wide
+    table of mostly-NULLs. ``request`` keeps the sentence the user actually
+    typed, which is the only record of what they meant as opposed to what was
+    parsed out of it.
+    """
+
+    __tablename__ = "custom_alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    params: Mapped[str] = mapped_column(Text, default="{}")
+    channel: Mapped[str] = mapped_column(String(16), default="telegram")
+    request: Mapped[str] = mapped_column(Text, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    once: Mapped[bool] = mapped_column(Boolean, default=False)
+    cooldown_minutes: Mapped[int] = mapped_column(Integer, default=1440)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_fired_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

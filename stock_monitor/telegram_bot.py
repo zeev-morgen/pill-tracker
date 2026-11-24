@@ -36,12 +36,18 @@ import pytz
 import requests
 import urllib3
 
-from . import fx, messages, mute, news, news_digest
+from . import custom_alerts, email_notifier, fx, messages, mute, news, news_digest
 from .config import default_alerts
 from .data_feed import StockDataFeed, get_market_session, symbol_is_known
 from .messages import ltr, money, rtl
 from .portfolio_risk import PortfolioRiskAnalyzer
-from .store import HoldingError, alert_store, portfolio_store, watchlist_store
+from .store import (
+    HoldingError,
+    alert_store,
+    custom_alert_store,
+    portfolio_store,
+    watchlist_store,
+)
 
 logger = logging.getLogger(__name__)
 NYSE_TZ = pytz.timezone("America/New_York")
@@ -80,6 +86,8 @@ _COMMANDS: Dict[str, str] = {
     "SUMMARY": "summary", "סיכום": "summary", "DIGEST": "summary",
     "ALERTS": "alerts", "התראות": "alerts", "MUTE": "alerts", "השתקה": "alerts",
     "MANAGE": "manage", "ניהול": "manage", "ניהול מניות": "manage",
+    "ALERT": "new_alert", "התראה חדשה": "new_alert", "NEWALERT": "new_alert",
+    "חדשה": "new_alert",
     "WATCHLIST": "manage", "ניהול התראות": "manage",
 }
 
@@ -94,6 +102,9 @@ MENU_KEYBOARD = {
     "is_persistent": True,
     "input_field_placeholder": "שלח טיקר, למשל AVGO",
 }
+
+_CHANNEL_HE = {"telegram": "טלגרם", "email": "אימייל ✉️",
+               "both": "טלגרם + אימייל"}
 
 _SESSION_HE = {
     "pre":     "טרום מסחר 🌅",
@@ -116,6 +127,11 @@ _HELP_TEXT = "\n".join([
     rtl("• 🔔 *התראות* ← מה הושתק, מה נשלח לאחרונה, והשתקה בלחיצה"),
     rtl("• ⚙️ *ניהול מניות* ← הוספה והסרה של מניות מהמעקב, בלחיצה"),
     "",
+    rtl("🔔 *התראה בשפה חופשית* — פשוט תכתוב מה שאתה רוצה:"),
+    rtl(f"  {ltr('תתריע לי כשמניית AVGO עולה 3% מנקודת הפתיחה')}"),
+    rtl(f"  {ltr('תעדכן אותי כשORCL חוצה כלפי מעלה את ממוצע 150 יום')}"),
+    rtl("אציג לך מה הבנתי, ואשמור רק אחרי שתאשר. אפשר גם לבקש התראה במייל."),
+    "",
     rtl(f"גם בהקלדה: {ltr('`הוסף AVGO`')} או {ltr('`הסר AVGO`')}."),
 ])
 
@@ -133,6 +149,16 @@ def _fmt_vol(v: int) -> str:
 def _plain(text: str) -> str:
     """Text from outside, with the characters that break Markdown removed."""
     return _MD_UNSAFE_RE.sub("", str(text or "")).strip()
+
+
+def _as_id(raw):
+    """A rule id from a callback payload: int where it is one, else the text.
+
+    Rules created without a database carry negative ids, so the sign is part
+    of the number rather than a separator.
+    """
+    text = str(raw)
+    return int(text) if text.lstrip("-").isdigit() else text
 
 
 def _safe_url(url) -> str:
@@ -249,6 +275,10 @@ class TelegramCommandBot:
         #: The only conversational state here: "➕ הוסף מניה" has to be
         #: followed by a ticker, and a button cannot carry one.
         self._pending: Dict[int, tuple] = {}
+        #: chat_id → (parsed but unsaved rule, when it was parsed). A rule read
+        #: out of a sentence is confirmed before it is stored, and a button
+        #: cannot carry a rule, so it waits here for the yes.
+        self._parsed: Dict[int, tuple] = {}
         self._offset             = 0
 
     @property
@@ -347,10 +377,12 @@ class TelegramCommandBot:
         # A pending "send me a ticker" wins over the ticker-shaped fallback, so
         # a bare AVGO adds the stock instead of quoting it. Any menu command
         # cancels the wait: tapping elsewhere is as good as saying never mind.
-        if self._take_pending(chat_id) and not command:
-            if add_match or remove_match:
-                pass        # an explicit "הוסף X" says what it wants
-            else:
+        pending = self._take_pending(chat_id) if not command else ""
+        if pending == "custom_alert":
+            await self._read_alert_request(chat_id, text)
+            return
+        if pending == "add_symbol":
+            if not (add_match or remove_match):   # an explicit "הוסף X" wins
                 await self._add_symbol(chat_id, text)
                 return
 
@@ -384,6 +416,13 @@ class TelegramCommandBot:
             await self._send_alerts(chat_id)
         elif command == "manage":
             await self._send_manage(chat_id)
+        elif command == "new_alert":
+            self._ask_for_alert_request(chat_id)
+        elif custom_alerts.looks_like_request(text):
+            # A sentence rather than a command: "תתריע לי כש…". Read as an
+            # alert request without the user having to find a button first,
+            # which is the whole point of asking in your own words.
+            await self._read_alert_request(chat_id, text)
         elif add_match:
             await self._add_symbol(chat_id, add_match.group(1))
         elif remove_match:
@@ -441,6 +480,36 @@ class TelegramCommandBot:
             symbol = data.split(":", 1)[1]
             mute.unmute(symbol)
             self._answer_callback(cb_id, "ההשתקה בוטלה")
+            await self._send_alerts(chat_id)
+            return
+        if data == "ca_new":
+            self._answer_callback(cb_id)
+            self._ask_for_alert_request(chat_id)
+            return
+        if data == "ca_ok":
+            self._answer_callback(cb_id, "נשמר")
+            await self._save_parsed_alert(chat_id)
+            return
+        if data == "ca_cancel":
+            self._parsed.pop(chat_id, None)
+            self._answer_callback(cb_id, "בוטל")
+            self._send(chat_id, rtl("❌ ההגדרה בוטלה. לא נשמר כלום."))
+            return
+        if data.startswith("ca_rm:"):
+            self._answer_callback(cb_id)
+            await self._remove_custom_alert(chat_id, data.split(":", 1)[1])
+            return
+        if data.startswith("ca_on:"):
+            # A one-time rule disables itself when it fires; re-arming it is
+            # the natural next thing to want, and deleting and re-dictating it
+            # would be the alternative.
+            rule_id = data.split(":", 1)[1]
+            self._answer_callback(cb_id, "הופעלה")
+            await asyncio.to_thread(custom_alert_store.set_enabled, _as_id(rule_id), True)
+            await self._send_alerts(chat_id)
+            return
+        if data == "alerts":
+            self._answer_callback(cb_id)
             await self._send_alerts(chat_id)
             return
         if data == "wl_add":
@@ -891,6 +960,121 @@ class TelegramCommandBot:
                        "ולכן המערכת חוזרת לרשימה שב-`config.yaml`.")
         await self._send_manage(chat_id, notice=notice, undo=symbol)
 
+    # ── Alerts asked for in your own words ────────────────────────────────────
+
+    def _ask_for_alert_request(self, chat_id: int) -> None:
+        self._pending[chat_id] = ("custom_alert", time.monotonic())
+        self._send(chat_id, "\n".join([
+            rtl("🔔 *מה להתריע לך?*"),
+            rtl("כתוב בשפה חופשית. לדוגמה:"),
+            "",
+            rtl(f"• {ltr('תתריע לי כשמניית AVGO עולה 3% מנקודת הפתיחה')}"),
+            rtl(f"• {ltr('תעדכן אותי כשORCL חוצה כלפי מעלה את ממוצע 150 יום')}"),
+            rtl(f"• {ltr('הודע לי במייל אם TEVA.TA יורדת מתחת ל-1800 אגורות')}"),
+            "",
+            rtl("אקרא את הבקשה, אציג לך מה הבנתי, ואשמור רק אחרי שתאשר."),
+        ]))
+
+    async def _read_alert_request(self, chat_id: int, text: str) -> None:
+        """Parse a request, verify the symbol, and ask for confirmation.
+
+        Nothing is saved here. A misread rule is worse than a refused one — it
+        either never fires, and a move passes in silence, or it fires on the
+        wrong condition — so the parse is always read back first.
+        """
+        self._send(chat_id, rtl("🧠 קורא את הבקשה…"))
+        result = await asyncio.to_thread(
+            custom_alerts.parse_request, text, self._analyst
+        )
+        if not result.ok:
+            self._send(chat_id, "\n".join([
+                rtl(f"❌ {result.error}"),
+                "",
+                rtl(f"אפשר לבקש: {custom_alerts.available_kinds_he()}."),
+            ]), reply_markup={"inline_keyboard": [[
+                {"text": "🔔 לנסות שוב", "callback_data": "ca_new"}
+            ]]})
+            return
+
+        alert = result.alert
+        known = await asyncio.to_thread(symbol_is_known, alert.symbol)
+        if known is False:
+            self._send(chat_id, "\n".join([
+                rtl(f"❌ לא נמצאו נתונים עבור *{ltr(alert.symbol)}*."),
+                rtl(f"בדוק את הסמל — מניות בתל אביב מסתיימות ב-{ltr('.TA')}."),
+            ]))
+            return
+
+        self._parsed[chat_id] = (alert, time.monotonic())
+        lines = [
+            rtl("🔎 *זה מה שהבנתי:*"),
+            "",
+            rtl(f"📈 מניה: *{ltr(alert.symbol)}*"),
+            rtl(f"🎯 התנאי: {alert.describe()}"),
+            rtl(f"📬 ערוץ: {_CHANNEL_HE[alert.channel]}"),
+        ]
+        if alert.once:
+            lines.append(rtl("🔂 חד-פעמי: ההתראה תכובה אחרי שתישלח."))
+        else:
+            lines.append(rtl(
+                f"🔁 חוזר: לכל היותר פעם ב-{ltr(alert.cooldown_minutes // 60)} שעות."
+            ))
+        if result.explain:
+            lines += ["", rtl(f"💬 {_plain(result.explain)}")]
+        if alert.channel in ("email", "both") and not email_notifier.is_configured():
+            missing = ", ".join(email_notifier.missing_settings())
+            lines += ["", rtl(
+                f"⚠️ שליחה במייל עוד לא מוגדרת (חסר {ltr(missing)}) — "
+                "עד שתוגדר, ההתראה תגיע לכאן."
+            )]
+        if alert.symbol not in self._syms:
+            lines += ["", rtl(f"ℹ️ {ltr(alert.symbol)} אינה ברשימת המעקב — "
+                              "אוסיף אותה לניטור כדי שהתנאי ייבדק.")]
+        lines += ["", rtl("לאשר?")]
+
+        self._send(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": [[
+            {"text": "✅ אישור", "callback_data": "ca_ok"},
+            {"text": "✏️ ננסח מחדש", "callback_data": "ca_new"},
+            {"text": "❌ ביטול", "callback_data": "ca_cancel"},
+        ]]})
+
+    async def _save_parsed_alert(self, chat_id: int) -> None:
+        entry = self._parsed.pop(chat_id, None)
+        if entry is None:
+            self._send(chat_id, rtl("ההגדרה כבר לא בתוקף. שלח את הבקשה מחדש."))
+            return
+        alert, started = entry
+        if time.monotonic() - started > self.PENDING_TTL:
+            self._send(chat_id, rtl("עבר יותר מדי זמן מאז הבקשה. שלח אותה מחדש."))
+            return
+
+        saved = await asyncio.to_thread(custom_alert_store.add, alert)
+        logger.info("Custom alert %s saved for %s (%s)", saved.id, saved.symbol,
+                    saved.kind)
+
+        lines = [rtl("✅ *ההתראה נשמרה.*"),
+                 rtl(f"{ltr(saved.symbol)} — {saved.describe()}")]
+        if saved.symbol not in self._syms:
+            # Without this the rule would be evaluated but the symbol would not
+            # appear anywhere else in the app, which is confusing to come back to.
+            await asyncio.to_thread(watchlist_store.add, saved.symbol)
+            lines.append(rtl(f"📋 {ltr(saved.symbol)} נוספה גם לרשימת המעקב."))
+        self._send(chat_id, "\n".join(lines),
+                   reply_markup={"inline_keyboard": [[
+                       {"text": "🔔 ההתראות שלי", "callback_data": "alerts"}
+                   ]]})
+
+    async def _remove_custom_alert(self, chat_id: int, rule_id: str) -> None:
+        rule = await asyncio.to_thread(custom_alert_store.get, rule_id)
+        removed = await asyncio.to_thread(custom_alert_store.remove, _as_id(rule_id))
+        if not removed:
+            self._send(chat_id, rtl("ההתראה לא נמצאה — אולי כבר נמחקה."))
+        else:
+            name = rule.symbol if rule is not None else rule_id
+            logger.info("Custom alert %s removed from Telegram", rule_id)
+            self._send(chat_id, rtl(f"🗑 ההתראה על *{ltr(name)}* נמחקה."))
+        await self._send_alerts(chat_id)
+
     # ── Alerts and muting ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -933,6 +1117,24 @@ class TelegramCommandBot:
         else:
             lines.append(rtl("🔔 כל ההתראות פעילות."))
 
+        # Rules the user wrote themselves, listed before the history: these are
+        # the ones they can change, and the only place they are visible.
+        rules = await asyncio.to_thread(custom_alert_store.all)
+        rule_buttons = []
+        if rules:
+            lines += ["", rtl("🎯 *ההתראות שהגדרת*")]
+            for rule in rules[:20]:
+                mark = "" if rule.enabled else " (כבויה)"
+                lines.append(rtl(
+                    f"• *{ltr(rule.symbol)}* — {rule.describe()} · "
+                    f"{_CHANNEL_HE.get(rule.channel, rule.channel)}{mark}"
+                ))
+                rule_buttons.append({"text": f"❌ {rule.symbol}",
+                                     "callback_data": f"ca_rm:{rule.id}"})
+                if not rule.enabled:
+                    rule_buttons.append({"text": f"🔁 הפעל {rule.symbol}",
+                                         "callback_data": f"ca_on:{rule.id}"})
+
         recent = await asyncio.to_thread(alert_store.recent, 5)
         if recent:
             lines += ["", rtl("📜 *נשלחו לאחרונה*")]
@@ -944,10 +1146,13 @@ class TelegramCommandBot:
         else:
             lines += ["", rtl("עדיין לא נשלחו התראות.")]
 
-        buttons = [
+        buttons = [[{"text": "🔔 התראה חדשה בשפה חופשית",
+                     "callback_data": "ca_new"}]]
+        buttons += [rule_buttons[i:i + 2] for i in range(0, len(rule_buttons), 2)]
+        buttons.append(
             [{"text": "🔕 השתק הכול לשעה", "callback_data": f"mute:{mute.ALL}:60"},
-             {"text": "🌙 השתק עד מחר", "callback_data": "mute_today"}],
-        ]
+             {"text": "🌙 השתק עד מחר", "callback_data": "mute_today"}]
+        )
         if muted:
             buttons.append([{"text": "🔔 בטל את כל ההשתקות", "callback_data": "unmute_all"}])
         # Muting is about noise; this is about which stocks exist at all. Both

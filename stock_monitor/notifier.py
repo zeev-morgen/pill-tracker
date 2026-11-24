@@ -15,9 +15,10 @@ from typing import Optional
 import requests
 import urllib3
 
-from . import messages, mute
+from . import custom_alerts, email_notifier, messages, mute
 from .alert_engine import AlertEvent
 from .config import NotificationConfig
+from .email_notifier import EmailNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,17 @@ class NotificationDispatcher:
         self._telegram: Optional[TelegramNotifier] = None
         self._discord:  Optional[DiscordNotifier]  = None
         self._desktop:  Optional[DesktopNotifier]  = None
+        # Always present: it reads the environment on each send, so mail
+        # configured after this process started still works.
+        self._email = EmailNotifier()
+        if email_notifier.is_configured():
+            logger.info("Email alerts enabled (to=%s)", email_notifier.settings()["to"])
+        else:
+            logger.info(
+                "Email alerts not configured (missing %s) — rules that ask for "
+                "mail will arrive in Telegram instead",
+                ", ".join(email_notifier.missing_settings()),
+            )
 
         if config.telegram.enabled and config.telegram.bot_token:
             self._telegram = TelegramNotifier(
@@ -188,6 +200,42 @@ class NotificationDispatcher:
             event.message,
             reply_markup=_alert_buttons(event),
         )
+
+    def dispatch_custom(self, alert, reason: str, session: str = "regular") -> None:
+        """Send one user-written rule's alert, down the channel it asked for.
+
+        A rule set to email when no SMTP is configured still goes to Telegram,
+        with a line saying why: the alternative is an alert the user asked for
+        and never receives, which is the one outcome worth avoiding here.
+        """
+        logger.info("CUSTOM ALERT ▶ %s: %s", alert.symbol, reason)
+        if mute.is_muted(alert.symbol):
+            logger.info("Custom alert for %s not sent: muted", alert.symbol)
+            return
+
+        wants_email = alert.channel in ("email", "both")
+        emailed = False
+        if wants_email:
+            subject, body = custom_alerts.email_text(alert, reason)
+            emailed = self._email.send(subject, body)
+
+        text = custom_alerts.alert_text(alert, reason, session)
+        if wants_email and not emailed:
+            missing = ", ".join(email_notifier.missing_settings())
+            text += "\n" + messages.rtl(
+                "✉️ ביקשת את ההתראה הזו במייל, אבל השליחה לא יצאה לדרך"
+                + (f" (חסר: {missing})" if missing else "")
+                + " — לכן היא נשלחת כאן."
+            )
+        elif alert.channel == "email":
+            # Delivered by mail as asked; the chat gets a one-line receipt so a
+            # silent Telegram does not read as a rule that never fired.
+            text = messages.rtl(f"✉️ נשלחה אליך התראה במייל על *{alert.symbol}*.")
+
+        if self._telegram:
+            self._telegram.send(text)
+        if self._discord:
+            self._discord.send(text, "INFO")
 
     def dispatch_raw(self, title: str, body: str, framed: bool = True) -> None:
         """Send a free-form message (e.g. from a TradingView webhook).

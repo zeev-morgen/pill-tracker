@@ -33,6 +33,18 @@ services:
         sync: false
       - key: TRADINGVIEW_WEBHOOK_SECRET
         sync: false
+      # Optional — only for alerts you ask to receive by email. Gmail needs an
+      # App Password here, not the account password; see .env.example.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: ALERT_EMAIL_TO
+        sync: false
       # ── Fixed ──
       - key: PYTHON_VERSION
         value: "3.12"

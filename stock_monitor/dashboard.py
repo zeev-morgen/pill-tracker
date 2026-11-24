@@ -21,7 +21,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import ai_analyst, chat, excel_export, fundamentals, fx, news
+from . import ai_analyst, chat, email_notifier, excel_export, fundamentals, fx, news
 # Re-exported, not just used: tests and the watchlist route both refer to
 # dashboard.symbol_is_known, and it is a question about the data feed.
 from .data_feed import symbol_is_known
@@ -554,6 +554,17 @@ async def api_news(max_age_minutes: int = 60):
     except Exception as exc:
         logger.error("News snapshot failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="שגיאה בשליפת החדשות") from exc
+
+
+@router.get("/api/diagnostics/email")
+async def api_email_diagnostics():
+    """Whether alert mail could be sent, and which settings are still missing.
+
+    Never includes the password — only whether one is present. Mail is the one
+    channel whose failure is invisible from the app itself, since nothing comes
+    back from a mail server that refused a login hours ago.
+    """
+    return JSONResponse(email_notifier.status())
 
 
 @router.get("/api/diagnostics/fundamentals")

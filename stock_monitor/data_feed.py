@@ -141,7 +141,9 @@ class StockDataFeed:
     """Thin wrapper around yfinance.Ticker with per-call fresh instances."""
 
     def __init__(self) -> None:
-        pass
+        #: (symbol, days) → (trading date, average). A moving average changes
+        #: once a day; the monitor asks every minute.
+        self._ma_cache: Dict[tuple, tuple] = {}
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -513,6 +515,47 @@ class StockDataFeed:
         except Exception as exc:
             logger.error("Error fetching history for %s: %s", symbol, exc, exc_info=True)
             return None
+
+    def get_moving_average(self, symbol: str, days: int) -> Optional[float]:
+        """The simple moving average of the last *days* daily closes.
+
+        Cached per symbol, length and trading date: a 150-day average moves
+        once a day, and the monitor asks every minute. Without the cache a
+        single moving-average rule would add a daily-history request per poll,
+        which is how this project got itself rate-limited before.
+
+        Today's own bar is included — a crossing is about where the price is
+        now, so excluding the live session would report yesterday's crossing.
+        """
+        today = datetime.now(NYSE_TZ).date()
+        key = (symbol.upper(), int(days))
+        cached = self._ma_cache.get(key)
+        if cached is not None and cached[0] == today:
+            return cached[1]
+
+        try:
+            # Calendar days, not sessions: ~252 sessions a year, so the span
+            # needs roughly half again as many days as the window, plus a
+            # margin for holidays.
+            span = max(int(days * 1.6) + 10, days + 10)
+            hist = self._ticker(symbol).history(period=f"{span}d", interval="1d")
+            closes = hist["Close"].dropna() if not hist.empty else None
+            if closes is None or len(closes) < days:
+                logger.info(
+                    "Not enough history for a %d-day average of %s (%d sessions)",
+                    days, symbol, 0 if closes is None else len(closes),
+                )
+                return None
+            average = float(closes.tail(days).mean())
+        except Exception as exc:
+            logger.error("Error computing %d-day average for %s: %s",
+                         days, symbol, exc)
+            return None
+
+        if not _usable(average):
+            return None
+        self._ma_cache[key] = (today, average)
+        return average
 
     def get_average_daily_volume(self, symbol: str, days: int = 10) -> Optional[float]:
         """Return the mean daily volume over the last *days* trading sessions.

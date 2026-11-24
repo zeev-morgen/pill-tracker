@@ -186,17 +186,31 @@ class StockAnalyst:
         ) as stream:
             return stream.get_final_message()
 
+    def parse_alert_request(self, system_prompt: str, request: str) -> str:
+        """Raw model output for one free-text alert request. Blocking.
+
+        The prompt's wording and the validation of the answer live in
+        :mod:`stock_monitor.custom_alerts`; one JSON object comes back, so the
+        token budget is small.
+        """
+        return self.complete(system_prompt, request, max_tokens=700)
+
     def summarize_news(
         self, system_prompt: str, prompt: str, max_tokens: int = 1400
     ) -> str:
-        """Raw model output for a batch of headlines. Blocking.
+        """Raw model output for a batch of headlines. See news_digest."""
+        return self.complete(system_prompt, prompt, max_tokens)
 
-        Deliberately thin: the wording, the batching and the parsing belong to
-        :mod:`stock_monitor.news_digest`, and this is the one place that knows
-        how to talk to the API — including the verify=False retry for networks
-        with TLS inspection. No adaptive thinking: translating a supplied
-        paragraph is not a reasoning task, and the latency lands in front of
-        someone waiting in a chat.
+    def complete(
+        self, system_prompt: str, prompt: str, max_tokens: int = 1400
+    ) -> str:
+        """One plain request to the model, no thinking, no streaming.
+
+        The single place that knows how to talk to the API for the short
+        structured jobs — summarising headlines, reading an alert request —
+        including the verify=False retry for networks with TLS inspection.
+        Neither job is a reasoning task, and both have someone waiting in a
+        chat for the answer.
         """
         def once(client: anthropic.Anthropic):
             return client.messages.create(

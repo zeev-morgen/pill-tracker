@@ -8,13 +8,14 @@ locally with no database installed. The public API is identical in both modes.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 from sqlalchemy import delete, desc, select
@@ -753,6 +754,173 @@ class ClosedPositionStore:
             return entry
 
 
+# ── Custom alerts ─────────────────────────────────────────────────────────────
+
+def _row_to_custom(row) -> "CustomAlert":
+    from .custom_alerts import CustomAlert
+
+    try:
+        params = json.loads(row.params or "{}")
+    except (TypeError, ValueError):
+        logger.error("Custom alert %s has unreadable params — treating as empty", row.id)
+        params = {}
+    return CustomAlert(
+        id=row.id,
+        symbol=row.symbol,
+        kind=row.kind,
+        params=params,
+        channel=row.channel or "telegram",
+        request=row.request or "",
+        enabled=bool(row.enabled),
+        once=bool(row.once),
+        cooldown_minutes=int(row.cooldown_minutes or 1440),
+        created_at=row.created_at,
+        last_fired_at=row.last_fired_at,
+    )
+
+
+class CustomAlertStore:
+    """Rules the user wrote in their own words.
+
+    In-memory ids are negative so that a rule created without a database can
+    never collide with a database id once one is configured — the evaluator
+    keys its crossing state on the id, and two rules sharing one would read
+    each other's side of the line.
+    """
+
+    def __init__(self) -> None:
+        self._rules: List = []
+        self._lock = threading.Lock()
+        self._next_id = -1
+        self._loaded_at = 0.0
+
+    # -- reading ------------------------------------------------------------
+
+    def all(self, include_disabled: bool = True) -> List:
+        rules = self._load()
+        if include_disabled:
+            return rules
+        return [r for r in rules if r.enabled]
+
+    def _load(self) -> List:
+        if db.is_enabled() and not _cache_is_fresh(self._loaded_at):
+            try:
+                with db.session_scope() as session:
+                    rows = session.scalars(
+                        select(db.CustomAlertRow).order_by(db.CustomAlertRow.id)
+                    ).all()
+                    rules = [_row_to_custom(r) for r in rows]
+                with self._lock:
+                    self._rules = rules
+                self._loaded_at = time.monotonic()
+                return list(rules)
+            except (SQLAlchemyError, RuntimeError) as exc:
+                logger.error("Failed to read custom alerts: %s", exc)
+        with self._lock:
+            return list(self._rules)
+
+    def get(self, rule_id) -> Optional["CustomAlert"]:
+        return next((r for r in self.all() if str(r.id) == str(rule_id)), None)
+
+    def symbols(self) -> List[str]:
+        """Symbols that have at least one live rule — these must be polled."""
+        return sorted({r.symbol for r in self.all(include_disabled=False)})
+
+    # -- writing ------------------------------------------------------------
+
+    def add(self, alert) -> "CustomAlert":
+        alert.validate()
+        if db.is_enabled():
+            try:
+                with db.session_scope() as session:
+                    row = db.CustomAlertRow(
+                        symbol=alert.symbol,
+                        kind=alert.kind,
+                        params=alert.to_json(),
+                        channel=alert.channel,
+                        request=alert.request,
+                        enabled=alert.enabled,
+                        once=alert.once,
+                        cooldown_minutes=alert.cooldown_minutes,
+                    )
+                    session.add(row)
+                    session.flush()
+                    saved = _row_to_custom(row)
+                self._invalidate()
+                return saved
+            except (SQLAlchemyError, RuntimeError) as exc:
+                logger.error("Failed to persist custom alert for %s: %s",
+                             alert.symbol, exc)
+        with self._lock:
+            alert.id = self._next_id
+            self._next_id -= 1
+            alert.created_at = datetime.now()
+            self._rules.append(alert)
+            return alert
+
+    def remove(self, rule_id) -> bool:
+        removed = False
+        if db.is_enabled():
+            try:
+                with db.session_scope() as session:
+                    result = session.execute(
+                        delete(db.CustomAlertRow).where(db.CustomAlertRow.id == rule_id)
+                    )
+                    removed = result.rowcount > 0
+                self._invalidate()
+            except (SQLAlchemyError, RuntimeError) as exc:
+                logger.error("Failed to remove custom alert %s: %s", rule_id, exc)
+        with self._lock:
+            before = len(self._rules)
+            self._rules = [r for r in self._rules if str(r.id) != str(rule_id)]
+            removed = removed or len(self._rules) < before
+        return removed
+
+    def mark_fired(self, rule_id, disable: bool = False) -> None:
+        """Record the firing — the cooldown is computed from it."""
+        when = datetime.now(timezone.utc)
+        if db.is_enabled():
+            try:
+                with db.session_scope() as session:
+                    row = session.get(db.CustomAlertRow, rule_id)
+                    if row is not None:
+                        row.last_fired_at = when
+                        if disable:
+                            row.enabled = False
+                self._invalidate()
+            except (SQLAlchemyError, RuntimeError) as exc:
+                logger.error("Failed to record firing of alert %s: %s", rule_id, exc)
+        with self._lock:
+            for rule in self._rules:
+                if str(rule.id) == str(rule_id):
+                    rule.last_fired_at = when
+                    if disable:
+                        rule.enabled = False
+
+    def set_enabled(self, rule_id, enabled: bool) -> bool:
+        found = False
+        if db.is_enabled():
+            try:
+                with db.session_scope() as session:
+                    row = session.get(db.CustomAlertRow, rule_id)
+                    if row is not None:
+                        row.enabled = enabled
+                        found = True
+                self._invalidate()
+            except (SQLAlchemyError, RuntimeError) as exc:
+                logger.error("Failed to toggle custom alert %s: %s", rule_id, exc)
+        with self._lock:
+            for rule in self._rules:
+                if str(rule.id) == str(rule_id):
+                    rule.enabled = enabled
+                    found = True
+        return found
+
+    def _invalidate(self) -> None:
+        """Force the next read to hit the database, so a write is visible."""
+        self._loaded_at = 0.0
+
+
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 
 class WatchlistStore:
@@ -861,3 +1029,4 @@ class WatchlistStore:
 
 closed_position_store = ClosedPositionStore()
 watchlist_store = WatchlistStore()
+custom_alert_store = CustomAlertStore()
